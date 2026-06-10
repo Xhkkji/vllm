@@ -31,4 +31,7 @@ os.environ['PYTORCH_NVML_BASED_CUDA_CHECK'] = '1'
 # see https://github.com/vllm-project/vllm/issues/10480
 os.environ['TORCHINDUCTOR_COMPILE_THREADS'] = '1'
 # see https://github.com/vllm-project/vllm/issues/10619
-torch._inductor.config.compile_threads = 1
+# 某些较低版本的 PyTorch 没有 torch._inductor.config，
+# 这里做兼容保护，避免导入 vllm 时直接失败。
+if hasattr(torch, "_inductor") and hasattr(torch._inductor, "config"):
+    torch._inductor.config.compile_threads = 1

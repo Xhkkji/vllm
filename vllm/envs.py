@@ -41,6 +41,13 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_FORCE_TENSOR_CORES: bool = False
     VLLM_PP_LAYER_PARTITION: Optional[str] = None
     VLLM_CPU_KVCACHE_SPACE: int = 0
+    VLLM_V0_SWAP_TRACE: bool = False
+    VLLM_BAM_SHADOW_ENABLE: bool = False
+    VLLM_BAM_IMPORT_PATH: Optional[str] = None
+    VLLM_BAM_CACHE_SIZE_MB: int = 64
+    VLLM_BAM_NUM_SSD: int = 1
+    VLLM_BAM_SSD_LIST: Optional[str] = None
+    VLLM_BAM_CTRL_IDX: int = 0
     VLLM_CPU_OMP_THREADS_BIND: str = ""
     VLLM_CPU_MOE_PREPACK: bool = True
     VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
@@ -362,6 +369,35 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # default is 4 GiB
     "VLLM_CPU_KVCACHE_SPACE":
     lambda: int(os.getenv("VLLM_CPU_KVCACHE_SPACE", "0")),
+
+    # 是否开启 V0 swap 路径的详细观测日志。
+    # 仅用于本地实验排查，默认关闭，避免污染正常推理日志。
+    "VLLM_V0_SWAP_TRACE":
+    lambda: bool(int(os.getenv("VLLM_V0_SWAP_TRACE", "0"))),
+
+    # 是否在 V0 swap_out 后额外执行一次 GPU -> SSD(BaM) 影子写出。
+    "VLLM_BAM_SHADOW_ENABLE":
+    lambda: bool(int(os.getenv("VLLM_BAM_SHADOW_ENABLE", "0"))),
+
+    # 可选：显式指定 BaM Python 模块搜索路径。
+    "VLLM_BAM_IMPORT_PATH":
+    lambda: os.getenv("VLLM_BAM_IMPORT_PATH", None),
+
+    # BaM page cache 大小，单位 MB。
+    "VLLM_BAM_CACHE_SIZE_MB":
+    lambda: int(os.getenv("VLLM_BAM_CACHE_SIZE_MB", "64")),
+
+    # 使用的 SSD 控制器数量。
+    "VLLM_BAM_NUM_SSD":
+    lambda: int(os.getenv("VLLM_BAM_NUM_SSD", "1")),
+
+    # 可选：逗号分隔的 SSD 编号列表，例如 "0,1"。
+    "VLLM_BAM_SSD_LIST":
+    lambda: os.getenv("VLLM_BAM_SSD_LIST", None),
+
+    # BaM 使用的控制 GPU 编号。
+    "VLLM_BAM_CTRL_IDX":
+    lambda: int(os.getenv("VLLM_BAM_CTRL_IDX", "0")),
 
     # (CPU backend only) CPU core ids bound by OpenMP threads, e.g., "0-31",
     # "0,1,2", "0-31,33". CPU cores of different ranks are separated by '|'.

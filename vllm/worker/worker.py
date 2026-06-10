@@ -389,6 +389,18 @@ class Worker(LocalOrDistributedWorkerBase):
                                       device=self.device,
                                       dtype=torch.int64).view(-1, 2)
 
+        if envs.VLLM_V0_SWAP_TRACE:
+            logger.info(
+                "[V0_SWAP_TRACE][Worker.prepare] ve=%d num_seq_groups=%d "
+                "num_steps=%d swap_in=%d swap_out=%d copy=%d",
+                virtual_engine,
+                num_seq_groups,
+                num_steps,
+                blocks_to_swap_in.shape[0],
+                blocks_to_swap_out.shape[0],
+                blocks_to_copy.shape[0],
+            )
+
         return WorkerInput(
             num_seq_groups=num_seq_groups,
             blocks_to_swap_in=blocks_to_swap_in,
@@ -404,14 +416,35 @@ class Worker(LocalOrDistributedWorkerBase):
         # Issue cache operations.
         if (worker_input.blocks_to_swap_in is not None
                 and worker_input.blocks_to_swap_in.numel() > 0):
+            if envs.VLLM_V0_SWAP_TRACE:
+                logger.info(
+                    "[V0_SWAP_TRACE][Worker.execute] ve=%d op=swap_in "
+                    "mappings=%d",
+                    virtual_engine,
+                    worker_input.blocks_to_swap_in.shape[0],
+                )
             self.cache_engine[virtual_engine].swap_in(
                 worker_input.blocks_to_swap_in)
         if (worker_input.blocks_to_swap_out is not None
                 and worker_input.blocks_to_swap_out.numel() > 0):
+            if envs.VLLM_V0_SWAP_TRACE:
+                logger.info(
+                    "[V0_SWAP_TRACE][Worker.execute] ve=%d op=swap_out "
+                    "mappings=%d",
+                    virtual_engine,
+                    worker_input.blocks_to_swap_out.shape[0],
+                )
             self.cache_engine[virtual_engine].swap_out(
                 worker_input.blocks_to_swap_out)
         if (worker_input.blocks_to_copy is not None
                 and worker_input.blocks_to_copy.numel() > 0):
+            if envs.VLLM_V0_SWAP_TRACE:
+                logger.info(
+                    "[V0_SWAP_TRACE][Worker.execute] ve=%d op=copy "
+                    "mappings=%d",
+                    virtual_engine,
+                    worker_input.blocks_to_copy.shape[0],
+                )
             self.cache_engine[virtual_engine].copy(worker_input.blocks_to_copy)
 
     def _get_cached_seq_group_metadata(

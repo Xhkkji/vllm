@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """A block manager that manages token blocks."""
+import vllm.envs as envs
 from typing import Dict, List, Optional
 from typing import Sequence as GenericSequence
 from typing import Tuple
@@ -11,11 +12,14 @@ from vllm.core.block.prefix_caching_block import (ComputedBlocksTracker,
                                                   LastAccessBlocksTracker)
 from vllm.core.block.utils import check_no_caching_or_swa_for_blockmgr_encdec
 from vllm.core.interfaces import AllocStatus, BlockSpaceManager
+from vllm.logger import init_logger
 from vllm.sequence import Sequence, SequenceGroup, SequenceStatus
 from vllm.utils import Device
 
 SeqId = int
 EncoderSeqId = str
+
+logger = init_logger(__name__)
 
 
 class SelfAttnBlockSpaceManager(BlockSpaceManager):
@@ -392,6 +396,15 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             physical_block_id_mapping.extend(
                 list(seq_physical_block_id_mapping.items()))
 
+        if envs.VLLM_V0_SWAP_TRACE:
+            logger.info(
+                "[V0_SWAP_TRACE][BlockManager] op=swap_in request_id=%s "
+                "seqs=%d mappings=%d",
+                seq_group.request_id,
+                len(seq_group.get_seqs(status=SequenceStatus.SWAPPED)),
+                len(physical_block_id_mapping),
+            )
+
         return physical_block_id_mapping
 
     def can_swap_out(self, seq_group: SequenceGroup) -> bool:
@@ -444,6 +457,15 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
 
             physical_block_id_mapping.extend(
                 list(seq_physical_block_id_mapping.items()))
+
+        if envs.VLLM_V0_SWAP_TRACE:
+            logger.info(
+                "[V0_SWAP_TRACE][BlockManager] op=swap_out request_id=%s "
+                "seqs=%d mappings=%d",
+                seq_group.request_id,
+                len(seq_group.get_seqs(status=SequenceStatus.RUNNING)),
+                len(physical_block_id_mapping),
+            )
 
         return physical_block_id_mapping
 

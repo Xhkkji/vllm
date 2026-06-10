@@ -29,6 +29,7 @@ ENABLE_ARTIFICIAL_PREEMPT = bool(
     os.getenv("VLLM_TEST_ENABLE_ARTIFICIAL_PREEMPT", False))  # noqa
 ARTIFICIAL_PREEMPTION_PROB = 0.5
 ARTIFICIAL_PREEMPTION_MAX_CNT = 500
+SWAP_TRACE_ENABLED = bool(int(os.getenv("VLLM_V0_SWAP_TRACE", "0")))
 
 
 class PreemptionMode(enum.Enum):
@@ -1777,6 +1778,15 @@ class Scheduler:
             )
         self.num_cumulative_preemption += 1
 
+        if SWAP_TRACE_ENABLED:
+            logger.info(
+                "[V0_SWAP_TRACE][Scheduler] op=preempt request_id=%s "
+                "mode=%s running_seqs=%d",
+                seq_group.request_id,
+                preemption_mode.name,
+                seq_group.get_max_num_running_seqs(),
+            )
+
         if preemption_mode == PreemptionMode.RECOMPUTE:
             self._preempt_by_recompute(seq_group)
         elif preemption_mode == PreemptionMode.SWAP:
@@ -1811,6 +1821,13 @@ class Scheduler:
     ) -> None:
         mapping = self.block_manager.swap_in(seq_group)
         blocks_to_swap_in.extend(mapping)
+        if SWAP_TRACE_ENABLED:
+            logger.info(
+                "[V0_SWAP_TRACE][Scheduler] op=swap_in request_id=%s "
+                "mappings=%d",
+                seq_group.request_id,
+                len(mapping),
+            )
         for seq in seq_group.get_seqs(status=SequenceStatus.SWAPPED):
             seq.status = SequenceStatus.RUNNING
 
@@ -1827,6 +1844,13 @@ class Scheduler:
                 "the swap space to avoid this error.")
         mapping = self.block_manager.swap_out(seq_group)
         blocks_to_swap_out.extend(mapping)
+        if SWAP_TRACE_ENABLED:
+            logger.info(
+                "[V0_SWAP_TRACE][Scheduler] op=swap_out request_id=%s "
+                "mappings=%d",
+                seq_group.request_id,
+                len(mapping),
+            )
         for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
             seq.status = SequenceStatus.SWAPPED
 

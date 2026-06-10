@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """CacheEngine class for managing the KV cache."""
+import time
 from typing import List
 
 import torch
 
+import vllm.envs as envs
 from vllm.attention import get_attn_backend
 from vllm.config import CacheConfig, DeviceConfig, ModelConfig, ParallelConfig
 from vllm.logger import init_logger
@@ -64,6 +66,39 @@ class CacheEngine:
         self.gpu_cache = self._allocate_kv_cache(
             self.num_gpu_blocks, self.device_config.device_type)
         self.cpu_cache = self._allocate_kv_cache(self.num_cpu_blocks, "cpu")
+        self.swap_trace_enabled = envs.VLLM_V0_SWAP_TRACE
+        self.bam_shadow_writer = self._init_bam_shadow_writer()
+
+    def _init_bam_shadow_writer(self):
+        if not envs.VLLM_BAM_SHADOW_ENABLE:
+            return None
+
+        from vllm.worker.bam_shadow_writer import BaMShadowWriter
+        return BaMShadowWriter(self.gpu_cache, self.num_cpu_blocks)
+
+    def _log_swap_event(self, op_name: str, src_to_dst: torch.Tensor,
+                        elapsed_s: float) -> None:
+        """记录一次 swap 的核心信息，便于观察 block 粒度和耗时。"""
+        if not self.swap_trace_enabled:
+            return
+
+        num_mappings = src_to_dst.shape[0]
+        block_bytes = self.get_cache_block_size(self.cache_config,
+                                                self.model_config,
+                                                self.parallel_config)
+        total_bytes = num_mappings * block_bytes
+        logger.info(
+            "[V0_SWAP_TRACE][CacheEngine] op=%s mappings=%d "
+            "block_size=%d block_bytes=%d total_bytes=%d "
+            "num_attention_layers=%d elapsed_ms=%.3f",
+            op_name,
+            num_mappings,
+            self.block_size,
+            block_bytes,
+            total_bytes,
+            self.num_attention_layers,
+            elapsed_s * 1000,
+        )
 
     def _allocate_kv_cache(
         self,
@@ -104,14 +139,21 @@ class CacheEngine:
         return kv_cache
 
     def swap_in(self, src_to_dst: torch.Tensor) -> None:
+        start = time.perf_counter()
         for i in range(self.num_attention_layers):
             self.attn_backend.swap_blocks(self.cpu_cache[i], self.gpu_cache[i],
                                           src_to_dst)
+        self._log_swap_event("swap_in", src_to_dst, time.perf_counter() - start)
 
     def swap_out(self, src_to_dst: torch.Tensor) -> None:
+        start = time.perf_counter()
         for i in range(self.num_attention_layers):
             self.attn_backend.swap_blocks(self.gpu_cache[i], self.cpu_cache[i],
                                           src_to_dst)
+        if self.bam_shadow_writer is not None:
+            self.bam_shadow_writer.on_swap_out(self.gpu_cache, src_to_dst)
+        self._log_swap_event("swap_out", src_to_dst,
+                             time.perf_counter() - start)
 
     def copy(self, src_to_dsts: torch.Tensor) -> None:
         self.attn_backend.copy_blocks(self.gpu_cache, src_to_dsts)

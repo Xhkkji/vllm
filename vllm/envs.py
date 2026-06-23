@@ -43,6 +43,12 @@ if TYPE_CHECKING:
     VLLM_CPU_KVCACHE_SPACE: int = 0
     VLLM_V0_SWAP_TRACE: bool = False
     VLLM_BAM_SHADOW_ENABLE: bool = False
+    VLLM_BAM_SWAPIN_ENABLE: bool = False
+    VLLM_BAM_SWAPIN_VERIFY: bool = False
+    VLLM_BAM_SWAPIN_VERIFY_BLOCKS: int = 0
+    VLLM_BAM_LMCACHE_SHADOW_ENABLE: bool = False
+    VLLM_BAM_LMCACHE_PREFER_LOAD_ENABLE: bool = False
+    VLLM_BAM_LMCACHE_SHADOW_CHUNKS: int = 1024
     VLLM_BAM_IMPORT_PATH: Optional[str] = None
     VLLM_BAM_CACHE_SIZE_MB: int = 64
     VLLM_BAM_NUM_SSD: int = 1
@@ -378,6 +384,30 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 是否在 V0 swap_out 后额外执行一次 GPU -> SSD(BaM) 影子写出。
     "VLLM_BAM_SHADOW_ENABLE":
     lambda: bool(int(os.getenv("VLLM_BAM_SHADOW_ENABLE", "0"))),
+
+    # 是否在 V0 swap_in 时优先从 BaM 读回 KV block。
+    "VLLM_BAM_SWAPIN_ENABLE":
+    lambda: bool(int(os.getenv("VLLM_BAM_SWAPIN_ENABLE", "0"))),
+
+    # 是否在 BaM swap_in 后校验恢复出的 block 与 cpu_cache 参考值一致。
+    "VLLM_BAM_SWAPIN_VERIFY":
+    lambda: bool(int(os.getenv("VLLM_BAM_SWAPIN_VERIFY", "0"))),
+
+    # 校验 block 数。<=0 表示全量校验，>0 表示仅校验当前 batch 前 N 个映射。
+    "VLLM_BAM_SWAPIN_VERIFY_BLOCKS":
+    lambda: int(os.getenv("VLLM_BAM_SWAPIN_VERIFY_BLOCKS", "0")),
+
+    # 是否在 LMCache V0 的 put 路径上额外做一份 BaM shadow store。
+    "VLLM_BAM_LMCACHE_SHADOW_ENABLE":
+    lambda: bool(int(os.getenv("VLLM_BAM_LMCACHE_SHADOW_ENABLE", "0"))),
+
+    # 是否在 LMCache V0 的 get 路径上优先从 BaM 读取，失败再回退原始 LMCache。
+    "VLLM_BAM_LMCACHE_PREFER_LOAD_ENABLE":
+    lambda: bool(int(os.getenv("VLLM_BAM_LMCACHE_PREFER_LOAD_ENABLE", "0"))),
+
+    # LMCache shadow store 在 BaM 里最多预留多少个 chunk 槽位。
+    "VLLM_BAM_LMCACHE_SHADOW_CHUNKS":
+    lambda: int(os.getenv("VLLM_BAM_LMCACHE_SHADOW_CHUNKS", "1024")),
 
     # 可选：显式指定 BaM Python 模块搜索路径。
     "VLLM_BAM_IMPORT_PATH":

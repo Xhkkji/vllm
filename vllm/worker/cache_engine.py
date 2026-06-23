@@ -67,14 +67,32 @@ class CacheEngine:
             self.num_gpu_blocks, self.device_config.device_type)
         self.cpu_cache = self._allocate_kv_cache(self.num_cpu_blocks, "cpu")
         self.swap_trace_enabled = envs.VLLM_V0_SWAP_TRACE
+        self.bam_block_store = self._init_bam_block_store()
         self.bam_shadow_writer = self._init_bam_shadow_writer()
+        self.bam_swap_reader = self._init_bam_swap_reader()
+
+    def _init_bam_block_store(self):
+        if not (envs.VLLM_BAM_SHADOW_ENABLE or envs.VLLM_BAM_SWAPIN_ENABLE):
+            return None
+
+        from vllm.worker.bam_block_store import BaMBlockStore
+        return BaMBlockStore(self.gpu_cache, self.num_cpu_blocks)
 
     def _init_bam_shadow_writer(self):
         if not envs.VLLM_BAM_SHADOW_ENABLE:
             return None
 
         from vllm.worker.bam_shadow_writer import BaMShadowWriter
-        return BaMShadowWriter(self.gpu_cache, self.num_cpu_blocks)
+        assert self.bam_block_store is not None
+        return BaMShadowWriter(self.bam_block_store, self.dtype)
+
+    def _init_bam_swap_reader(self):
+        if not envs.VLLM_BAM_SWAPIN_ENABLE:
+            return None
+
+        from vllm.worker.bam_swap_reader import BaMSwapReader
+        assert self.bam_block_store is not None
+        return BaMSwapReader(self.bam_block_store, self.dtype)
 
     def _log_swap_event(self, op_name: str, src_to_dst: torch.Tensor,
                         elapsed_s: float) -> None:
@@ -140,9 +158,13 @@ class CacheEngine:
 
     def swap_in(self, src_to_dst: torch.Tensor) -> None:
         start = time.perf_counter()
-        for i in range(self.num_attention_layers):
-            self.attn_backend.swap_blocks(self.cpu_cache[i], self.gpu_cache[i],
-                                          src_to_dst)
+        if self.bam_swap_reader is not None:
+            self.bam_swap_reader.swap_in(self.gpu_cache, self.cpu_cache,
+                                         src_to_dst)
+        else:
+            for i in range(self.num_attention_layers):
+                self.attn_backend.swap_blocks(self.cpu_cache[i],
+                                              self.gpu_cache[i], src_to_dst)
         self._log_swap_event("swap_in", src_to_dst, time.perf_counter() - start)
 
     def swap_out(self, src_to_dst: torch.Tensor) -> None:

@@ -10,6 +10,7 @@ from xformers.ops.fmha.attn_bias import (AttentionBias,
                                          BlockDiagonalMask,
                                          LowerTriangularMaskWithTensorBias)
 
+from vllm import _custom_ops as ops
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
                                               AttentionLayer,
                                               AttentionMetadata, AttentionType)
@@ -571,26 +572,61 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
                 assert prefill_meta.query_start_loc is not None
                 assert prefill_meta.max_query_len is not None
 
-                # prefix-enabled attention
-                # TODO(Hai) this triton kernel has regression issue (broke) to
-                # deal with different data types between KV and FP8 KV cache,
-                # to be addressed separately.
-                out = PagedAttention.forward_prefix(
-                    query,
-                    key,
-                    value,
-                    self.kv_cache_dtype,
-                    key_cache,
-                    value_cache,
-                    prefill_meta.block_tables,
-                    prefill_meta.query_start_loc,
-                    prefill_meta.seq_lens_tensor,
+                logger.info(
+                    "[XFORMERS_PREFIX] query_shape=%s key_shape=%s value_shape=%s "
+                    "block_tables_shape=%s query_start_loc=%s seq_lens=%s "
+                    "seq_lens_tensor=%s num_prefills=%d num_prefill_tokens=%d "
+                    "max_query_len=%s max_prefill_seq_len=%s",
+                    tuple(query.shape),
+                    None if key is None else tuple(key.shape),
+                    None if value is None else tuple(value.shape),
+                    tuple(prefill_meta.block_tables.shape),
+                    prefill_meta.query_start_loc.tolist(),
+                    prefill_meta.seq_lens,
+                    None if prefill_meta.seq_lens_tensor is None else
+                    prefill_meta.seq_lens_tensor.tolist(),
+                    prefill_meta.num_prefills,
+                    prefill_meta.num_prefill_tokens,
                     prefill_meta.max_query_len,
-                    self.alibi_slopes,
-                    self.sliding_window,
-                    layer._k_scale,
-                    layer._v_scale,
+                    prefill_meta.max_prefill_seq_len,
                 )
+
+                # V100 + V0 + xFormers 的 prefix kernel 在当前环境会触发
+                # LLVM layout 崩溃。这里保留 prefix hit 语义和 paged KV /
+                # SSD 读负载，只把最后一步 attention 计算切到稳定的
+                # xFormers 普通 varlen 路径。
+                device_capability = torch.cuda.get_device_capability(
+                    query.device)
+                if device_capability < (8, 0) and self.alibi_slopes is None:
+                    out = self._run_prefix_attention_fallback(
+                        query=query,
+                        key=key,
+                        value=value,
+                        key_cache=key_cache,
+                        value_cache=value_cache,
+                        prefill_meta=prefill_meta,
+                    )
+                else:
+                    # prefix-enabled attention
+                    # TODO(Hai) this triton kernel has regression issue (broke)
+                    # to deal with different data types between KV and FP8 KV
+                    # cache, to be addressed separately.
+                    out = PagedAttention.forward_prefix(
+                        query,
+                        key,
+                        value,
+                        self.kv_cache_dtype,
+                        key_cache,
+                        value_cache,
+                        prefill_meta.block_tables,
+                        prefill_meta.query_start_loc,
+                        prefill_meta.seq_lens_tensor,
+                        prefill_meta.max_query_len,
+                        self.alibi_slopes,
+                        self.sliding_window,
+                        layer._k_scale,
+                        layer._v_scale,
+                    )
                 assert output[:num_prefill_query_tokens].shape == out.shape
                 output[:num_prefill_query_tokens] = out
 
@@ -621,6 +657,165 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
 
         # Reshape the output tensor.
         return output.view(-1, self.num_heads * self.head_size)
+
+    def _run_prefix_attention_fallback(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        prefill_meta: XFormersMetadata,
+    ) -> torch.Tensor:
+        """绕开不稳定的 prefix kernel，但保留 prefix hit 与 paged KV 语义。"""
+        assert prefill_meta.seq_lens is not None
+        assert prefill_meta.context_lens_tensor is not None
+        assert prefill_meta.query_start_loc is not None
+        assert prefill_meta.block_tables is not None
+
+        query_lens = [
+            int(x) for x in (
+                prefill_meta.query_start_loc[1:] -
+                prefill_meta.query_start_loc[:-1]).tolist()
+        ]
+        context_lens = [
+            int(x) for x in prefill_meta.context_lens_tensor.tolist()
+        ]
+        kv_lens = [ctx + q for ctx, q in zip(context_lens, query_lens)]
+
+        prefix_key, prefix_value = self._gather_prefix_kv_from_cache(
+            key_cache=key_cache,
+            value_cache=value_cache,
+            prefill_meta=prefill_meta,
+        )
+
+        combined_keys: list[torch.Tensor] = []
+        combined_values: list[torch.Tensor] = []
+
+        prefix_start = 0
+        query_start = 0
+        for context_len, query_len in zip(context_lens, query_lens):
+            if context_len > 0:
+                prefix_end = prefix_start + context_len
+                combined_keys.append(prefix_key[prefix_start:prefix_end])
+                combined_values.append(prefix_value[prefix_start:prefix_end])
+                prefix_start = prefix_end
+            if query_len > 0:
+                query_end = query_start + query_len
+                combined_keys.append(key[query_start:query_end])
+                combined_values.append(value[query_start:query_end])
+                query_start = query_end
+
+        full_key = torch.cat(combined_keys, dim=0)
+        full_value = torch.cat(combined_values, dim=0)
+
+        attn_bias = BlockDiagonalMask.from_seqlens(
+            q_seqlen=query_lens,
+            kv_seqlen=kv_lens,
+            device=query.device,
+        ).make_causal_from_bottomright()
+        if self.sliding_window is not None:
+            attn_bias = attn_bias.make_local_attention_from_bottomright(
+                self.sliding_window)
+
+        original_query = query
+        if self.num_kv_heads != self.num_heads:
+            query = query.view(query.shape[0], self.num_kv_heads,
+                               self.num_queries_per_kv, query.shape[-1])
+            full_key = full_key[:, :, None, :].expand(
+                full_key.shape[0],
+                self.num_kv_heads,
+                self.num_queries_per_kv,
+                full_key.shape[-1],
+            )
+            full_value = full_value[:, :, None, :].expand(
+                full_value.shape[0],
+                self.num_kv_heads,
+                self.num_queries_per_kv,
+                full_value.shape[-1],
+            )
+
+        logger.info(
+            "[XFORMERS_PREFIX_FALLBACK] query_lens=%s context_lens=%s "
+            "kv_lens=%s total_query_tokens=%d total_kv_tokens=%d",
+            query_lens,
+            context_lens,
+            kv_lens,
+            query.shape[0],
+            full_key.shape[0],
+        )
+
+        out = xops.memory_efficient_attention_forward(
+            query.unsqueeze(0),
+            full_key.unsqueeze(0),
+            full_value.unsqueeze(0),
+            attn_bias=attn_bias,
+            p=0.0,
+            scale=self.scale,
+        )
+        return out.view_as(original_query)
+
+    def _gather_prefix_kv_from_cache(
+        self,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        prefill_meta: XFormersMetadata,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """把 prefix 命中的 paged KV 真正 gather 回连续张量。"""
+        assert prefill_meta.context_lens_tensor is not None
+        assert prefill_meta.block_tables is not None
+
+        total_context_tokens = int(prefill_meta.context_lens_tensor.sum().item())
+        block_size = int(value_cache.shape[-1])
+
+        key_src_cache = key_cache.permute(0, 3, 1, 2, 4).contiguous().view(
+            key_cache.shape[0],
+            block_size,
+            self.num_kv_heads,
+            self.head_size,
+        )
+        value_src_cache = value_cache.permute(0, 3, 1, 2).contiguous()
+
+        gathered_key = torch.empty(
+            (total_context_tokens, self.num_kv_heads, self.head_size),
+            dtype=key_src_cache.dtype,
+            device=key_src_cache.device,
+        )
+        gathered_value = torch.empty(
+            (total_context_tokens, self.num_kv_heads, self.head_size),
+            dtype=value_src_cache.dtype,
+            device=value_src_cache.device,
+        )
+
+        if total_context_tokens == 0:
+            return gathered_key, gathered_value
+
+        cu_context_lens = torch.zeros(
+            prefill_meta.num_prefills + 1,
+            dtype=torch.int32,
+            device=key_cache.device,
+        )
+        torch.cumsum(
+            prefill_meta.context_lens_tensor.to(torch.int32),
+            dim=0,
+            out=cu_context_lens[1:],
+        )
+
+        ops.gather_cache(
+            src_cache=key_src_cache,
+            dst=gathered_key,
+            block_table=prefill_meta.block_tables,
+            cu_seq_lens=cu_context_lens,
+            batch_size=prefill_meta.num_prefills,
+        )
+        ops.gather_cache(
+            src_cache=value_src_cache,
+            dst=gathered_value,
+            block_table=prefill_meta.block_tables,
+            cu_seq_lens=cu_context_lens,
+            batch_size=prefill_meta.num_prefills,
+        )
+        return gathered_key, gathered_value
 
     def _run_memory_efficient_xformers_forward(
         self,

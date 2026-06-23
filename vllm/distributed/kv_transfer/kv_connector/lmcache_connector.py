@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, List, Tuple, Union
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBase
 from vllm.logger import init_logger
@@ -59,6 +60,22 @@ class LMCacheConnector(KVConnectorBase):
         self.lmcache_should_store = lmcache_should_store
         self.store_status = StoreStatus
         self.retrieve_status = RetrieveStatus
+
+        if (envs.VLLM_BAM_LMCACHE_SHADOW_ENABLE
+                or envs.VLLM_BAM_LMCACHE_PREFER_LOAD_ENABLE) and \
+                self.engine is not None:
+            # 统一包装 LMCache storage manager：
+            # - put: 可做 BaM shadow write
+            # - get: 可做 BaM prefer-load，失败再回退原始 LMCache
+            from vllm.bam.lmcache_bam_storage import LMCacheBaMStorageManager
+            self.engine.storage_manager = LMCacheBaMStorageManager(
+                self.engine.storage_manager)
+            logger.info(
+                "Enabled LMCache <-> BaM storage wrapper for V0 connector. "
+                "shadow_enable=%s prefer_load_enable=%s",
+                envs.VLLM_BAM_LMCACHE_SHADOW_ENABLE,
+                envs.VLLM_BAM_LMCACHE_PREFER_LOAD_ENABLE,
+            )
 
     def recv_kv_caches_and_hidden_states(
         self, model_executable: torch.nn.Module,

@@ -1,10 +1,13 @@
-# V100 + vLLM V0 + BaM Shadow Swap-Out 第一版方案
+# V100 + vLLM V0 + BaM Shadow Swap-Out / Swap-In 方案
 
-本文档整理 `BaM_IOStack` 接入 `vLLM V0` 的第一版落地方案。该方案的目标不是立刻替换 `vLLM` 当前的 `CPU swap`，而是在 **不破坏现有运行语义** 的前提下，先打通 `GPU -> SSD(BaM)` 的旁路写出通路。
+本文档整理 `BaM_IOStack` 接入 `vLLM V0` 的当前落地方案。该方案的目标不是立刻替换 `vLLM` 当前的整套 `CPU swap` 机制，而是在 **不破坏现有运行语义** 的前提下，先打通：
+
+- `GPU -> SSD(BaM)` 的 shadow `swap_out`
+- `SSD(BaM) -> GPU` 的实验性 `swap_in`
 
 ## 当前状态
 
-这条第一版路线已经在本地跑通，且已经确认发生了真实的 `swap_out -> BaM shadow write`。
+这条路线当前已经在本地跑通真实 vLLM V0 调度闭环，并且完成了 `swap_in` 后的全量 byte-level 正确性校验。
 
 当前最小成功配置：
 
@@ -20,7 +23,7 @@
 - `preemption_mode=swap`
 - `max_num_seqs=8`
 
-对应成功日志：
+早期 shadow write 成功日志：
 
 - [v0_swap_trace_Qwen3-0.6B_20260610_202648.log](/home/xhk/llm-inference/vllm/evaluation/logs/v0_swap_trace_Qwen3-0.6B_20260610_202648.log:1)
 
@@ -38,7 +41,7 @@
 - [Worker execute swap_out](/home/xhk/llm-inference/vllm/evaluation/logs/v0_swap_trace_Qwen3-0.6B_20260610_202648.log:664)
 - [BaM shadow write](/home/xhk/llm-inference/vllm/evaluation/logs/v0_swap_trace_Qwen3-0.6B_20260610_202648.log:666)
 
-当前成功日志汇总结果：
+早期 shadow write 日志汇总结果：
 
 - `swap_out_shadow` 次数：`24`
 - 累计 `mappings`：`9835`
@@ -51,18 +54,135 @@
 
 一个重要经验是：仅靠增大并发请求数，很多时候只会形成 waiting queue；要更稳定地制造 `swap_out`，需要让单个请求组内部形成多分支运行态，因此这次成功配置里的 `temperature=0.8 + best_of=4` 是关键。
 
+## 最新代码进展
+
+在 `2026-06-15` 的最新代码里，已经补上 `BaM swap_in` 读回路径、共享 BaM 后端、全量正确性校验，并完成真实 vLLM V0 调度路径下的端到端闭环验证。
+
+当前最新成功日志：
+
+- [v100_v0_bam_swap_roundtrip_20260615_183422.log](/home/xhk/llm-inference/vllm/evaluation/logs/v100_v0_bam_swap_roundtrip_20260615_183422.log:1)
+
+当前新增内容包括：
+
+- `BaMRowStore.load_rows()`：为 `BaM` 行存补齐按行读回能力
+- `BaMRowStore` 使用 `int64 chunk` 方式存储原始字节，避免 `uint8` 路径的不确定性
+- `BaMBlockStore`：共享同一个 BaM row-store 后端，避免写路径和读路径各自初始化控制器
+- `BaMSwapReader`：独立的 `SSD -> GPU` block 读回模块
+- `VLLM_BAM_SWAPIN_ENABLE=1`：在 `CacheEngine.swap_in()` 中切换到 `BaM` 读回
+- `VLLM_BAM_SWAPIN_VERIFY=1`：在 `swap_in` 后把恢复出的 GPU block 与 `cpu_cache` 参考 block 做显式校验
+- `VLLM_BAM_SWAPIN_VERIFY_BLOCKS`：支持全量校验或按当前 batch 前 N 个映射抽样校验
+- `GIDS_FORCE_SYNC_READ=1`：第一轮实验建议走同步读，优先验证正确性
+- `VLLM_BAM_CACHE_SIZE_MB=1024`：当前 roundtrip/shadow 脚本固定使用已验证通过的 BaM page cache 配置
+
+当前设计仍然保持“尽量解耦”：
+
+- `swap_out` 写路径仍由 `BaMShadowWriter` 负责
+- `swap_in` 读路径单独放在 `BaMSwapReader`
+- `CacheEngine` 只负责在原生路径和 `BaM` 路径之间分发
+
+最新真实 vLLM 闭环实验已经确认：
+
+- `swap_out` 触发 `24` 次
+- `swap_in` 触发 `24` 次
+- `BaM shadow write` 触发 `24` 次
+- `BaM swap_in readback` 触发 `24` 次
+- 端到端推理正常结束，日志中存在完整 `Run summary`
+- `BAM_SWAPIN_VERIFY` 全量校验通过 `24` 次
+- 全量校验 `9835` 个 mapping，对应 `275380` 个 layer-block
+- 日志中没有 `mismatch detected` 或 `Traceback`
+
+最新闭环实验的平均表现：
+
+- `swap_out` 平均 `409.79` mappings/次
+- `swap_out` 累计写出 `16.81 GiB`
+- `swap_out` 平均写出 `0.700 GiB`/次
+- `swap_out` 平均耗时 `396.80 ms`
+- `swap_out` 平均带宽 `1.86 GiB/s`
+- `swap_in` 累计读回 `16.81 GiB`
+- `swap_in` 平均读回 `0.700 GiB`/次
+- `swap_in` 平均耗时 `230.65 ms`
+- `swap_in` 平均带宽 `3.08 GiB/s`
+
+## 当前正确性结论
+
+截至 `2026-06-15` 的最新实验，可以确认真实 vLLM V0 调度路径下的数据正确性：
+
+- `Scheduler -> swap_out -> BaM write -> swap_in -> BaM read -> GPU cache restore` 这条链路已经真实发生
+- `swap_out` 和 `swap_in` 的次数一一对应
+- 每次 `swap_in` 后，读回的 GPU block 都与 `cpu_cache` 对应 block 做了 byte-level `torch.equal` 校验
+- 最新日志中 `24` 次 `[BAM_SWAPIN_VERIFY] mode=full ... exact=1`
+- 读回后程序完整生成了最终输出
+
+因此当前可以正式表述为：
+
+- “BaM swap roundtrip 已在真实 vLLM V0 调度路径中跑通”
+- “换出与换入链路已真实触发并完成”
+- “BaM swap_in 读回数据正确性已通过全量 byte-level 校验”
+
+需要同时保留的限制是：当前正确性结论是在 `GIDS_FORCE_SYNC_READ=1` 和 `VLLM_BAM_CACHE_SIZE_MB=1024` 下得到的。默认 `64MB` BaM page cache 会触发 page-cache 容量边界问题，后续需要单独修 BaM 小 cache 替换/回写路径。
+
+## 最新校验实现
+
+当前代码已经补上 `swap_in` 后的显式正确性校验逻辑，校验位置放在 `BaMSwapReader` 内部，保持和 `CacheEngine`、`BaMShadowWriter` 解耦：
+
+- 先按 `cpu_block_id -> row_id` 从 `BaM` 读回 block
+- 回填到 `gpu_cache`
+- 再把恢复后的 GPU block 与 `cpu_cache` 中对应 block 做 `torch.equal`
+- 若 `torch.equal` 失败，再补充 `torch.allclose` 与 `max_abs_diff` 作为诊断信息
+- 若存在不一致，直接抛出 `RuntimeError`
+
+当前支持两种模式：
+
+- 全量校验：`VLLM_BAM_SWAPIN_VERIFY=1` 且 `VLLM_BAM_SWAPIN_VERIFY_BLOCKS=0`
+- 抽样校验：`VLLM_BAM_SWAPIN_VERIFY=1` 且 `VLLM_BAM_SWAPIN_VERIFY_BLOCKS=N`
+
+当前抽样策略采用“当前 batch 前 N 个映射”，目的是让日志可重复、可复现。
+
+校验通过时，日志中会打印：
+
+- `[BAM_SWAPIN_VERIFY] mode=full checked_mappings=... exact=1`
+- 或 `[BAM_SWAPIN_VERIFY] mode=sample checked_mappings=... exact=1`
+
+最新真实 vLLM 日志已经实际看到这条校验成功记录，因此当前结论已经升级为：
+
+- “BaM swap_in 读回数据正确性已验证”
+
+## BaM Page Cache 配置说明
+
+当前实验脚本固定使用：
+
+- `VLLM_BAM_CACHE_SIZE_MB=1024`
+
+原因是当前一次真实 vLLM `swap_out` batch 大约包含：
+
+- `mappings ~= 390-422`
+- `num_layers=28`
+- 每个 layer block 为 `65536 bytes`
+
+也就是一次 batch 需要约 `11000-11816` 个 64KB page。默认 `64MB` BaM cache 只有：
+
+- `64MB / 64KB = 1024 pages`
+
+之前的失败点出现在 `first_bad_cpu_block=37`，对应 `37 * 28 = 1036 pages`，刚好越过 1024 page 边界。因此当前先固定 `1024MB`：
+
+- `1024MB / 64KB = 16384 pages`
+
+这个容量可以覆盖当前实验中的单次真实 swap batch，避免触发 BaM page-cache 替换路径的不稳定问题。
+
 ## 方案定位
 
-第一版采用 `shadow swap-out` 思路：
+当前阶段采用“保守闭环”思路：
 
 - 保留 `vLLM` 原生 `GPU -> CPU` 的 `swap_out`
 - 在同一次 `swap_out` 之后，额外将同批 KV block 再写一份到 `SSD(BaM)`
-- `swap_in` 暂时完全不改，仍然走原来的 `CPU -> GPU`
+- `swap_in` 第一轮先改成“可切换”
+  - 默认仍可走原来的 `CPU -> GPU`
+  - 开启 `VLLM_BAM_SWAPIN_ENABLE=1` 时，优先从 `BaM` 读回到 `GPU cache`
 
-因此，这一版的 `BaM` 角色不是新的主数据源，而是：
+因此，这一阶段的 `BaM` 角色还不是完全替代 `CPU swap` 的主后端，而是：
 
 - 一个影子写出后端
-- 一个可观测、可测量的 `GPU -> SSD` 数据通路原型
+- 一个可观测、可测量的 `GPU -> SSD -> GPU` 数据通路原型
 
 ## 为什么第一版要这样做
 
@@ -93,21 +213,22 @@
 1. 先保留原始 `CPU swap` 行为
 2. 额外接入 `GPU -> SSD(BaM)` 影子写出
 3. 先解决 block 布局、地址映射、吞吐测量
-4. 后续再考虑真正的 `SSD -> GPU swap_in`
+4. 先补最小 `SSD -> GPU swap_in`
+5. 再做更强的正确性与性能验证
 
 ## 第一版的明确目标
 
-第一版只验证下面四件事：
+当前阶段优先验证下面五件事：
 
 1. `GPU -> SSD(BaM)` 写出通路能稳定跑通
 2. SSD 上的 block 布局和映射关系清晰、可追踪
 3. 可以记录每批 `swap_out` 的写出耗时和带宽
-4. 不影响当前 `vLLM` 基于 `CPU swap` 的正常推理结果
+4. `SSD(BaM) -> GPU` 读回路径能按 block 正确恢复 KV cache
+5. 不影响当前 `vLLM` 正常推理结果
 
-第一版 **不要求**：
+当前阶段 **仍然不要求**：
 
 - 替换当前 `CPU swap`
-- 从 `SSD` 执行 `swap_in`
 - 实现异步预取
 - 改动 scheduler 策略
 - 做端到端加速结论
@@ -118,13 +239,17 @@
 
 `Scheduler -> BlockManager -> Worker.prepare -> Worker.execute -> CacheEngine.swap_out`
 
+当前 `swap_in` 主链路则是：
+
+`Scheduler -> BlockManager -> Worker.prepare -> Worker.execute -> CacheEngine.swap_in`
+
 第一版建议只在这条链路的最末端增加一个旁路动作：
 
 `CacheEngine.swap_out(GPU->CPU)` 结束后，再触发一次 `BaM shadow write`
 
 换句话说，主链路不变，只是在 `CacheEngine` 内部追加一个“把本轮换出的 block 再写到 SSD”的动作。
 
-## 推荐的数据通路形态
+## 当前推荐的数据通路形态
 
 第一版建议使用下面的逻辑：
 
@@ -138,6 +263,9 @@
    - `total_bytes`
    - `elapsed_ms`
    - `GiB/s`
+6. 当后续同一批 block 需要 `swap_in` 时：
+   - 若未开启 `VLLM_BAM_SWAPIN_ENABLE`，则继续走原生 `CPU -> GPU`
+   - 若开启 `VLLM_BAM_SWAPIN_ENABLE`，则由 `BaMSwapReader` 按 `cpu_block_id -> row_id` 从 `BaM` 读回，并回填到 `gpu_cache`
 
 ## 第一版推荐的模块边界
 
@@ -181,6 +309,18 @@
 - 统计并记录耗时、吞吐、映射范围
 
 它是第一版真正的数据面入口。
+
+### 4. `BaMSwapReader`
+
+职责：
+
+- 接收一次 `swap_in` 的 block 批次
+- 根据 `cpu_block_id` 生成 `BaM row id`
+- 从 `BaM` 读取对应 rows
+- 恢复成 `vLLM` 当前 KV block 布局
+- 把 block 写回 `gpu_cache`
+
+这一层与 `BaMShadowWriter` 分离，目的是保持读写逻辑解耦，避免把 `CacheEngine` 变成一个臃肿的大类。
 
 ## SSD 上的最小数据单位
 
@@ -237,7 +377,33 @@
 
 这样上层调度和 block 状态完全不需要知道 `BaM` 的存在。
 
-## 第一版的数据来源选择
+## 当前执行命令
+
+推荐先跑“同步读 + 最小闭环”版本：
+
+```bash
+cd /home/xhk/llm-inference/vllm
+bash evaluation/run_v100_v0_bam_swap_roundtrip.sh /home/xhk/model/Qwen3-0.6B
+```
+
+这个脚本默认会打开：
+
+- `VLLM_BAM_SHADOW_ENABLE=1`
+- `VLLM_BAM_SWAPIN_ENABLE=1`
+- `VLLM_BAM_SWAPIN_VERIFY=1`
+- `VLLM_BAM_SWAPIN_VERIFY_BLOCKS=0`
+- `VLLM_BAM_CACHE_SIZE_MB=1024`
+- `GIDS_FORCE_SYNC_READ=1`
+- `VLLM_V0_SWAP_TRACE=1`
+
+如果只想复现之前已经成功验证过的 shadow `swap_out` 写入路径，则继续使用：
+
+```bash
+cd /home/xhk/llm-inference/vllm
+bash evaluation/run_v100_v0_bam_shadow_swapout.sh /home/xhk/model/Qwen3-0.6B
+```
+
+## 当前数据来源选择
 
 这里有一个重要设计点：影子写 SSD 的数据，到底从哪里取。
 
@@ -293,16 +459,21 @@
 
 这样后续可以直接与当前 CPU 基线对齐比较。
 
-## 第一版成功标准
+## 当前已达成标准
 
-第一版建议用下面的标准判断是否“做成了”：
+截至 `2026-06-15`，第一版“可运行的 `GPU -> SSD -> GPU` 原型”已经达到下面标准：
 
-1. 开启 `bam shadow` 后，`vLLM` 推理结果与当前版本一致
-2. 在触发 `swap_out` 的 workload 下，日志中能稳定看到 `BaM shadow write` 事件
-3. SSD 侧能确认写出了对应 block 数据
-4. 可以统计每轮写出的 `ms/block` 和 `GiB/s`
+1. 开启 `BaM shadow` 后，真实 vLLM V0 推理可以正常结束
+2. 在触发 `swap_out` 的 workload 下，日志中稳定出现 `BaM shadow write`
+3. `swap_in` 可以从 `BaM` 读回并恢复到 `gpu_cache`
+4. `swap_in` 后已经对恢复 block 和 `cpu_cache` 参考 block 做全量 byte-level 校验
+5. 可以统计每轮 `swap_out_shadow / swap_in` 的 `ms/event` 和 `GiB/s`
 
-只要满足这四条，就可以认为第一版已经完成了“可运行的 `GPU -> SSD` 影子写出原型”。
+最新成功日志对应的数据：
+
+- `swap_out_shadow`：`24` 次，累计 `16.81 GiB`，平均 `396.80 ms/event`，平均 `1.86 GiB/s`
+- `swap_in`：`24` 次，累计 `16.81 GiB`，平均 `230.65 ms/event`，平均 `3.08 GiB/s`
+- 正确性：`24` 次全量校验通过，共 `9835` 个 mapping、`275380` 个 layer-block
 
 ## 与当前 CPU swap 基线的关系
 
@@ -313,38 +484,27 @@
 - 往返 `round_trip`：约 `0.84 ms/block`
 - 有效带宽：约 `4.0 GiB/s`
 
-第一版 `BaM shadow swap-out` 跑通后，最先要比较的就是：
+这次 BaM roundtrip 日志里的平均 mapping 数约为 `409.79`，对应粗略单 block 成本：
 
-- `GPU -> SSD` 的单向 `ms/block`
-- `GPU -> SSD` 的有效写带宽
-- 批量写出时的稳定性
+- BaM `swap_out_shadow`：约 `0.968 ms/block`
+- BaM `swap_in`：约 `0.563 ms/block`
+- BaM 同步读写合计：约 `1.531 ms/block`
 
-这一步先不比较端到端吞吐，只比较“写出这条通路本身”。
+这个比较只能作为当前同步路径的工程参考，不能直接得出最终 BaM 一定慢于 CPU swap 的结论。原因是当前实现仍保留原生 `GPU -> CPU` swap，并且 BaM 写入是 shadow 额外动作；读路径也固定为 `GIDS_FORCE_SYNC_READ=1`，还没有启用异步读、队列并发和调度重叠。
 
-## 第一版之后的自然下一步
+## 接下来建议
 
-当 shadow `swap_out` 跑通后，后续最自然的两条路是：
+当前最值得优先推进的是把这条线从“正确性闭环”推进到“性能基线清晰”：
 
-### 路线 1：先做写出基线完善
+1. 做同 workload 下的 CPU swap 与 BaM roundtrip 对照实验
+2. 把 `VLLM_BAM_SWAPIN_VERIFY` 从全量校验切到抽样或关闭，测去掉校验开销后的 BaM 读写成本
+3. 单独修 `64MB` BaM page cache 下的替换/回写问题，避免长期依赖 `1024MB`
+4. 在正确性和同步性能基线稳定后，再评估 BaM 异步读路径和预取重叠
 
-- 系统化测量不同 batch 大小下的 `GPU -> SSD` 写出成本
-- 与当前 `CPU swap_out` 基线做对照
-
-### 路线 2：开始设计 `SSD -> GPU swap_in`
-
-- 先做同步 `swap_in`
-- 后续再做异步预取和调度重叠
-
-建议顺序是：
-
-1. 先稳住 `swap_out`
-2. 再做 `swap_in`
-3. 最后才碰异步和 scheduler
+暂时不建议马上改 scheduler 或完全移除 CPU swap。当前最稳的路线是先保留 vLLM 原生语义，把 BaM 作为可切换、可验证、可测量的数据面后端逐步做实。
 
 ## 本文档对应的总建议
 
-一句话总结第一版方案：
+一句话总结当前阶段：
 
-**不要在第一步改掉 `vLLM` 当前的 `CPU swap` 语义，也不要一开始就重写 scheduler；先在 `CacheEngine.swap_out()` 后面增加一个 `BaM shadow writer`，把每批被换出的 KV block 额外写一份到 SSD，并把这条路径的 `ms/block` 与 `GiB/s` 测出来。**
-
-这就是当前阶段最稳妥、最清晰、最容易验证的第一版接入路线。
+**BaM 的真实 vLLM V0 换出换入闭环已经跑通，读回数据也通过全量 byte-level 校验；下一步不要急着重写 scheduler，而是先做同 workload 的 CPU/BaM 性能对照、降低校验开销、修小 page cache，再进入异步读和调度重叠。**

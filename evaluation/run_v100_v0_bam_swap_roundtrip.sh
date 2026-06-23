@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
-  echo "Usage: bash evaluation/run_v100_v0_bam_shadow_swapout.sh <model-or-local-path>"
+  echo "Usage: bash evaluation/run_v100_v0_bam_swap_roundtrip.sh <model-or-local-path>"
   exit 1
 fi
 
@@ -31,11 +31,15 @@ TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
 PREEMPTION_MODE="${PREEMPTION_MODE:-swap}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
 SEED="${SEED:-1234}"
+BAM_SWAPIN_ENABLE="${BAM_SWAPIN_ENABLE:-1}"
+GIDS_FORCE_SYNC_READ="${GIDS_FORCE_SYNC_READ:-1}"
+BAM_SWAPIN_VERIFY="${BAM_SWAPIN_VERIFY:-1}"
+BAM_SWAPIN_VERIFY_BLOCKS="${BAM_SWAPIN_VERIFY_BLOCKS:-0}"
 # 固定使用已验证通过的 BaM page cache 配置。
 BAM_CACHE_SIZE_MB="1024"
 
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
-RUN_LOG_PATH="${LOG_DIR}/v100_v0_bam_shadow_swapout_${TIMESTAMP}.log"
+RUN_LOG_PATH="${LOG_DIR}/v100_v0_bam_swap_roundtrip_${TIMESTAMP}.log"
 
 SUDO_CMD=(
   sudo env
@@ -44,9 +48,13 @@ SUDO_CMD=(
   "VLLM_USE_V1=0"
   "VLLM_V0_SWAP_TRACE=1"
   "VLLM_BAM_SHADOW_ENABLE=1"
+  "VLLM_BAM_SWAPIN_ENABLE=${BAM_SWAPIN_ENABLE}"
+  "VLLM_BAM_SWAPIN_VERIFY=${BAM_SWAPIN_VERIFY}"
+  "VLLM_BAM_SWAPIN_VERIFY_BLOCKS=${BAM_SWAPIN_VERIFY_BLOCKS}"
   "VLLM_BAM_IMPORT_PATH=${GIDS_MODULE_DIR}"
   "VLLM_BAM_CACHE_SIZE_MB=${BAM_CACHE_SIZE_MB}"
   "VLLM_ATTENTION_BACKEND=XFORMERS"
+  "GIDS_FORCE_SYNC_READ=${GIDS_FORCE_SYNC_READ}"
   "${PYTHON_BIN}"
   "${ROOT_DIR}/evaluation/v0_swap_trace_eval.py"
   "${MODEL}"

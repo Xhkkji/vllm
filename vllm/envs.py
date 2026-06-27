@@ -49,11 +49,22 @@ if TYPE_CHECKING:
     VLLM_BAM_LMCACHE_SHADOW_ENABLE: bool = False
     VLLM_BAM_LMCACHE_PREFER_LOAD_ENABLE: bool = False
     VLLM_BAM_LMCACHE_SHADOW_CHUNKS: int = 1024
+    VLLM_BAM_LMCACHE_READ_MODE: str = "sync"
+    VLLM_BAM_LMCACHE_BASE_ROW_OFFSET: int = 0
     VLLM_BAM_IMPORT_PATH: Optional[str] = None
     VLLM_BAM_CACHE_SIZE_MB: int = 64
     VLLM_BAM_NUM_SSD: int = 1
     VLLM_BAM_SSD_LIST: Optional[str] = None
     VLLM_BAM_CTRL_IDX: int = 0
+    VLLM_GDS_LMCACHE_SHADOW_ENABLE: bool = False
+    VLLM_GDS_LMCACHE_PREFER_LOAD_ENABLE: bool = False
+    VLLM_GDS_LMCACHE_PATH: str = "/tmp/vllm-bam-lmcache-gds"
+    VLLM_GDS_LMCACHE_USE_GDS: bool = True
+    VLLM_GDS_LMCACHE_USE_DIRECT_IO: bool = True
+    VLLM_GDS_LMCACHE_DEVICE: Optional[str] = None
+    VLLM_GDS_LMCACHE_FMT: str = "KV_2LTD"
+    VLLM_GDS_LMCACHE_USE_REGISTERED_BUFFER: bool = False
+    VLLM_GDS_LMCACHE_REGISTERED_BUFFER_MB: int = 0
     VLLM_CPU_OMP_THREADS_BIND: str = ""
     VLLM_CPU_MOE_PREPACK: bool = True
     VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
@@ -409,6 +420,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_BAM_LMCACHE_SHADOW_CHUNKS":
     lambda: int(os.getenv("VLLM_BAM_LMCACHE_SHADOW_CHUNKS", "1024")),
 
+    # LMCache BaM 读路径：
+    # - sync: 稳定同步 baseline
+    # - prefetch: page-level submit/poll/complete/refill 中间层，用于 GPU-initiated 路线
+    "VLLM_BAM_LMCACHE_READ_MODE":
+    lambda: os.getenv("VLLM_BAM_LMCACHE_READ_MODE", "sync"),
+
+    # LMCache chunk 在 BaM 逻辑 row 空间里的起始 row。默认 0 保持原热路径行为；
+    # cold-read replay 可设为 128，避开设备最前面的保留区域。
+    "VLLM_BAM_LMCACHE_BASE_ROW_OFFSET":
+    lambda: int(os.getenv("VLLM_BAM_LMCACHE_BASE_ROW_OFFSET", "0")),
+
     # 可选：显式指定 BaM Python 模块搜索路径。
     "VLLM_BAM_IMPORT_PATH":
     lambda: os.getenv("VLLM_BAM_IMPORT_PATH", None),
@@ -428,6 +450,42 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # BaM 使用的控制 GPU 编号。
     "VLLM_BAM_CTRL_IDX":
     lambda: int(os.getenv("VLLM_BAM_CTRL_IDX", "0")),
+
+    # 是否在 LMCache V0 的 put 路径上额外写一份 LMCache-style GDS 文件。
+    "VLLM_GDS_LMCACHE_SHADOW_ENABLE":
+    lambda: bool(int(os.getenv("VLLM_GDS_LMCACHE_SHADOW_ENABLE", "0"))),
+
+    # 是否在 LMCache V0 的 get 路径上优先从 LMCache-style GDS 读取。
+    "VLLM_GDS_LMCACHE_PREFER_LOAD_ENABLE":
+    lambda: bool(int(os.getenv("VLLM_GDS_LMCACHE_PREFER_LOAD_ENABLE", "0"))),
+
+    # LMCache-style GDS 的根目录，内部按 chunk_hash 前缀分两级目录。
+    "VLLM_GDS_LMCACHE_PATH":
+    lambda: os.getenv("VLLM_GDS_LMCACHE_PATH", "/tmp/vllm-bam-lmcache-gds"),
+
+    # 是否使用原生 cuFile/GDS。设为 0 时只作为 POSIX fallback 调试路径。
+    "VLLM_GDS_LMCACHE_USE_GDS":
+    lambda: bool(int(os.getenv("VLLM_GDS_LMCACHE_USE_GDS", "1"))),
+
+    # cuFile 路径是否使用 O_DIRECT，贴近 LMCache V1 GdsBackend 的 use_direct_io。
+    "VLLM_GDS_LMCACHE_USE_DIRECT_IO":
+    lambda: bool(int(os.getenv("VLLM_GDS_LMCACHE_USE_DIRECT_IO", "1"))),
+
+    # GDS staging tensor 使用的 CUDA device；为空时跟随 VLLM_BAM_CTRL_IDX。
+    "VLLM_GDS_LMCACHE_DEVICE":
+    lambda: os.getenv("VLLM_GDS_LMCACHE_DEVICE", None),
+
+    # LMCache V1 metadata 中的 MemoryFormat.value；默认贴近 V1 KV_2LTD。
+    "VLLM_GDS_LMCACHE_FMT":
+    lambda: os.getenv("VLLM_GDS_LMCACHE_FMT", "KV_2LTD"),
+
+    # 是否启用 V1-like 预注册 GPU staging buffer。
+    "VLLM_GDS_LMCACHE_USE_REGISTERED_BUFFER":
+    lambda: bool(int(os.getenv("VLLM_GDS_LMCACHE_USE_REGISTERED_BUFFER", "0"))),
+
+    # 预注册 staging buffer 大小。0 表示按首次 chunk 大小懒分配。
+    "VLLM_GDS_LMCACHE_REGISTERED_BUFFER_MB":
+    lambda: int(os.getenv("VLLM_GDS_LMCACHE_REGISTERED_BUFFER_MB", "0")),
 
     # (CPU backend only) CPU core ids bound by OpenMP threads, e.g., "0-31",
     # "0,1,2", "0-31,33". CPU cores of different ranks are separated by '|'.

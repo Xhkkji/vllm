@@ -163,7 +163,7 @@ LMCache SSD-only 这次还额外确认了两件事：
 
 ## 这份 baseline 和 BaM 的关系
 
-后续更合理的主线不是继续围绕 Mooncake，而是：
+后续更合理的主线是：
 
 1. 保留 `LMCache` 作为 control plane / connector baseline
 2. 把 `BaM` 作为 `SSD data plane backend`

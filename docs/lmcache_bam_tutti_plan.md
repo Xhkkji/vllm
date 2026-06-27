@@ -4,8 +4,7 @@
 
 This plan defines the new mainline for experiments in `vllm-bam`.
 
-We will no longer treat Mooncake as the primary development path.
-Instead, we will:
+The current `vllm-bam` mainline is:
 
 1. Use LMCache as the baseline.
 2. Integrate BaM underneath LMCache as a storage/backend tier.
@@ -22,7 +21,6 @@ The core architectural decision is:
 This means:
 
 - Do **not** start by building a brand-new standalone `BaMConnectorV1`.
-- Do **not** continue the mainline around Mooncake.
 - Do **not** keep BaM logic tied only to V0 `swap_in/swap_out`.
 
 Instead:
@@ -44,7 +42,9 @@ LMCache already provides:
 - disaggregated prefill/decode examples,
 - a cleaner baseline story for system comparison.
 
-This makes LMCache a much better baseline than a custom Mooncake-centered path.
+This makes LMCache a much better baseline than a custom connector-centered path.
+This keeps the comparison aligned with the current `vllm-bam`
+LMCache/BaM/GDS path instead of unrelated KV-transfer backends.
 
 ### Why BaM should live below LMCache
 
@@ -210,7 +210,7 @@ path.
 
 - `vllm/worker/cache_engine.py`
 - V0 swap path code
-- Mooncake connector/store files
+- upstream vLLM KV-transfer connectors that are unrelated to LMCache/BaM/GDS
 
 
 ## Integration Strategy
@@ -410,7 +410,7 @@ Build a comparison matrix:
 
 We should explicitly avoid the following in the current phase:
 
-- extending Mooncake further,
+- adding unrelated KV-transfer backends,
 - building a standalone `BaMConnectorV1` first,
 - rewriting LMCache core semantics,
 - widening the old V0 swap path before the LMCache path is validated.

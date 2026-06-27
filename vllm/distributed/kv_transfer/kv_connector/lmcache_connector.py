@@ -23,6 +23,132 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _get_lmcache_retrieve_token_limit(
+    total_seq_len: int,
+    vllm_num_computed_tokens: int,
+    min_query_len: int,
+) -> int:
+    """复制 LMCache V0 retrieve 前缀截断规则。
+
+    这里不能直接取完整 prompt 去 prefetch，否则 BaM 会预取 LMCache retrieve
+    最后不会真正消费的尾部 chunk。规则要和 LMCache V0 adapter 里的
+    `_get_retrieve_token_limit()` 保持一致：
+
+    - 至少给 vLLM 留 `min_query_len` 个 token 自己重算
+    - LMCache/BaM 只预取真正可能被 `engine.retrieve()` 消费的前缀 chunk
+    """
+    min_query_len = max(min_query_len, 1)
+    min_query_len = min(min_query_len, total_seq_len)
+    max_computed_tokens = max(total_seq_len - min_query_len, 0)
+    max_lmc_num_computed_tokens = max(
+        max_computed_tokens - vllm_num_computed_tokens, 0)
+    return vllm_num_computed_tokens + max_lmc_num_computed_tokens
+
+
+def _maybe_prefetch_lmcache_bam_chunks(
+    engine: object,
+    model_input: "ModelInputForGPUWithSamplingMetadata",
+    retrieve_status: List[object],
+) -> None:
+    """在 LMCache retrieve 前提前提交 BaM chunk 读取。
+
+    当前 V0 LMCache adapter 的真实 retrieve 仍是逐 chunk blocking get：
+
+    ```text
+    engine.retrieve(...)
+      -> storage_manager.get(key)
+      -> BaM load / LMCache fallback
+    ```
+
+    这里复用 LMCache 已有的 `engine.prefetch(tokens, mask)` 入口，在进入
+    `engine.retrieve()` 前先把同一批 chunk key 交给 storage manager。
+    对 BaM wrapper 来说，这会触发：
+
+    ```text
+    storage_manager.prefetch(key)
+      -> BaM prepare_request()
+      -> BaM submit_request()
+    ```
+
+    之后真正的 `storage_manager.get(key)` 会消费已经提交的 request，
+    做 poll/complete/refill。CPU 仍负责“哪些 chunk 要读”的粗粒度决策；
+    BaM/GPU 负责 page id 请求表和数据读取链路。
+    """
+    if not (envs.VLLM_BAM_LMCACHE_PREFER_LOAD_ENABLE
+            and envs.VLLM_BAM_LMCACHE_READ_MODE == "prefetch"):
+        return
+
+    if getattr(engine, "config", None) is None:
+        return
+    if getattr(engine.config, "enable_blending", False):
+        return
+
+    attn_metadata = model_input.attn_metadata
+    sampling_metadata = model_input.sampling_metadata
+    if attn_metadata is None or sampling_metadata is None:
+        return
+
+    query_start_loc = getattr(attn_metadata, "query_start_loc", None)
+    seq_lens = getattr(attn_metadata, "seq_lens", None)
+    seq_group_list = getattr(sampling_metadata, "seq_groups", None)
+    if query_start_loc is None or seq_lens is None or seq_group_list is None:
+        return
+
+    chunk_size = int(engine.config.chunk_size)
+    idx = 0
+    for seq_group in seq_group_list:
+        for seq_id in seq_group.seq_ids:
+            seq_data = seq_group.seq_data[seq_id]
+            status = retrieve_status[idx]
+            status_name = getattr(status, "name", str(status))
+
+            # 这几个判断要和 LMCache V0 retrieve 保持一致，避免预取不会被
+            # retrieve 消费的 chunk。
+            if status_name == "NONE":
+                idx += 1
+                continue
+
+            total_seq_len = (seq_lens[idx] if status_name == "CHUNK_PREFILL"
+                             else seq_data.get_len())
+            full_token_tensor = torch.tensor(
+                seq_data.get_token_ids()[:total_seq_len], device="cpu")
+
+            vllm_num_required_tokens = (query_start_loc[idx + 1] -
+                                        query_start_loc[idx]).item()
+            vllm_num_required_tokens = int(vllm_num_required_tokens)
+            if vllm_num_required_tokens < chunk_size:
+                idx += 1
+                continue
+
+            vllm_num_computed_tokens = total_seq_len - vllm_num_required_tokens
+            vllm_num_computed_tokens_align = (
+                vllm_num_computed_tokens // chunk_size * chunk_size)
+
+            token_mask = torch.ones_like(full_token_tensor, dtype=torch.bool)
+            token_mask[:vllm_num_computed_tokens_align] = False
+            retrieve_token_limit = _get_lmcache_retrieve_token_limit(
+                total_seq_len=total_seq_len,
+                vllm_num_computed_tokens=vllm_num_computed_tokens,
+                min_query_len=chunk_size,
+            )
+
+            prefetch_tokens = full_token_tensor[:retrieve_token_limit]
+            prefetch_mask = token_mask[:retrieve_token_limit]
+            if torch.sum(prefetch_mask).item() <= 0:
+                idx += 1
+                continue
+
+            logger.info(
+                "[LMCACHE_BAM_EARLY_PREFETCH] engine.prefetch tokens=%d "
+                "masked_tokens=%d chunk_size=%d",
+                len(prefetch_tokens),
+                int(torch.sum(prefetch_mask).item()),
+                chunk_size,
+            )
+            engine.prefetch(prefetch_tokens, prefetch_mask)
+            idx += 1
+
+
 class LMCacheConnector(KVConnectorBase):
 
     def __init__(
@@ -61,6 +187,25 @@ class LMCacheConnector(KVConnectorBase):
         self.store_status = StoreStatus
         self.retrieve_status = RetrieveStatus
 
+        if (envs.VLLM_GDS_LMCACHE_SHADOW_ENABLE
+                or envs.VLLM_GDS_LMCACHE_PREFER_LOAD_ENABLE) and \
+                self.engine is not None:
+            # 可选 LMCache-style GDS wrapper：
+            # - 默认关闭，不影响原始 LMCache SSD
+            # - 可单独 shadow / prefer-load
+            # - 若同时开启 BaM，BaM wrapper 会在外层，优先级更高
+            from vllm.bam.lmcache_gds_storage import LMCacheGDSStorageManager
+            self.engine.storage_manager = LMCacheGDSStorageManager(
+                self.engine.storage_manager)
+            logger.info(
+                "Enabled LMCache-style GDS storage wrapper for V0 connector. "
+                "shadow_enable=%s prefer_load_enable=%s path=%s use_gds=%s",
+                envs.VLLM_GDS_LMCACHE_SHADOW_ENABLE,
+                envs.VLLM_GDS_LMCACHE_PREFER_LOAD_ENABLE,
+                envs.VLLM_GDS_LMCACHE_PATH,
+                envs.VLLM_GDS_LMCACHE_USE_GDS,
+            )
+
         if (envs.VLLM_BAM_LMCACHE_SHADOW_ENABLE
                 or envs.VLLM_BAM_LMCACHE_PREFER_LOAD_ENABLE) and \
                 self.engine is not None:
@@ -85,11 +230,32 @@ class LMCacheConnector(KVConnectorBase):
                "ModelInputForGPUWithSamplingMetadata"]:
 
         retrieve_status = self.lmcache_should_retrieve(model_input)
+        self._maybe_prefetch_bam_chunks(model_input, retrieve_status)
         model_input, bypass_model_exec, hidden_or_intermediate_states =\
             self.lmcache_retrieve_kv(
                 model_executable, model_input, self.cache_config, kv_caches,
                 retrieve_status)
         return hidden_or_intermediate_states, bypass_model_exec, model_input
+
+    def _maybe_prefetch_bam_chunks(
+        self,
+        model_input: "ModelInputForGPUWithSamplingMetadata",
+        retrieve_status: List[object],
+    ) -> None:
+        """真实 vLLM retrieve 前的 BaM early-prefetch hook。
+
+        hook 放在 connector 层而不是 LMCache 源码里，是为了保持 vllm-bam
+        主线和 LMCache V0 repo 解耦。失败只记日志，不影响原始 retrieve。
+        """
+        if self.engine is None:
+            return
+        try:
+            _maybe_prefetch_lmcache_bam_chunks(self.engine, model_input,
+                                               retrieve_status)
+        except Exception:
+            logger.exception(
+                "[LMCACHE_BAM_EARLY_PREFETCH] failed before retrieve; "
+                "continue with normal LMCache retrieve")
 
     def send_kv_caches_and_hidden_states(
         self,

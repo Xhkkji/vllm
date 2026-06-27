@@ -205,3 +205,9 @@ shellcheck*/
 
 # Ingore moe/marlin_moe gen code
 csrc/moe/marlin_moe_wna16/kernel_*
+
+# Evaluation generated binary payloads
+evaluation/logs/**/lmcache_gds/
+evaluation/logs/**/*.safetensors
+evaluation/logs/**/*.bin
+evaluation/logs/**/*.pt

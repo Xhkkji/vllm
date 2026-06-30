@@ -30,18 +30,27 @@ SUMMARY_WARMUP_SAMPLES="${SUMMARY_WARMUP_SAMPLES:-1}"
 BATCH_PREFETCH_WARMUP="${BATCH_PREFETCH_WARMUP:-1}"
 BAM_LMCACHE_READ_MODE="${BAM_LMCACHE_READ_MODE:-}"
 if [[ -z "${BAM_LMCACHE_READ_MODE}" ]]; then
-  if [[ "${BACKEND}" == "bam_prefetch" || "${BACKEND}" == "bam_prefetch_batch" ]]; then
-    # replay 的 bam_prefetch backend 显式测试 page-level submit/poll/get/refill。
+  if [[ "${BACKEND}" == "bam_prefetch" || "${BACKEND}" == "bam_prefetch_batch" || \
+        "${BACKEND}" == "bam_kv_fast_path" || "${BACKEND}" == "bam_kv_fast_path_batch" ]]; then
+    # replay 的 prefetch/KV backend 都需要 rowctx，不能强制 GIDS 同步读。
     BAM_LMCACHE_READ_MODE="prefetch"
   else
     BAM_LMCACHE_READ_MODE="sync"
   fi
 fi
+if [[ "${BACKEND}" == "bam_kv_fast_path" || "${BACKEND}" == "bam_kv_fast_path_batch" ]]; then
+  VLLM_BAM_KV_FAST_PATH_VALUE="${VLLM_BAM_KV_FAST_PATH:-1}"
+else
+  VLLM_BAM_KV_FAST_PATH_VALUE="${VLLM_BAM_KV_FAST_PATH:-0}"
+fi
+VLLM_BAM_KV_EXECUTOR_VALUE="${VLLM_BAM_KV_EXECUTOR:-rowctx}"
 TRACE_JSONL="${TRACE_JSONL:-}"
 
 # 只有 BaM 需要访问 /dev/libnvm0，GDS/LMCache-GDS baseline 不需要 sudo。
 if [[ "${BACKEND}" == "bam" || "${BACKEND}" == "bam_prefetch" || \
       "${BACKEND}" == "bam_prefetch_batch" || \
+      "${BACKEND}" == "bam_kv_fast_path" || \
+      "${BACKEND}" == "bam_kv_fast_path_batch" || \
       "${BACKEND}" == "bam_cold_read" || "${BACKEND}" == "all" ]]; then
   USE_SUDO="${USE_SUDO:-1}"
 else
@@ -88,6 +97,8 @@ CMD=(env
   "VLLM_BAM_CTRL_IDX=${VLLM_BAM_CTRL_IDX:-0}"
   "VLLM_BAM_LMCACHE_SHADOW_CHUNKS=${VLLM_BAM_LMCACHE_SHADOW_CHUNKS:-1024}"
   "VLLM_BAM_LMCACHE_READ_MODE=${BAM_LMCACHE_READ_MODE}"
+  "VLLM_BAM_KV_FAST_PATH=${VLLM_BAM_KV_FAST_PATH_VALUE}"
+  "VLLM_BAM_KV_EXECUTOR=${VLLM_BAM_KV_EXECUTOR_VALUE}"
   "GIDS_FORCE_SYNC_READ=${GIDS_FORCE_SYNC_READ_VALUE}"
   "LMCACHE_CHUNK_SIZE=${SLOT_NUM_TOKENS}"
   "${PYTHON_BIN}"

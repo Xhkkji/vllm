@@ -29,6 +29,9 @@ from typing import Any, Dict, Optional
 import torch
 
 import vllm.envs as envs
+from vllm.bam.lmcache_bam_direct_placement import (
+    place_bam_results_to_vllm_kvcache)
+from vllm.bam.lmcache_bam_kv_fast_path import LMCacheBaMKVFastPath
 from vllm.bam.lmcache_bam_prefetch import (LMCacheBaMChunkReadRequest,
                                            LMCacheBaMPagePipeline)
 from vllm.bam.row_store_loader import (import_bam_row_store,
@@ -255,8 +258,11 @@ class LMCacheBaMStore:
         self._chunk_metadata: Dict[str, BaMChunkMetadata] = {}
         self._slot_lock = threading.Lock()
         self._prefetch_pipeline: Optional[LMCacheBaMPagePipeline] = None
+        self._kv_fast_path: Optional[LMCacheBaMKVFastPath] = None
         self._prefetch_lock = threading.Lock()
         self._prefetch_requests: Dict[str, LMCacheBaMChunkReadRequest] = {}
+        self._kv_batch_pending_keys: "OrderedDict[str, Any]" = OrderedDict()
+        self._kv_batch_loaded_tensors: Dict[str, torch.Tensor] = {}
 
     @classmethod
     def from_kv_shape(cls, kv_shape: torch.Size,
@@ -303,7 +309,7 @@ class LMCacheBaMStore:
             "slot_num_tokens=%d hidden_dim=%d page_token_capacity=%d "
             "pages_per_kv_layer=%d cache_size_mb=%d num_ssd=%d ssd_list=%s "
             "ctrl_idx=%d read_mode=%s gids_force_sync_read=%s "
-            "base_row_offset=%d",
+            "base_row_offset=%d kv_fast_path=%s",
             layout.page_bytes,
             num_rows,
             layout.pages_per_chunk,
@@ -320,6 +326,7 @@ class LMCacheBaMStore:
             read_mode,
             os.environ.get("GIDS_FORCE_SYNC_READ", ""),
             base_row_offset,
+            envs.VLLM_BAM_KV_FAST_PATH,
         )
         return cls(row_store=row_store,
                    layout=layout,
@@ -516,6 +523,33 @@ class LMCacheBaMStore:
             metadata=metadata,
         )
 
+    def load_chunk_tensor_kv_fast_path(self, key: Any) -> Optional[torch.Tensor]:
+        """用 KVCache 专用 fast path 读取 chunk。
+
+        这里是第 2 档路线在 vLLM 侧的入口。和 prefetch 中间层相比，它不再
+        把上层接口暴露为通用 row/page 读取，而是明确表达为：
+
+        ```text
+        chunk metadata
+          -> KV request descriptor
+          -> BaM KV store
+          -> [pages_per_chunk, 128KB]
+          -> LMCache KV tensor
+        ```
+
+        当前内部仍复用 BaM rowctx；后续底层替换成 GPU worker 时，上层
+        storage manager 不需要改变。
+        """
+        chunk_hash = _extract_chunk_hash(key)
+        metadata = self._lookup_metadata(chunk_hash)
+        if metadata is None:
+            return None
+
+        return self._ensure_kv_fast_path().load_chunk_tensor(
+            chunk_hash=chunk_hash,
+            metadata=metadata,
+        )
+
     def _ensure_prefetch_pipeline(self) -> LMCacheBaMPagePipeline:
         """懒创建 page-level prefetch pipeline。
 
@@ -529,6 +563,20 @@ class LMCacheBaMStore:
                 device=f"cuda:{envs.VLLM_BAM_CTRL_IDX}",
             )
         return self._prefetch_pipeline
+
+    def _ensure_kv_fast_path(self) -> LMCacheBaMKVFastPath:
+        """懒创建 KVCache 专用 fast path。
+
+        它和 sync/prefetch 共享同一个 BaMRowStore，因此不会重复初始化 BaM
+        controller/page cache。这里创建的只是一个 KV 语义适配层。
+        """
+        if self._kv_fast_path is None:
+            self._kv_fast_path = LMCacheBaMKVFastPath(
+                row_store=self.row_store,
+                layout=self.layout,
+                device=f"cuda:{envs.VLLM_BAM_CTRL_IDX}",
+            )
+        return self._kv_fast_path
 
     def prefetch_chunk(self, key: Any) -> bool:
         """提前提交一个 chunk 的 BaM page read 请求。
@@ -647,6 +695,331 @@ class LMCacheBaMStore:
 
         return self._ensure_prefetch_pipeline().load_chunk_tensors_batch(items)
 
+    def load_chunk_tensors_kv_fast_path_batch(
+        self,
+        keys: list[Any],
+    ) -> dict[str, torch.Tensor]:
+        """批量走 KVCache 专用 fast path。
+
+        这是第 2 档路线的第一阶段 microbench 入口。它和已有
+        `load_chunk_tensors_prefetch_batch()` 的输出一致，但内部上层接口已经
+        换成 KV descriptor：
+
+        ```text
+        [key, ...]
+          -> [(chunk_hash, metadata), ...]
+          -> [BaMKVRequest, ...]
+          -> [chunk, pages_per_chunk, 128KB]
+          -> {chunk_hash: KV tensor}
+        ```
+        """
+        items: list[tuple[str, BaMChunkMetadata]] = []
+        for key in keys:
+            chunk_hash = _extract_chunk_hash(key)
+            metadata = self._lookup_metadata(chunk_hash)
+            if metadata is None:
+                raise KeyError(f"BaM chunk not found: {chunk_hash}")
+            items.append((chunk_hash, metadata))
+
+        if not items:
+            return {}
+
+        return self._ensure_kv_fast_path().load_chunk_tensors_batch(items)
+
+    def read_chunk_pages_kv_fast_path_batch(
+        self,
+        keys: list[Any],
+    ) -> list[Any]:
+        """批量读取 BaM pages，供 direct placement 使用。
+
+        与 `load_chunk_tensors_kv_fast_path_batch()` 的区别：
+
+        - 不调用 Triton refill
+        - 不构造 `[2, layers, tokens, hidden]` LMCache tensor
+        - 返回底层 BaM pages result，让上层直接写入 vLLM paged KV cache
+
+        这正是 Tutti/TARDIS 路线里“减少中间 tensor/rebuild”的第一步。
+        """
+        items: list[tuple[str, BaMChunkMetadata]] = []
+        for key in keys:
+            chunk_hash = _extract_chunk_hash(key)
+            metadata = self._lookup_metadata(chunk_hash)
+            if metadata is None:
+                raise KeyError(f"BaM chunk not found: {chunk_hash}")
+            items.append((chunk_hash, metadata))
+
+        if not items:
+            return []
+
+        return self._ensure_kv_fast_path().read_chunk_pages_batch(items)
+
+    def _collect_direct_placement_entries(
+        self,
+        *,
+        token_database: Any,
+        tokens: torch.Tensor,
+        mask: Optional[torch.Tensor],
+    ) -> list[tuple[int, int, Any]]:
+        """收集本轮 direct placement 可由 BaM 服务的前缀 chunks。
+
+        这里刻意把“命中判断”和“真正发起 I/O”拆开，原因有两个：
+
+        1. 让 `LMCacheBaMStorageManager` 不需要知道 token_database 的迭代细节，
+           它只负责把 direct placement 请求转交给 BaM store。
+        2. 保持 LMCache prefix 语义不变。`process_tokens()` 产出的 chunk 是按前缀
+           顺序排列的，一旦中间有一个 chunk 在 BaM 中缺失，就必须停止；否则
+           后面的 chunk 即使存在，也不能越过缺口直接注回 vLLM KV cache。
+
+        返回值中的三元组含义：
+
+        ```text
+        (start, end, key)
+        ```
+
+        其中 `start/end` 使用的是当前 `tokens` / `slot_mapping` 这一段局部坐标，
+        后续 placement kernel 会用它把 chunk 对应的 token 范围映射回正确 slot。
+        """
+        entries: list[tuple[int, int, Any]] = []
+        for start, end, key in token_database.process_tokens(tokens, mask):
+            metadata = self.get_chunk_metadata(key)
+            if metadata is None:
+                # direct placement 只能消费“连续前缀命中”。
+                # 因此一旦这里遇到第一个 miss，就必须立刻停止，并把断点
+                # 记录下来，帮助排查“为什么前几个 chunk 能复用、最后一个
+                # 不能复用”的具体位置。
+                logger.info(
+                    "[LMCACHE_BAM_DIRECT_PLACEMENT_PREFIX_BREAK] "
+                    "prefix_chunks=%d miss_range=[%d,%d) chunk_hash=%s",
+                    len(entries),
+                    int(start),
+                    int(end),
+                    _extract_chunk_hash(key)[:16],
+                )
+                break
+            entries.append((int(start), int(end), key))
+        return entries
+
+    def direct_place_chunks_to_vllm_kvcache(
+        self,
+        *,
+        token_database: Any,
+        tokens: torch.Tensor,
+        mask: Optional[torch.Tensor],
+        kv_caches: list[torch.Tensor],
+        slot_mapping: torch.Tensor,
+        kv_cache_dtype: str = "auto",
+        num_kv_heads: int,
+        head_size: int,
+    ) -> Optional[torch.Tensor]:
+        """把 BaM 命中的前缀 chunks 直接写入 vLLM paged KV cache。
+
+        这是 Direct Placement v0 在 `LMCacheBaMStore` 里的数据面总入口。
+        它把原来分散在 storage manager 里的几步操作收口到一起：
+
+        ```text
+        token_database.process_tokens()
+          -> 找到 BaM 可服务的前缀 chunks
+          -> BaM KV fast path batch read pages
+          -> direct placement 写入 vLLM paged KV cache
+          -> 返回 ret_mask 给 LMCache adapter
+        ```
+
+        返回值语义：
+
+        - `torch.Tensor`:
+            BaM 已经成功服务至少一个 chunk，返回当前这部分命中的 ret_mask。
+            LMCache adapter 会按这份 mask 重建 model input。
+        - `None`:
+            当前请求不应继续走 direct placement，调用方应回退到 LMCache 原始
+            retrieve 路径。典型场景包括：
+            - BaM 还没初始化 / 当前没写入过 metadata
+            - 这个前缀在 BaM 中 0 命中
+            - KV fast path 未启用
+
+        这里把“0 命中”定义为 `None` 而不是全 False mask，是为了避免误吞掉
+        原始 LMCache SSD retrieve。否则 direct placement 开关一开，BaM 没命中
+        时就会直接返回 miss，后面的 LMCache fallback 根本没有机会执行。
+        """
+        if not envs.VLLM_BAM_KV_FAST_PATH:
+            return None
+
+        masked_tokens = int(mask.sum().item()) if mask is not None else len(tokens)
+        logger.info(
+            "[LMCACHE_BAM_DIRECT_PLACEMENT_ENTER] tokens=%d masked_tokens=%d "
+            "slot_mapping=%d",
+            len(tokens),
+            masked_tokens,
+            int(slot_mapping.numel()),
+        )
+        entries = self._collect_direct_placement_entries(
+            token_database=token_database,
+            tokens=tokens,
+            mask=mask,
+        )
+        if not entries:
+            logger.info(
+                "[LMCACHE_BAM_DIRECT_PLACEMENT_NO_PREFIX_HIT] "
+                "tokens=%d masked_tokens=%d",
+                len(tokens),
+                masked_tokens,
+            )
+            return None
+
+        keys = [key for _, _, key in entries]
+        chunk_ranges = ",".join(f"[{start},{end})" for start, end, _ in entries)
+        chunk_hashes = ",".join(_extract_chunk_hash(key)[:16] for key in keys)
+        logger.info(
+            "[LMCACHE_BAM_DIRECT_PLACEMENT_PREFIX_HIT] chunks=%d ranges=%s "
+            "chunk_hashes=%s",
+            len(entries),
+            chunk_ranges,
+            chunk_hashes,
+        )
+
+        read_start = time.perf_counter()
+        logger.info(
+            "[LMCACHE_BAM_DIRECT_PLACEMENT_READ_BEGIN] batch_size=%d "
+            "chunk_hashes=%s",
+            len(keys),
+            chunk_hashes,
+        )
+        results = self.read_chunk_pages_kv_fast_path_batch(keys)
+        read_ms = (time.perf_counter() - read_start) * 1000.0
+        if not results:
+            logger.info(
+                "[LMCACHE_BAM_DIRECT_PLACEMENT_READ_EMPTY] batch_size=%d "
+                "read_ms=%.3f",
+                len(keys),
+                read_ms,
+            )
+            return None
+
+        # token_database 和 slot_mapping 使用同一段 tokens 的局部坐标系。
+        # 例如 mask 前缀有 False 时，第一条可 retrieve 的 chunk 起点可能不是 0。
+        # 这里必须保留这个局部偏移，不能人为重编号，否则 placement 会把数据写
+        # 到错误的 vLLM physical slot。
+        chunk_starts = [start for start, _, _ in entries]
+        place_stats = place_bam_results_to_vllm_kvcache(
+            results=results,
+            layout=self.layout,
+            kv_caches=kv_caches,
+            slot_mapping=slot_mapping,
+            chunk_starts=chunk_starts,
+            kv_cache_dtype=kv_cache_dtype,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+        )
+
+        ret_mask = torch.zeros_like(tokens, dtype=torch.bool, device="cpu")
+        for start, end, _ in entries:
+            ret_mask[start:end] = True
+
+        total_bytes = sum(int(result.descriptor.total_bytes) for result in results)
+        total_tokens = int(ret_mask.sum().item())
+        batch_stats = results[0].stats
+        logger.info(
+            "[LMCACHE_BAM_DIRECT_PLACEMENT_READ] batch_size=%d total_bytes=%d "
+            "submit_ms=%.3f poll_ms=%.3f poll_iters=%d get_ms=%.3f "
+            "read_ms=%.3f executor=%s worker_backend=%s",
+            len(results),
+            total_bytes,
+            batch_stats.submit_ms,
+            batch_stats.poll_ms,
+            batch_stats.poll_iters,
+            batch_stats.get_ms,
+            read_ms,
+            getattr(batch_stats, "executor_name", "rowctx"),
+            getattr(batch_stats, "worker_backend", "rowctx"),
+        )
+        logger.info(
+            "[LMCACHE_BAM_DIRECT_PLACEMENT] chunks=%d tokens=%d "
+            "impl=%s read_ms=%.3f refill_ms=%.3f transfer_ms=%.3f "
+            "fused_ms=%.3f place_ms=%.3f total_ms=%.3f",
+            len(entries),
+            total_tokens,
+            place_stats.impl,
+            read_ms,
+            place_stats.refill_ms,
+            place_stats.transfer_ms,
+            place_stats.fused_ms,
+            place_stats.place_ms,
+            read_ms + place_stats.place_ms,
+        )
+        return ret_mask
+
+    def enqueue_kv_fast_path_prefetch_key(self, key: Any) -> bool:
+        """登记本轮 LMCache retrieve 可能会读取的 key。
+
+        第一版真实 vLLM batch fast path 仍然由 CPU 做粗粒度决策：
+
+        ```text
+        LMCache engine.prefetch(tokens, mask)
+          -> storage_manager.prefetch(key)
+          -> enqueue key
+        ```
+
+        这里不立即 submit BaM IO，而是把同一轮 retrieve 的 key 收集起来。
+        第一次 `get(key)` 进来时，再把这批 key 一次性走
+        `load_chunk_tensors_kv_fast_path_batch()`，避免逐 key 串行 read/refill。
+        """
+        chunk_hash = _extract_chunk_hash(key)
+        metadata = self._lookup_metadata(chunk_hash)
+        if metadata is None:
+            return False
+
+        with self._prefetch_lock:
+            self._kv_batch_pending_keys[chunk_hash] = key
+            logger.info(
+                "[LMCACHE_BAM_KV_FAST_PATH_PREFETCH_ENQUEUE] "
+                "chunk_hash=%s pending=%d",
+                chunk_hash[:16],
+                len(self._kv_batch_pending_keys),
+            )
+        return True
+
+    def consume_kv_fast_path_tensor(self, key: Any) -> Optional[torch.Tensor]:
+        """消费 KV fast path batch 结果。
+
+        返回值语义：
+
+        - 有 batch 结果：返回已经读好的 tensor
+        - 有 pending keys 但还没加载：触发一次 batch read，然后返回当前 key
+        - 当前 key 不在 batch 中：返回 None，让调用方退回单 chunk fast path
+
+        这保持了正确性：即使某个 key 没被 prefetch 阶段收集，也仍能在 get
+        阶段用单 chunk fast path 读取。
+        """
+        chunk_hash = _extract_chunk_hash(key)
+        with self._prefetch_lock:
+            tensor = self._kv_batch_loaded_tensors.pop(chunk_hash, None)
+            if tensor is not None:
+                return tensor
+
+            if chunk_hash not in self._kv_batch_pending_keys:
+                return None
+
+            pending_items = list(self._kv_batch_pending_keys.items())
+            self._kv_batch_pending_keys.clear()
+
+        # BaM IO 和 Triton refill 不应在锁内执行；否则其它 LMCache 调用会被
+        # Python lock 额外阻塞。
+        keys = [item_key for _, item_key in pending_items]
+        tensors = self.load_chunk_tensors_kv_fast_path_batch(keys)
+
+        with self._prefetch_lock:
+            for loaded_hash, loaded_tensor in tensors.items():
+                self._kv_batch_loaded_tensors[loaded_hash] = loaded_tensor
+            tensor = self._kv_batch_loaded_tensors.pop(chunk_hash, None)
+
+        logger.info(
+            "[LMCACHE_BAM_KV_FAST_PATH_BATCH_CONSUME] requested=%s "
+            "batch_size=%d hit=%s",
+            chunk_hash[:16],
+            len(pending_items),
+            tensor is not None,
+        )
+        return tensor
+
 
 class LMCacheMemoryObjAdapter:
     """把 BaM 读回 tensor 回填到 LMCache 的 memory_obj。"""
@@ -737,6 +1110,11 @@ class LMCacheBaMStorageManager:
             parse_optional_int_list(envs.VLLM_BAM_SSD_LIST),
             envs.VLLM_BAM_CTRL_IDX,
         )
+        logger.info(
+            "[LMCACHE_BAM] env gids_registered_poll_impl=%s gids_kv_worker_poll_impl=%s",
+            os.environ.get("GIDS_REGISTERED_POLL_IMPL", "<unset>"),
+            os.environ.get("GIDS_KV_WORKER_POLL_IMPL", "<unset>"),
+        )
 
     def _ensure_bam_store(self, memory_obj: Any) -> Optional[LMCacheBaMStore]:
         # BaM store 只在第一次真正看到 tensor 时初始化。
@@ -769,8 +1147,8 @@ class LMCacheBaMStorageManager:
         # prefer-load 的顺序是：
         #   1. 根据 chunk_hash 找到元数据
         #   2. 在 LMCache storage 侧先申请一个同形状的 memory_obj
-        #   3. 从 BaM 读回 tensor。sync 模式走完整 chunk 同步读；
-        #      prefetch 模式走 page-level submit/poll/get/refill 中间层。
+        #   3. 从 BaM 读回 tensor。默认保持原 sync/prefetch 行为；
+        #      开启 VLLM_BAM_KV_FAST_PATH 后走 KVCache 专用 descriptor 路径。
         #   4. 把 tensor 回填进 LMCache 的 memory_obj
         if self._bam_store is None:
             return None
@@ -783,7 +1161,21 @@ class LMCacheBaMStorageManager:
         if memory_obj is None:
             return None
 
-        if envs.VLLM_BAM_LMCACHE_READ_MODE == "prefetch":
+        if envs.VLLM_BAM_KV_FAST_PATH:
+            logger.info(
+                "[LMCACHE_BAM_KV_FAST_PATH_GET] chunk_hash=%s "
+                "mode=batch_or_single",
+                _extract_chunk_hash(key)[:16],
+            )
+            tensor = self._bam_store.consume_kv_fast_path_tensor(key)
+            if tensor is None:
+                logger.info(
+                    "[LMCACHE_BAM_KV_FAST_PATH_GET_FALLBACK_SINGLE] "
+                    "chunk_hash=%s batch_miss=True",
+                    _extract_chunk_hash(key)[:16],
+                )
+                tensor = self._bam_store.load_chunk_tensor_kv_fast_path(key)
+        elif envs.VLLM_BAM_LMCACHE_READ_MODE == "prefetch":
             # 如果上游已经调用过 `storage_manager.prefetch(key)`，
             # 这里优先消费那次已提交的 BaM request；否则回到原来的 blocking
             # prefetch 读。这样 early prefetch 是纯优化，不是正确性前提。
@@ -810,13 +1202,61 @@ class LMCacheBaMStorageManager:
         `storage_manager.prefetch(key)`。这里把同名接口接到 BaM：
 
         - 开启 BaM prefer-load + read_mode=prefetch 时：提交 BaM page read
+        - 开启 KV fast path 时：不再透传原生 LMCache disk prefetch，避免
+          BaM 读取和 LMCache SSD 预取同时发生，污染性能口径
         - 其他模式：透传给原始 LMCache storage manager
 
         这让真实 vLLM 路径可以在 `retrieve()` 前先发起 BaM IO，而 `get()`
         时只需要等待/消费 outstanding request。
         """
         if (envs.VLLM_BAM_LMCACHE_PREFER_LOAD_ENABLE
+                and envs.VLLM_BAM_KV_FAST_PATH
+                and not self._bam_prefer_load_disabled
+                and self._bam_store is not None):
+            enqueued = self._bam_store.enqueue_kv_fast_path_prefetch_key(key)
+            if enqueued:
+                # 只有当前 chunk 已经成功登记到 BaM 本轮 batch 队列时，
+                # 才能安全跳过 LMCache 原生 disk prefetch。
+                #
+                # 否则会出现这样的问题：
+                # 1. prefetch 阶段没有把 chunk 纳入 BaM batch
+                # 2. 这里又提前 return，LMCache 原生预取也被跳过
+                # 3. 后续 retrieve 只能在更晚的 get 阶段临时兜底，甚至可能
+                #    因为上层等待预取结果而表现为“卡住”
+                #
+                # 因此这里必须把“BaM 已接管”和“BaM 未接管”两种情况分开。
+                logger.info(
+                    "[LMCACHE_BAM_KV_FAST_PATH_PREFETCH_SKIP] chunk_hash=%s "
+                    "enqueued=%s skip original LMCache disk prefetch",
+                    _extract_chunk_hash(key)[:16],
+                    enqueued,
+                )
+                return
+
+            # 走到这里说明：
+            # - KV fast path 已启用
+            # - 但当前 chunk 还没有在 BaM 侧形成可用 metadata，通常是因为
+            #   这轮请求的 shadow store 还在推进，或 chunk 还没被写入 BaM
+            #
+            # 这里我们**不要**回退到 LMCache 原生 disk prefetch：
+            # - 回退会把 BaM/LMCache 两条路径重新搅在一起，容易把排错问题
+            #   放大成“看起来卡住”
+            # - 只要后续 `get()` 时 metadata 已经写入，prefer-load 仍然可以走
+            #   BaM 单 chunk read 补上这个 key
+            #
+            # 因此这里更合适的语义是“暂时不预取，保留给后续 BaM read”。
+            logger.info(
+                "[LMCACHE_BAM_KV_FAST_PATH_PREFETCH_DEFER] chunk_hash=%s "
+                "enqueued=%s defer to later BaM read instead of LMCache "
+                "fallback",
+                _extract_chunk_hash(key)[:16],
+                enqueued,
+            )
+            return
+
+        if (envs.VLLM_BAM_LMCACHE_PREFER_LOAD_ENABLE
                 and envs.VLLM_BAM_LMCACHE_READ_MODE == "prefetch"
+                and not envs.VLLM_BAM_KV_FAST_PATH
                 and not self._bam_prefer_load_disabled
                 and self._bam_store is not None):
             try:
@@ -943,6 +1383,60 @@ class LMCacheBaMStorageManager:
             except Exception:
                 pass
         return memory_obj
+
+    def direct_retrieve_to_vllm_kvcache(
+        self,
+        *,
+        token_database: Any,
+        tokens: torch.Tensor,
+        mask: Optional[torch.Tensor],
+        kv_caches: list[torch.Tensor],
+        slot_mapping: torch.Tensor,
+        kv_cache_dtype: str = "auto",
+        num_kv_heads: int,
+        head_size: int,
+    ) -> Optional[torch.Tensor]:
+        """把 BaM 中命中的 chunks 直接写入 vLLM paged KV cache。
+
+        这个方法是 Direct Placement v0 的 storage-manager 入口。它复用
+        LMCache 已有的 `token_database.process_tokens()`，因此不会重新实现
+        prefix hash / mask / chunk key 逻辑。
+
+        数据流：
+
+        ```text
+        tokens + mask
+          -> token_database.process_tokens()
+          -> [CacheEngineKey, ...]
+          -> BaM KV batch read pages
+          -> place_bam_results_to_vllm_kvcache()
+          -> ret_mask
+        ```
+
+        返回值语义与 `LMCacheBaMStore.direct_place_chunks_to_vllm_kvcache()`
+        保持一致：
+
+        - `torch.Tensor`: BaM 已经完成至少一个 chunk 的 direct placement
+        - `None`: 当前应回退到原始 LMCache retrieve
+
+        注意：这里仅在显式 direct-placement 开关开启时由 vLLM adapter 调用；
+        普通 `get()` / LMCache SSD / 现有 BaM prefer-load 路径完全不受影响。
+        """
+        if self._bam_store is None:
+            return None
+        if not envs.VLLM_BAM_KV_FAST_PATH:
+            return None
+
+        return self._bam_store.direct_place_chunks_to_vllm_kvcache(
+            token_database=token_database,
+            tokens=tokens,
+            mask=mask,
+            kv_caches=kv_caches,
+            slot_mapping=slot_mapping,
+            kv_cache_dtype=kv_cache_dtype,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+        )
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._storage_manager, name)

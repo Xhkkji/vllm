@@ -51,8 +51,11 @@ if TYPE_CHECKING:
     VLLM_BAM_LMCACHE_SHADOW_CHUNKS: int = 1024
     VLLM_BAM_LMCACHE_READ_MODE: str = "sync"
     VLLM_BAM_LMCACHE_BASE_ROW_OFFSET: int = 0
+    VLLM_BAM_KV_FAST_PATH: bool = False
+    VLLM_BAM_DIRECT_PLACEMENT: bool = False
+    VLLM_BAM_DIRECT_PLACEMENT_IMPL: str = "lmcache"
     VLLM_BAM_IMPORT_PATH: Optional[str] = None
-    VLLM_BAM_CACHE_SIZE_MB: int = 64
+    VLLM_BAM_CACHE_SIZE_MB: int = 512
     VLLM_BAM_NUM_SSD: int = 1
     VLLM_BAM_SSD_LIST: Optional[str] = None
     VLLM_BAM_CTRL_IDX: int = 0
@@ -431,13 +434,31 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_BAM_LMCACHE_BASE_ROW_OFFSET":
     lambda: int(os.getenv("VLLM_BAM_LMCACHE_BASE_ROW_OFFSET", "0")),
 
+    # 是否启用 KVCache 专用 BaM fast path。
+    # 第一阶段内部仍复用 BaM rowctx，但接口已经从通用 feature path 中拆出。
+    "VLLM_BAM_KV_FAST_PATH":
+    lambda: bool(int(os.getenv("VLLM_BAM_KV_FAST_PATH", "0"))),
+
+    # 是否启用 Direct Placement v0。
+    # 开启后 LMCache retrieve 会优先尝试：
+    #   BaM pages -> vLLM paged KV cache
+    # 失败则回退原 LMCache retrieve。
+    "VLLM_BAM_DIRECT_PLACEMENT":
+    lambda: bool(int(os.getenv("VLLM_BAM_DIRECT_PLACEMENT", "0"))),
+
+    # Direct Placement 的具体实现：
+    # - lmcache: 保正确版本，BaM pages -> LMCache tensor -> LMCache transfer
+    # - fused: 实验版本，BaM pages -> vLLM flat paged KV cache
+    "VLLM_BAM_DIRECT_PLACEMENT_IMPL":
+    lambda: os.getenv("VLLM_BAM_DIRECT_PLACEMENT_IMPL", "lmcache"),
+
     # 可选：显式指定 BaM Python 模块搜索路径。
     "VLLM_BAM_IMPORT_PATH":
     lambda: os.getenv("VLLM_BAM_IMPORT_PATH", None),
 
     # BaM page cache 大小，单位 MB。
     "VLLM_BAM_CACHE_SIZE_MB":
-    lambda: int(os.getenv("VLLM_BAM_CACHE_SIZE_MB", "64")),
+    lambda: int(os.getenv("VLLM_BAM_CACHE_SIZE_MB", "512")),
 
     # 使用的 SSD 控制器数量。
     "VLLM_BAM_NUM_SSD":

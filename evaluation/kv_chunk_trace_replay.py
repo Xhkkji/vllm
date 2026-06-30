@@ -22,8 +22,9 @@ def parse_args() -> argparse.Namespace:
         description="Replay KV chunk writes/reads on BaM and native GDS/cuFile.")
     parser.add_argument("--backend",
                         choices=("bam", "bam_prefetch", "bam_prefetch_batch",
-                                 "bam_cold_read", "gds", "lmcache_gds",
-                                 "all"),
+                                 "bam_kv_fast_path",
+                                 "bam_kv_fast_path_batch", "bam_cold_read",
+                                 "gds", "lmcache_gds", "all"),
                         default="all",
                         help="要测试的 backend；all 默认只跑主线 bam + lmcache_gds")
     parser.add_argument("--trace-jsonl",
@@ -305,6 +306,121 @@ class BaMPrefetchBatchReplayStore(BaMPrefetchReplayStore):
         return results, outputs
 
 
+class BaMKVFastPathReplayStore(BaMReplayStore):
+    """测试 KVCache 专用 fast path 的单 chunk 读取。
+
+    与 `bam_prefetch` 的底层第一阶段类似，当前仍复用 BaM rowctx；区别在于
+    上层接口已经从通用 page prefetch pipeline 切到 KV descriptor：
+
+      chunk_hash -> metadata -> BaMKVRequest -> [112, 128KB] -> KV tensor
+    """
+
+    backend_name = "bam_kv_fast_path"
+
+    def get_chunk(self, chunk_hash: str, out_tensor):
+        from vllm.bam.gds_baseline.chunk_store_base import ChunkTransferResult
+        import time
+
+        start = time.perf_counter()
+        tensor = self.store.load_chunk_tensor_kv_fast_path(DummyKey(chunk_hash))
+        if tensor is None:
+            raise KeyError(f"BaM chunk not found: {chunk_hash}")
+        out_tensor.copy_(tensor.to(device=out_tensor.device, non_blocking=False))
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        nbytes = int(out_tensor.numel() * out_tensor.element_size())
+        return ChunkTransferResult("bam_kv_fast_path", "read", chunk_hash,
+                                   nbytes, elapsed_ms)
+
+
+class BaMKVFastPathBatchReplayStore(BaMKVFastPathReplayStore):
+    """批量测试 KVCache 专用 fast path。
+
+    这是下一阶段 BaM 修改的第一块试金石：同一批 chunk 不再通过
+    通用 feature/page prefetch 抽象提交，而是通过 KV chunk descriptor 批量
+    进入 BaM KV store。当前仍按 rowctx FIFO 完成，后续可以把内部替换成
+    GPU-visible queue / persistent worker。
+    """
+
+    backend_name = "bam_kv_fast_path_batch"
+
+    def __init__(self,
+                 shape: tuple[int, ...],
+                 dtype: Any,
+                 manifest_path: Path | None = None) -> None:
+        super().__init__(shape, dtype, manifest_path=manifest_path)
+        self._warmup_done = False
+
+    def _warmup_refill_once(self, entry: Any, args: argparse.Namespace) -> None:
+        """用同一个 KV fast path batch 接口预热一次 refill/JIT。
+
+        之前 `bam_kv_fast_path_batch` 的正式统计几乎全是首次 Triton refill JIT：
+
+        ```text
+        total_ms ~= refill_ms ~= 300-500ms
+        ```
+
+        这里先用 1 个 chunk 走完整 KV descriptor batch read + refill，但不加入
+        summary。这样正式 batch 的数据更接近稳态 BaM KV fast path。
+        """
+        import time
+        import torch
+
+        key = DummyKey(entry.chunk_hash)
+        start = time.perf_counter()
+        tensors = self.store.load_chunk_tensors_kv_fast_path_batch([key])
+        tensor = tensors.get(entry.chunk_hash)
+        if tensor is None:
+            raise KeyError(
+                f"BaM KV fast path chunk not found during warmup: {entry.chunk_hash}"
+            )
+        if tensor.is_cuda:
+            torch.cuda.synchronize(tensor.device)
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        print(
+            f"[bam_kv_fast_path_batch warmup] chunk_hash={entry.chunk_hash[:16]} "
+            f"elapsed_ms={elapsed_ms:.3f} not_counted=1")
+
+    def get_chunks(self, entries: list[Any], args: argparse.Namespace):
+        from vllm.bam.gds_baseline.chunk_store_base import ChunkTransferResult
+        import time
+        import torch
+
+        if not entries:
+            return [], {}
+
+        if args.batch_prefetch_warmup and not self._warmup_done:
+            self._warmup_refill_once(entries[0], args)
+            self._warmup_done = True
+
+        keys = [DummyKey(entry.chunk_hash) for entry in entries]
+        start = time.perf_counter()
+        tensors = self.store.load_chunk_tensors_kv_fast_path_batch(keys)
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        amortized_ms = elapsed_ms / len(entries)
+
+        outputs = {}
+        results = []
+        for entry in entries:
+            tensor = tensors.get(entry.chunk_hash)
+            if tensor is None:
+                raise KeyError(f"BaM chunk not found: {entry.chunk_hash}")
+            out = torch.empty(entry.shape,
+                              device=args.device,
+                              dtype=entry.torch_dtype)
+            out.copy_(tensor.to(device=out.device, non_blocking=False))
+            outputs[entry.chunk_hash] = out
+            nbytes = int(out.numel() * out.element_size())
+            results.append(
+                ChunkTransferResult("bam_kv_fast_path_batch", "read",
+                                    entry.chunk_hash, nbytes, amortized_ms))
+
+        print(
+            f"[bam_kv_fast_path_batch read_batch] chunks={len(entries)} "
+            f"elapsed_ms={elapsed_ms:.3f} "
+            f"amortized_ms={amortized_ms:.3f}")
+        return results, outputs
+
+
 class BaMColdReadReplayStore(BaMReplayStore):
     """新进程只注册 metadata 后读 BaM，避免命中写进程的 GPU page cache。"""
 
@@ -455,6 +571,22 @@ def build_store(backend: str, shape: tuple[int, ...], dtype,
             dtype,
             manifest_path=args.bam_cold_manifest,
         )
+    if backend == "bam_kv_fast_path":
+        os.environ.setdefault("VLLM_BAM_LMCACHE_READ_MODE", "prefetch")
+        os.environ.setdefault("VLLM_BAM_KV_FAST_PATH", "1")
+        return BaMKVFastPathReplayStore(
+            shape,
+            dtype,
+            manifest_path=args.bam_cold_manifest,
+        )
+    if backend == "bam_kv_fast_path_batch":
+        os.environ.setdefault("VLLM_BAM_LMCACHE_READ_MODE", "prefetch")
+        os.environ.setdefault("VLLM_BAM_KV_FAST_PATH", "1")
+        return BaMKVFastPathBatchReplayStore(
+            shape,
+            dtype,
+            manifest_path=args.bam_cold_manifest,
+        )
     if backend == "bam_cold_read":
         if args.bam_cold_manifest is None:
             raise ValueError("--bam-cold-manifest is required for bam_cold_read")
@@ -492,7 +624,8 @@ def replay_backend(backend: str, entries: list[Any],
 
     first = entries[0]
     dtype = first.torch_dtype
-    if backend in ("bam", "bam_prefetch", "bam_prefetch_batch"):
+    if backend in ("bam", "bam_prefetch", "bam_prefetch_batch",
+                   "bam_kv_fast_path", "bam_kv_fast_path_batch"):
         ensure_bam_replay_cache_capacity(entries, args)
     store = build_store(backend, first.shape, dtype, args)
     expected: dict[str, torch.Tensor] = {}
@@ -516,13 +649,15 @@ def replay_backend(backend: str, entries: list[Any],
         def flush_pending_batch_reads() -> None:
             """提交并校验当前累积的一批 read entries。
 
-            只有 `bam_prefetch_batch` 会走这里。其他 backend 仍保持原来的
+            只有 batch backend 会走这里。其他 backend 仍保持原来的
             单 chunk 读写流程，避免 batch 实验影响已有 baseline。
             """
             nonlocal pending_batch_reads
             if not pending_batch_reads:
                 return
-            if not isinstance(store, BaMPrefetchBatchReplayStore):
+            if not isinstance(
+                    store,
+                (BaMPrefetchBatchReplayStore, BaMKVFastPathBatchReplayStore)):
                 raise RuntimeError("pending batch reads require batch store")
 
             results, outputs = store.get_chunks(pending_batch_reads, args)
@@ -578,7 +713,9 @@ def replay_backend(backend: str, entries: list[Any],
                 if expected_tensor is not None:
                     expected[entry.chunk_hash] = expected_tensor
             else:
-                if isinstance(store, BaMPrefetchBatchReplayStore):
+                if isinstance(
+                        store,
+                    (BaMPrefetchBatchReplayStore, BaMKVFastPathBatchReplayStore)):
                     pending_batch_reads.append(entry)
                     continue
 

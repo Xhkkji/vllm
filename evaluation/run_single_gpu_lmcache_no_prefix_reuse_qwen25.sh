@@ -12,6 +12,11 @@ LMCACHE_CHUNK_SIZE_VALUE="${LMCACHE_CHUNK_SIZE_VALUE:-256}"
 LMCACHE_MAX_LOCAL_CPU_SIZE_VALUE="${LMCACHE_MAX_LOCAL_CPU_SIZE_VALUE:-5.0}"
 PROMPT_REPEAT="${PROMPT_REPEAT:-100}"
 MAX_TOKENS="${MAX_TOKENS:-64}"
+STEADY_REPEAT="${STEADY_REPEAT:-0}"
+# 当前主线默认测 steady-state，因此把 request_1 之后的隐藏 prewarm 默认打开。
+# 这样正式 request_2 更接近我们真正关心的稳态口径，而不会把一次性 warmup
+# 重新算回主结果。
+DIRECT_RETRIEVE_PREWARM_AFTER_REQUEST1="${DIRECT_RETRIEVE_PREWARM_AFTER_REQUEST1:-1}"
 LOG_ROOT="${LOG_ROOT:-${SCRIPT_DIR}/logs/single_gpu_lmcache_no_prefix_reuse_qwen25}"
 RUN_DIR="${RUN_DIR:-${LOG_ROOT}/${TIMESTAMP}}"
 LOG_FILE="${LOG_FILE:-${RUN_DIR}/run.log}"
@@ -28,13 +33,24 @@ LMCACHE_USE_EXPERIMENTAL_VALUE="${LMCACHE_USE_EXPERIMENTAL:-True}"
 LMCACHE_LOCAL_CPU_VALUE="${LMCACHE_LOCAL_CPU:-False}"
 LMCACHE_LOCAL_DISK_VALUE="${LMCACHE_LOCAL_DISK:-/home/xhk/llm-inference/lmcache_local_disk/}"
 LMCACHE_MAX_LOCAL_DISK_SIZE_VALUE="${LMCACHE_MAX_LOCAL_DISK_SIZE:-20}"
-VLLM_BAM_LMCACHE_SHADOW_ENABLE_VALUE="${VLLM_BAM_LMCACHE_SHADOW_ENABLE:-0}"
-VLLM_BAM_LMCACHE_PREFER_LOAD_ENABLE_VALUE="${VLLM_BAM_LMCACHE_PREFER_LOAD_ENABLE:-0}"
+# 下面这组默认值固定到当前已经跑通、并持续作为主线联调口径的配置：
+# - LMCache chunk 持续 shadow 到 BaM
+# - request_2 优先从 BaM prefer-load 恢复 prefix
+# - 打开 KV fast path
+# - 打开 direct placement，并默认走当前更贴近目标形态的 fused 路径
+#
+# 调试/回归到其它口径时，仍然可以通过环境变量显式覆盖。
+VLLM_BAM_LMCACHE_SHADOW_ENABLE_VALUE="${VLLM_BAM_LMCACHE_SHADOW_ENABLE:-1}"
+VLLM_BAM_LMCACHE_PREFER_LOAD_ENABLE_VALUE="${VLLM_BAM_LMCACHE_PREFER_LOAD_ENABLE:-1}"
 VLLM_BAM_LMCACHE_SHADOW_CHUNKS_VALUE="${VLLM_BAM_LMCACHE_SHADOW_CHUNKS:-1024}"
-VLLM_BAM_KV_FAST_PATH_VALUE="${VLLM_BAM_KV_FAST_PATH:-0}"
+VLLM_BAM_KV_FAST_PATH_VALUE="${VLLM_BAM_KV_FAST_PATH:-1}"
 VLLM_BAM_KV_EXECUTOR_VALUE="${VLLM_BAM_KV_EXECUTOR:-rowctx}"
-VLLM_BAM_DIRECT_PLACEMENT_VALUE="${VLLM_BAM_DIRECT_PLACEMENT:-0}"
-VLLM_BAM_DIRECT_PLACEMENT_IMPL_VALUE="${VLLM_BAM_DIRECT_PLACEMENT_IMPL:-lmcache}"
+VLLM_BAM_DIRECT_PLACEMENT_VALUE="${VLLM_BAM_DIRECT_PLACEMENT:-1}"
+VLLM_BAM_DIRECT_PLACEMENT_IMPL_VALUE="${VLLM_BAM_DIRECT_PLACEMENT_IMPL:-fused}"
+VLLM_BAM_DIRECT_PLACEMENT_FRONTIER_CHUNKS_VALUE="${VLLM_BAM_DIRECT_PLACEMENT_FRONTIER_CHUNKS:-0}"
+VLLM_BAM_DIRECT_PLACEMENT_FOLLOWUP_CHUNKS_VALUE="${VLLM_BAM_DIRECT_PLACEMENT_FOLLOWUP_CHUNKS:-0}"
+VLLM_BAM_XFORMERS_PREFIX_FALLBACK_PROFILE_VALUE="${VLLM_BAM_XFORMERS_PREFIX_FALLBACK_PROFILE:-0}"
+VLLM_BAM_TRY_PAGED_PREFIX_ZERO_ALIBI_VALUE="${VLLM_BAM_TRY_PAGED_PREFIX_ZERO_ALIBI:-0}"
 if [[ -n "${VLLM_BAM_LMCACHE_READ_MODE:-}" ]]; then
   VLLM_BAM_LMCACHE_READ_MODE_VALUE="${VLLM_BAM_LMCACHE_READ_MODE}"
 elif [[ "${VLLM_BAM_KV_FAST_PATH_VALUE}" == "1" ]]; then
@@ -44,7 +60,9 @@ else
 fi
 VLLM_BAM_IMPORT_PATH_VALUE="${VLLM_BAM_IMPORT_PATH:-/home/xhk/llm-inference/BaM_IOStack/gids_module}"
 BAM_LIB_DIR_VALUE="${BAM_LIB_DIR:-/home/xhk/llm-inference/BaM_IOStack/bam/build/lib}"
-VLLM_BAM_CACHE_SIZE_MB_VALUE="${VLLM_BAM_CACHE_SIZE_MB:-512}"
+# 当前 KV cache 路径下，1GB cache 在最近几轮联调里更稳，减少了 cache 容量
+# 偏小时的额外抖动，因此把默认值从 512MB 提到 1024MB。
+VLLM_BAM_CACHE_SIZE_MB_VALUE="${VLLM_BAM_CACHE_SIZE_MB:-1024}"
 VLLM_BAM_NUM_SSD_VALUE="${VLLM_BAM_NUM_SSD:-1}"
 VLLM_BAM_SSD_LIST_VALUE="${VLLM_BAM_SSD_LIST:-0}"
 VLLM_BAM_CTRL_IDX_VALUE="${VLLM_BAM_CTRL_IDX:-0}"
@@ -67,6 +85,8 @@ if [[ ( "${VLLM_BAM_LMCACHE_SHADOW_ENABLE_VALUE}" == "1" || \
     "LMCACHE_MAX_LOCAL_CPU_SIZE_VALUE=${LMCACHE_MAX_LOCAL_CPU_SIZE_VALUE}" \
     "PROMPT_REPEAT=${PROMPT_REPEAT}" \
     "MAX_TOKENS=${MAX_TOKENS}" \
+    "STEADY_REPEAT=${STEADY_REPEAT}" \
+    "DIRECT_RETRIEVE_PREWARM_AFTER_REQUEST1=${DIRECT_RETRIEVE_PREWARM_AFTER_REQUEST1}" \
     "LOG_FILE=${LOG_FILE}" \
     "LMCACHE_REPO_PATH=${LMCACHE_REPO_PATH}" \
     "PYTHON_BIN=${PYTHON_BIN}" \
@@ -85,6 +105,10 @@ if [[ ( "${VLLM_BAM_LMCACHE_SHADOW_ENABLE_VALUE}" == "1" || \
     "VLLM_BAM_KV_EXECUTOR=${VLLM_BAM_KV_EXECUTOR_VALUE}" \
     "VLLM_BAM_DIRECT_PLACEMENT=${VLLM_BAM_DIRECT_PLACEMENT_VALUE}" \
     "VLLM_BAM_DIRECT_PLACEMENT_IMPL=${VLLM_BAM_DIRECT_PLACEMENT_IMPL_VALUE}" \
+    "VLLM_BAM_DIRECT_PLACEMENT_FRONTIER_CHUNKS=${VLLM_BAM_DIRECT_PLACEMENT_FRONTIER_CHUNKS_VALUE}" \
+    "VLLM_BAM_DIRECT_PLACEMENT_FOLLOWUP_CHUNKS=${VLLM_BAM_DIRECT_PLACEMENT_FOLLOWUP_CHUNKS_VALUE}" \
+    "VLLM_BAM_XFORMERS_PREFIX_FALLBACK_PROFILE=${VLLM_BAM_XFORMERS_PREFIX_FALLBACK_PROFILE_VALUE}" \
+    "VLLM_BAM_TRY_PAGED_PREFIX_ZERO_ALIBI=${VLLM_BAM_TRY_PAGED_PREFIX_ZERO_ALIBI_VALUE}" \
     "VLLM_BAM_IMPORT_PATH=${VLLM_BAM_IMPORT_PATH_VALUE}" \
     "VLLM_BAM_CACHE_SIZE_MB=${VLLM_BAM_CACHE_SIZE_MB_VALUE}" \
     "VLLM_BAM_NUM_SSD=${VLLM_BAM_NUM_SSD_VALUE}" \
@@ -121,6 +145,10 @@ export VLLM_BAM_KV_FAST_PATH="${VLLM_BAM_KV_FAST_PATH_VALUE}"
 export VLLM_BAM_KV_EXECUTOR="${VLLM_BAM_KV_EXECUTOR_VALUE}"
 export VLLM_BAM_DIRECT_PLACEMENT="${VLLM_BAM_DIRECT_PLACEMENT_VALUE}"
 export VLLM_BAM_DIRECT_PLACEMENT_IMPL="${VLLM_BAM_DIRECT_PLACEMENT_IMPL_VALUE}"
+export VLLM_BAM_DIRECT_PLACEMENT_FRONTIER_CHUNKS="${VLLM_BAM_DIRECT_PLACEMENT_FRONTIER_CHUNKS_VALUE}"
+export VLLM_BAM_DIRECT_PLACEMENT_FOLLOWUP_CHUNKS="${VLLM_BAM_DIRECT_PLACEMENT_FOLLOWUP_CHUNKS_VALUE}"
+export VLLM_BAM_XFORMERS_PREFIX_FALLBACK_PROFILE="${VLLM_BAM_XFORMERS_PREFIX_FALLBACK_PROFILE_VALUE}"
+export VLLM_BAM_TRY_PAGED_PREFIX_ZERO_ALIBI="${VLLM_BAM_TRY_PAGED_PREFIX_ZERO_ALIBI_VALUE}"
 export VLLM_BAM_IMPORT_PATH="${VLLM_BAM_IMPORT_PATH_VALUE}"
 export VLLM_BAM_CACHE_SIZE_MB="${VLLM_BAM_CACHE_SIZE_MB_VALUE}"
 export VLLM_BAM_NUM_SSD="${VLLM_BAM_NUM_SSD_VALUE}"
@@ -129,6 +157,7 @@ export VLLM_BAM_CTRL_IDX="${VLLM_BAM_CTRL_IDX_VALUE}"
 export GIDS_FORCE_SYNC_READ="${GIDS_FORCE_SYNC_READ_VALUE}"
 export GIDS_KV_DEBUG="${GIDS_KV_DEBUG_VALUE}"
 export GIDS_KV_WAIT_TIMEOUT_S="${GIDS_KV_WAIT_TIMEOUT_S_VALUE}"
+export DIRECT_RETRIEVE_PREWARM_AFTER_REQUEST1="${DIRECT_RETRIEVE_PREWARM_AFTER_REQUEST1}"
 export LD_LIBRARY_PATH="${BAM_LIB_DIR_VALUE}:${LD_LIBRARY_PATH:-}"
 
 if [[ -n "${LMCACHE_LOCAL_DISK_VALUE}" ]]; then
@@ -200,6 +229,10 @@ echo "[single-gpu-lmcache-no-prefix-reuse] vllm_bam_kv_fast_path=${VLLM_BAM_KV_F
 echo "[single-gpu-lmcache-no-prefix-reuse] vllm_bam_kv_executor=${VLLM_BAM_KV_EXECUTOR_VALUE}"
 echo "[single-gpu-lmcache-no-prefix-reuse] vllm_bam_direct_placement=${VLLM_BAM_DIRECT_PLACEMENT_VALUE}"
 echo "[single-gpu-lmcache-no-prefix-reuse] vllm_bam_direct_placement_impl=${VLLM_BAM_DIRECT_PLACEMENT_IMPL_VALUE}"
+echo "[single-gpu-lmcache-no-prefix-reuse] vllm_bam_direct_placement_frontier_chunks=${VLLM_BAM_DIRECT_PLACEMENT_FRONTIER_CHUNKS_VALUE}"
+echo "[single-gpu-lmcache-no-prefix-reuse] vllm_bam_direct_placement_followup_chunks=${VLLM_BAM_DIRECT_PLACEMENT_FOLLOWUP_CHUNKS_VALUE}"
+echo "[single-gpu-lmcache-no-prefix-reuse] vllm_bam_xformers_prefix_fallback_profile=${VLLM_BAM_XFORMERS_PREFIX_FALLBACK_PROFILE_VALUE}"
+echo "[single-gpu-lmcache-no-prefix-reuse] vllm_bam_try_paged_prefix_zero_alibi=${VLLM_BAM_TRY_PAGED_PREFIX_ZERO_ALIBI_VALUE}"
 echo "[single-gpu-lmcache-no-prefix-reuse] vllm_bam_import_path=${VLLM_BAM_IMPORT_PATH_VALUE}"
 echo "[single-gpu-lmcache-no-prefix-reuse] vllm_bam_cache_size_mb=${VLLM_BAM_CACHE_SIZE_MB_VALUE}"
 echo "[single-gpu-lmcache-no-prefix-reuse] vllm_bam_num_ssd=${VLLM_BAM_NUM_SSD_VALUE}"
@@ -212,6 +245,8 @@ echo "[single-gpu-lmcache-no-prefix-reuse] bam_preflight=${BAM_PREFLIGHT_VALUE}"
 echo "[single-gpu-lmcache-no-prefix-reuse] bam_lib_dir=${BAM_LIB_DIR_VALUE}"
 echo "[single-gpu-lmcache-no-prefix-reuse] prompt_repeat=${PROMPT_REPEAT}"
 echo "[single-gpu-lmcache-no-prefix-reuse] max_tokens=${MAX_TOKENS}"
+echo "[single-gpu-lmcache-no-prefix-reuse] steady_repeat=${STEADY_REPEAT}"
+echo "[single-gpu-lmcache-no-prefix-reuse] direct_retrieve_prewarm_after_request1=${DIRECT_RETRIEVE_PREWARM_AFTER_REQUEST1}"
 echo "[single-gpu-lmcache-no-prefix-reuse] log_root=${LOG_ROOT}"
 echo "[single-gpu-lmcache-no-prefix-reuse] run_dir=${RUN_DIR}"
 echo "[single-gpu-lmcache-no-prefix-reuse] log_file=${LOG_FILE}"
@@ -237,6 +272,8 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN}" \
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION}" \
 PROMPT_REPEAT="${PROMPT_REPEAT}" \
 MAX_TOKENS="${MAX_TOKENS}" \
+STEADY_REPEAT="${STEADY_REPEAT}" \
+DIRECT_RETRIEVE_PREWARM_AFTER_REQUEST1="${DIRECT_RETRIEVE_PREWARM_AFTER_REQUEST1}" \
 DTYPE="${DTYPE}" \
 ENFORCE_EAGER="${ENFORCE_EAGER}" \
 ENABLE_CHUNKED_PREFILL="${ENABLE_CHUNKED_PREFILL}" \
@@ -263,6 +300,9 @@ dtype = os.environ.get("DTYPE", "half")
 enforce_eager = os.environ.get("ENFORCE_EAGER", "true").lower() == "true"
 enable_chunked_prefill = os.environ.get("ENABLE_CHUNKED_PREFILL",
                                         "false").lower() == "true"
+steady_repeat = int(os.environ.get("STEADY_REPEAT", "0"))
+direct_retrieve_prewarm_after_request1 = int(
+    os.environ.get("DIRECT_RETRIEVE_PREWARM_AFTER_REQUEST1", "0"))
 
 
 @contextlib.contextmanager
@@ -306,6 +346,16 @@ if prefer_load_enable:
     # 这样不会依赖 vLLM 自身的 prefix cache，而是直接观察 LMCache retrieve
     # 是否真的走到了我们新增的 BaM prefer-load。
     prompts = [prompt_a, prompt_a]
+    # 进程内 steady-state 验证：
+    # 在同一个 vLLM/LMCache/BaM 进程里，继续重复与 request_2 相同的 prompt。
+    # 这样可以直接观察：
+    # - fused direct placement warmup 是否只在首次 direct retrieve 里出现
+    # - 后续 request 的 prepare_ms / direct_retrieve_ms 是否明显下降
+    #
+    # 注意这里仍然复用同一个 prompt_a，而不是重新构造新 prompt，
+    # 目的是尽量让控制面、命中 chunk 范围与 prefix 结构都保持一致。
+    for _ in range(max(steady_repeat, 0)):
+        prompts.append(prompt_a)
 else:
     prompts = [prompt_a, prompt_b]
 
@@ -331,4 +381,22 @@ with build_llm() as llm:
         print(outputs[0].outputs[0].text)
         print(f"[baseline] request_{idx}_elapsed_s={elapsed:.4f}")
         print()
+
+        # 把 direct placement / fused kernel 的首次 warmup 提前到正式测量请求之前。
+        # 这里选择放在 request_1 之后、request_2 之前，原因是：
+        # 1. request_1 负责把可复用前缀写入 LMCache / BaM；
+        # 2. 隐藏 prewarm 再走一次同样的 prompt，可以在同一进程内把
+        #    direct retrieve 首次触发的 Triton warmup 提前做掉；
+        # 3. 这样 request_2 开始时，更接近我们真正想看的 steady-state 口径。
+        #
+        # 这个隐藏 prewarm 不单独编号成 request，不打印生成文本，只打印耗时。
+        if (idx == 1 and prefer_load_enable and
+                direct_retrieve_prewarm_after_request1 > 0):
+            prewarm_start = time.time()
+            _ = llm.generate(prompt_a, sampling_params)
+            prewarm_elapsed = time.time() - prewarm_start
+            print(
+                "[prewarm] direct_retrieve_after_request1_elapsed_s="
+                f"{prewarm_elapsed:.4f}")
+            print()
 PY

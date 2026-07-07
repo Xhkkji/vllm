@@ -30,7 +30,10 @@ import torch
 
 import vllm.envs as envs
 from vllm.bam.lmcache_bam_direct_placement import (
-    place_bam_results_to_vllm_kvcache)
+    BaMDirectKVPlacer, BaMDirectPlacementBatchDescriptor,
+    BaMDirectPlacementBatchStateSnapshot, BaMDirectPlacementChunkDescriptor,
+    BaMDirectPlacementExecution, BaMDirectPlacementStateTracker,
+    prepare_bam_results_for_vllm_kvcache)
 from vllm.bam.lmcache_bam_kv_fast_path import LMCacheBaMKVFastPath
 from vllm.bam.lmcache_bam_prefetch import (LMCacheBaMChunkReadRequest,
                                            LMCacheBaMPagePipeline)
@@ -244,6 +247,104 @@ class LMCacheBaMPageLayout:
         return full_tensor[:, :, :metadata.actual_tokens, :].contiguous()
 
 
+@dataclass(frozen=True)
+class _InFlightDirectPlacementWave:
+    """描述一次已经 launch、等待后续收口的 direct placement wave。
+
+    这层对象刻意只保存 runtime 边界真正需要的最小信息：
+
+    - `direct_execution`
+      当前 wave 对应的执行句柄，后续通过它推进 ready / 等待 frontier。
+    - `direct_placer`
+      负责在收口完成后打印这次 wave 的 step timing。
+    - `launch_*`
+      当前 wave 真实提交给 placement 的 chunk 范围。
+    - `return_target_chunks`
+      当前 wave 对正常推理引擎准备暴露的连续 prefix 目标。
+
+    这样 store 主流程就不需要再把“launch 细节”和“等待细节”揉在一个 helper
+    里，后续如果继续往更长期存活的 execution 推进，也可以直接从这个对象
+    继续演化。
+    """
+
+    direct_execution: BaMDirectPlacementExecution
+    direct_placer: BaMDirectKVPlacer
+    launched_batch: Any
+    wave_name: str
+    launch_start_chunk: int
+    launch_chunks: int
+    return_target_chunks: int
+
+
+@dataclass(frozen=True)
+class _DirectPlacementRequestBootstrapProfile:
+    """记录 direct placement request 在 launch 前后的基础 profile。
+
+    这里刻意只保留“本次 request 已经发生、且未来 finalize 一定还会用到”的
+    计时信息：
+
+    - `*_ms`:
+      已经完成的同步阶段耗时，例如 collect/read/prepare。
+    - `*_start_time`:
+      还在进行中的阶段起点，例如整个 request 总耗时、frontier wave 墙钟时间。
+
+    后续如果把 request handle 再往更高层 runtime 提升，这份 profile 结构可以
+    原样复用，而不需要再从散落的局部变量里反推一次。
+    """
+
+    collect_entries_ms: float
+    read_ms: float
+    descriptor_ms: float
+    tracker_init_ms: float
+    prepare_ms: float
+    direct_total_start_time: float
+    frontier_wave_start_time: float
+
+
+@dataclass(frozen=True)
+class _InFlightDirectPlacementRequest:
+    """描述一次已经 start、后续可被 poll/finalize 的 direct placement request。
+
+    这层对象是“request 级控制面”的第一版句柄。它和 `_InFlightDirectPlacementWave`
+    的区别是：
+
+    - `Wave` 只描述单次 placement launch 的 runtime 边界
+    - `Request` 描述一次完整 direct retrieve 的稳定上下文
+
+    因此 request handle 会额外持有：
+
+    - prefix 命中信息
+    - 当前 request 对上层准备返回的 frontier 目标
+    - followup wave 的实验配置
+    - finalize 阶段还会继续用到的 profile / tensors / tracker
+
+    当前版本虽然仍然由 store 同步 finalize，但上层语义已经变成：
+
+    ```text
+    start request
+      -> poll request ready state
+      -> finalize request return semantics
+    ```
+
+    这样后续如果要把 handle 继续上提到 runtime，就不需要再拆一次 request 级边界。
+    """
+
+    tokens: torch.Tensor
+    kv_caches: list[torch.Tensor]
+    slot_mapping: torch.Tensor
+    results: list[Any]
+    state_tracker: BaMDirectPlacementStateTracker
+    direct_placer: BaMDirectKVPlacer
+    chunk_starts: list[int]
+    frontier_wave: _InFlightDirectPlacementWave
+    prefix_hit_chunks: int
+    prefix_hit_tokens: int
+    first_wave_launch_chunks: int
+    first_wave_return_target_chunks: int
+    followup_chunk_limit: int
+    bootstrap_profile: _DirectPlacementRequestBootstrapProfile
+
+
 class LMCacheBaMStore:
     """管理 LMCache chunk 在 BaM 中的槽位映射与读写。"""
 
@@ -258,6 +359,19 @@ class LMCacheBaMStore:
         self._chunk_metadata: Dict[str, BaMChunkMetadata] = {}
         self._slot_lock = threading.Lock()
         self._prefetch_pipeline: Optional[LMCacheBaMPagePipeline] = None
+        # Direct placement 的 placer 需要跨请求复用，才能真正保留：
+        # - Triton/JIT warmup 状态
+        # - 已初始化的 KV cache pointer table
+        #
+        # 如果每次 direct retrieve 都临时 new 一个 placer，那么 warmup 状态会在
+        # 每个请求里丢失，导致“一次性成本”反复落回 request_2 的热路径上。
+        self._direct_kv_placer: Optional[BaMDirectKVPlacer] = None
+        # 记录最近一次 direct placement 的 batch 状态。
+        # 当前同步版本里它主要用于：
+        # - 测试与日志直接观察“哪些 chunk/token 已经 ready”
+        # - 为后续按需 consume / 更细粒度 ready 语义预留统一接口
+        self._last_direct_placement_state_tracker: Optional[
+            BaMDirectPlacementStateTracker] = None
         self._kv_fast_path: Optional[LMCacheBaMKVFastPath] = None
         self._prefetch_lock = threading.Lock()
         self._prefetch_requests: Dict[str, LMCacheBaMChunkReadRequest] = {}
@@ -753,6 +867,22 @@ class LMCacheBaMStore:
 
         return self._ensure_kv_fast_path().read_chunk_pages_batch(items)
 
+    def get_last_direct_placement_state_snapshot(
+        self,
+    ) -> Optional[BaMDirectPlacementBatchStateSnapshot]:
+        """返回最近一次 direct placement 的状态快照。
+
+        当前主线还没有把这份状态真正接到 attention consume 侧，因此这里先提供
+        只读快照接口，方便：
+
+        - 在测试里直接断言 ready 语义
+        - 在联调中核对 direct placement 究竟推进到了哪个阶段
+        - 后续把它接给更细粒度的 prefix consume 逻辑
+        """
+        if self._last_direct_placement_state_tracker is None:
+            return None
+        return self._last_direct_placement_state_tracker.snapshot()
+
     def _collect_direct_placement_entries(
         self,
         *,
@@ -799,6 +929,964 @@ class LMCacheBaMStore:
             entries.append((int(start), int(end), key))
         return entries
 
+    def _build_direct_placement_descriptor(
+        self,
+        *,
+        entries: list[tuple[int, int, Any]],
+        results: list[Any],
+    ) -> BaMDirectPlacementBatchDescriptor:
+        """把本轮命中的 chunk 与 BaM 读结果收成稳定 descriptor。
+
+        这一步和 direct placement 内部 `_build_plan()` 的职责不同：
+
+        - `_build_plan()` 面向“当前这次真正怎么执行 placement”
+        - 这里面向“这次 batch 在控制面上由哪些 chunk 组成”
+
+        因此这里保留 chunk hash / token range / total_bytes 这些更适合状态跟踪与
+        后续按需 consume 的信息，而不掺入临时的 CUDA tensor / launch 细节。
+        """
+        if len(entries) != len(results):
+            raise ValueError(
+                "direct placement descriptor requires matching entries/results: "
+                f"{len(entries)} vs {len(results)}")
+
+        chunk_descriptors: list[BaMDirectPlacementChunkDescriptor] = []
+        total_tokens = 0
+        total_bytes = 0
+        for (start, end, key), result in zip(entries, results):
+            actual_tokens = int(result.descriptor.actual_tokens)
+            total_chunk_bytes = int(result.descriptor.total_bytes)
+            chunk_descriptors.append(
+                BaMDirectPlacementChunkDescriptor(
+                    chunk_hash=_extract_chunk_hash(key),
+                    chunk_start=int(start),
+                    chunk_end=int(end),
+                    actual_tokens=actual_tokens,
+                    total_bytes=total_chunk_bytes,
+                ))
+            total_tokens += actual_tokens
+            total_bytes += total_chunk_bytes
+
+        return BaMDirectPlacementBatchDescriptor(
+            chunks=tuple(chunk_descriptors),
+            total_tokens=total_tokens,
+            total_bytes=total_bytes,
+        )
+
+    def _log_direct_placement_state(
+        self,
+        *,
+        stage: str,
+        tracker: BaMDirectPlacementStateTracker,
+    ) -> None:
+        """打印当前 direct placement batch 的 ready 状态摘要。"""
+        snapshot = tracker.snapshot()
+        logger.info(
+            "[LMCACHE_BAM_DIRECT_PLACEMENT_STATE] stage=%s chunks=%d "
+            "read_ready=%d/%d staged_ready=%d/%d cache_ready=%d/%d "
+            "read_tokens=%d/%d staged_tokens=%d/%d cache_tokens=%d/%d "
+            "consumable_chunks=%d/%d consumable_tokens=%d/%d",
+            stage,
+            len(snapshot.chunk_states),
+            snapshot.read_ready_chunks,
+            len(snapshot.chunk_states),
+            snapshot.staged_ready_chunks,
+            len(snapshot.chunk_states),
+            snapshot.cache_ready_chunks,
+            len(snapshot.chunk_states),
+            snapshot.read_ready_tokens,
+            snapshot.descriptor.total_tokens,
+            snapshot.staged_ready_tokens,
+            snapshot.descriptor.total_tokens,
+            snapshot.cache_ready_tokens,
+            snapshot.descriptor.total_tokens,
+            snapshot.consumable_chunks,
+            len(snapshot.chunk_states),
+            snapshot.consumable_tokens,
+            snapshot.descriptor.total_tokens,
+        )
+
+    def _resolve_direct_placement_frontier_chunk_limit(
+        self,
+        *,
+        total_chunks: int,
+    ) -> int | None:
+        """解析本轮 direct placement 需要真正 launch 的连续前缀 chunk 数。
+
+        当前语义保持“默认不裁剪”：
+
+        - `VLLM_BAM_DIRECT_PLACEMENT_FRONTIER_CHUNKS <= 0`
+          表示本轮命中的连续 prefix chunks 全量 launch
+        - `1 <= N < total_chunks`
+          表示本轮只 launch 前 N 个 chunk
+        - `N >= total_chunks`
+          等价于不裁剪，仍走全量 launch
+
+        返回 `None` 表示“按默认主线全量 launch”，这样下游执行器仍然可以保留
+        “默认全量”和“显式前缀裁剪”两种控制面分支，后续继续往真正的 frontier
+        consume 推进时更容易扩展。
+        """
+        configured_limit = int(
+            envs.VLLM_BAM_DIRECT_PLACEMENT_FRONTIER_CHUNKS)
+        if configured_limit <= 0 or configured_limit >= int(total_chunks):
+            return None
+        return int(configured_limit)
+
+    def _resolve_direct_placement_followup_chunk_limit(
+        self,
+        *,
+        total_chunks: int,
+        first_wave_chunks: int,
+    ) -> int:
+        """解析真实 store 路径里第二波 followup placement 的 chunk 数。
+
+        这里故意把 followup wave 设计成一个独立开关，而不是复用第一波的
+        `FRONTIER_CHUNKS`，原因是两者关注点不同：
+
+        - 第一波决定“当前要尽快暴露多少可消费前缀”
+        - 第二波决定“在第一波之后，额外再补多少已命中的 chunk”
+
+        当前返回值语义：
+
+        - `0`: 不执行 followup wave
+        - `N>0`: 从 `first_wave_chunks` 开始，再额外执行至多 `N` 个 chunk
+
+        注意：
+        这个 followup 目前仍是“真实 store 控制面验证版”，默认关闭，避免影响
+        已经稳定的全前缀主路径。
+        """
+        configured_limit = int(
+            envs.VLLM_BAM_DIRECT_PLACEMENT_FOLLOWUP_CHUNKS)
+        remaining_chunks = max(int(total_chunks) - int(first_wave_chunks), 0)
+        if configured_limit <= 0 or remaining_chunks <= 0:
+            return 0
+        return min(int(configured_limit), remaining_chunks)
+
+    @staticmethod
+    def _count_ready_chunks_in_range(
+        snapshot: BaMDirectPlacementBatchStateSnapshot,
+        *,
+        chunk_start: int,
+        chunk_count: int,
+        ready_attr: str,
+    ) -> int:
+        """统计某一段 chunk 范围内已经 ready 的数量。"""
+        chunk_end = min(chunk_start + chunk_count, len(snapshot.chunk_states))
+        ready_chunks = 0
+        for chunk_state in snapshot.chunk_states[chunk_start:chunk_end]:
+            if bool(getattr(chunk_state, ready_attr)):
+                ready_chunks += 1
+        return ready_chunks
+
+    @staticmethod
+    def _mark_ready_range_if_empty(
+        tracker: BaMDirectPlacementStateTracker,
+        *,
+        chunk_start: int,
+        chunk_count: int,
+        ready_attr: str,
+    ) -> None:
+        """仅在某一波完全没有推进 ready 状态时，按范围补一个保守兜底。
+
+        旧版 store 的兜底逻辑是“如果外部实现没有推进状态，就整批标成 ready”。
+        在单波全量 launch 的时代这没问题，但现在已经开始支持：
+
+        - 第一波只 launch 前若干个 chunk
+        - 第二波从中间某个 chunk 偏移继续 launch
+
+        因此兜底必须收缩到“本轮真实 launch 的 chunk 范围”，不能再把整批都
+        粗暴标成 ready，否则会破坏我们刚建立好的 frontier 语义。
+        """
+        snapshot = tracker.snapshot()
+        ready_chunks = LMCacheBaMStore._count_ready_chunks_in_range(
+            snapshot,
+            chunk_start=chunk_start,
+            chunk_count=chunk_count,
+            ready_attr=ready_attr,
+        )
+        if ready_chunks > 0:
+            return
+
+        chunk_end = min(chunk_start + chunk_count, len(snapshot.chunk_states))
+        for chunk_index in range(chunk_start, chunk_end):
+            if ready_attr == "staged_ready":
+                tracker.mark_chunk_staged_ready(chunk_index)
+            elif ready_attr == "cache_ready":
+                tracker.mark_chunk_cache_ready(chunk_index)
+            else:
+                raise ValueError(f"unsupported ready_attr: {ready_attr!r}")
+
+    @staticmethod
+    def _resolve_wave_return_target_chunks(
+        *,
+        launch_start_chunk: int,
+        launch_chunks: int,
+        return_target_chunks: int | None,
+    ) -> int:
+        """规范化当前 wave 的连续前缀返回目标。"""
+        if return_target_chunks is None:
+            return_target_chunks = int(launch_start_chunk) + int(launch_chunks)
+        normalized_target = max(int(return_target_chunks), 0)
+        if normalized_target < int(launch_start_chunk):
+            raise ValueError(
+                "return_target_chunks must not be smaller than launch_start_chunk: "
+                f"{normalized_target} vs {launch_start_chunk}")
+        return normalized_target
+
+    def _launch_direct_placement_wave(
+        self,
+        *,
+        direct_placer: BaMDirectKVPlacer,
+        results: list[Any],
+        kv_caches: list[torch.Tensor],
+        slot_mapping: torch.Tensor,
+        chunk_starts: list[int],
+        state_tracker: BaMDirectPlacementStateTracker,
+        launch_start_chunk: int,
+        launch_chunk_count: int | None,
+        return_target_chunks: int | None,
+        wave_name: str,
+        do_prepare: bool = True,
+    ) -> _InFlightDirectPlacementWave:
+        """launch 一波 direct placement，并返回可继续收口的 in-flight wave。
+
+        这层 helper 的职责很单一：
+
+        - 只组织一波 placement 的 prepare / launch
+        - 只产出一个显式 in-flight wave 对象
+        - 不在这里做等待/收口，避免再把 launch 与 wait 混回去
+
+        注意：
+        当前主线虽然最终仍会在同一次 direct retrieve 内等待 wave 满足返回
+        语义，但这里已经先把 launch 边界独立了出来。后续如果要把 execution
+        句柄再往上层 runtime 提一层，就不需要再重新拆主流程。
+
+        参数语义：
+
+        - `launch_chunk_count`
+          这一波真实提交给 placement 的 chunk 数。
+        - `return_target_chunks`
+          这一波结束后，希望暴露给上层推理引擎的“连续可消费前缀 chunk 数”。
+
+        """
+        launch_chunks = (int(launch_chunk_count)
+                         if launch_chunk_count is not None else
+                         max(len(results) - int(launch_start_chunk), 0))
+        if launch_chunks <= 0:
+            raise ValueError("launch_chunks must be positive for in-flight wave")
+        normalized_return_target_chunks = self._resolve_wave_return_target_chunks(
+            launch_start_chunk=launch_start_chunk,
+            launch_chunks=launch_chunks,
+            return_target_chunks=return_target_chunks,
+        )
+
+        if do_prepare:
+            direct_placer.prepare_for_batch(
+                results=results,
+                kv_caches=kv_caches,
+                slot_mapping=slot_mapping,
+                chunk_starts=chunk_starts,
+                launch_start_chunk=launch_start_chunk,
+                max_chunks_to_launch=launch_chunk_count,
+            )
+        launched_batch = direct_placer.start_batch(
+            results=results,
+            kv_caches=kv_caches,
+            slot_mapping=slot_mapping,
+            chunk_starts=chunk_starts,
+            launch_start_chunk=launch_start_chunk,
+            max_chunks_to_launch=launch_chunk_count,
+        )
+        direct_execution = direct_placer.execution_from_launched_batch(
+            launched_batch=launched_batch,
+            state_tracker=state_tracker,
+        )
+        # 先做一次非阻塞推进，把已经天然 ready 的状态同步进 tracker。
+        # 当前同步版本虽然最终还是会 wait，但把这一步单独保留出来后，未来要把
+        # wave 改成更细粒度轮询时，就不需要再拆 execution 接口。
+        direct_execution.advance_ready()
+        return _InFlightDirectPlacementWave(
+            direct_execution=direct_execution,
+            direct_placer=direct_placer,
+            launched_batch=launched_batch,
+            wave_name=wave_name,
+            launch_start_chunk=int(launch_start_chunk),
+            launch_chunks=int(launch_chunks),
+            return_target_chunks=int(normalized_return_target_chunks),
+        )
+
+    def _wait_direct_placement_wave(
+        self,
+        *,
+        in_flight_wave: _InFlightDirectPlacementWave,
+        state_tracker: BaMDirectPlacementStateTracker,
+    ) -> tuple[Any, BaMDirectPlacementBatchStateSnapshot]:
+        """等待一个已经 launch 的 direct placement wave 满足返回语义。"""
+        direct_execution = in_flight_wave.direct_execution
+        target_frontier_wait = getattr(
+            direct_execution,
+            "wait_until_contiguous_cache_ready",
+            None,
+        )
+        wave_local_wait = getattr(
+            direct_execution,
+            "wait_until_launched_range_cache_ready",
+            None,
+        )
+        if callable(target_frontier_wait):
+            _final_state_snapshot = target_frontier_wait(
+                in_flight_wave.return_target_chunks)
+            # 这里优先走新的 `get_stats()` 显式接口。
+            #
+            # 之所以仍然兼容历史上的 `_build_stats()`，是因为当前测试桩和部分过渡
+            # 执行器还没有完全切到新接口。如果在 storage 边界直接强制所有调用方
+            # 升级，会让这次“拆 launch / wait 边界”的控制面改动无谓扩散。
+            #
+            # 因此这里做一层很薄的兼容适配：
+            # - 真实主线实现：走 `get_stats()`；
+            # - 旧测试桩 / 过渡执行器：回退到 `_build_stats()`。
+            #
+            # 这样既能保持上层接口收敛，也不会把兼容逻辑污染到 direct placement
+            # 数据面里。
+            if hasattr(direct_execution, "get_stats"):
+                place_stats = direct_execution.get_stats()
+            else:
+                place_stats = direct_execution._build_stats()
+        elif callable(wave_local_wait):
+            place_stats, _final_state_snapshot = wave_local_wait()
+        else:
+            place_stats, _final_state_snapshot = direct_execution.wait()
+        in_flight_wave.direct_placer.log_launched_batch_step_timings(
+            in_flight_wave.launched_batch)
+
+        self._mark_ready_range_if_empty(
+            state_tracker,
+            chunk_start=in_flight_wave.launch_start_chunk,
+            chunk_count=in_flight_wave.launch_chunks,
+            ready_attr="staged_ready",
+        )
+        self._mark_ready_range_if_empty(
+            state_tracker,
+            chunk_start=in_flight_wave.launch_start_chunk,
+            chunk_count=in_flight_wave.launch_chunks,
+            ready_attr="cache_ready",
+        )
+        snapshot = state_tracker.snapshot()
+        logger.info(
+            "[LMCACHE_BAM_DIRECT_PLACEMENT_WAVE_DONE] wave=%s "
+            "launch_start_chunk=%d launch_chunks=%d staged_ready_in_wave=%d "
+            "cache_ready_in_wave=%d return_target_chunks=%d "
+            "consumable_chunks=%d consumable_tokens=%d "
+            "place_ms=%.3f",
+            in_flight_wave.wave_name,
+            in_flight_wave.launch_start_chunk,
+            in_flight_wave.launch_chunks,
+            self._count_ready_chunks_in_range(
+                snapshot,
+                chunk_start=in_flight_wave.launch_start_chunk,
+                chunk_count=in_flight_wave.launch_chunks,
+                ready_attr="staged_ready",
+            ),
+            self._count_ready_chunks_in_range(
+                snapshot,
+                chunk_start=in_flight_wave.launch_start_chunk,
+                chunk_count=in_flight_wave.launch_chunks,
+                ready_attr="cache_ready",
+            ),
+            in_flight_wave.return_target_chunks,
+            snapshot.consumable_chunks,
+            snapshot.consumable_tokens,
+            float(place_stats.place_ms),
+        )
+        return place_stats, snapshot
+
+    def _run_direct_placement_wave(
+        self,
+        *,
+        direct_placer: BaMDirectKVPlacer,
+        results: list[Any],
+        kv_caches: list[torch.Tensor],
+        slot_mapping: torch.Tensor,
+        chunk_starts: list[int],
+        state_tracker: BaMDirectPlacementStateTracker,
+        launch_start_chunk: int,
+        launch_chunk_count: int | None,
+        return_target_chunks: int | None,
+        wave_name: str,
+        do_prepare: bool = True,
+    ) -> tuple[Any, BaMDirectPlacementBatchStateSnapshot]:
+        """兼容当前调用方的一站式 wave helper。"""
+        launch_chunks = (int(launch_chunk_count)
+                         if launch_chunk_count is not None else
+                         max(len(results) - int(launch_start_chunk), 0))
+        if launch_chunks <= 0:
+            return type(
+                "PlaceStats", (),
+                {
+                    "impl": envs.VLLM_BAM_DIRECT_PLACEMENT_IMPL.strip().lower(),
+                    "refill_ms": 0.0,
+                    "transfer_ms": 0.0,
+                    "fused_ms": 0.0,
+                    "place_ms": 0.0,
+                })(), state_tracker.snapshot()
+        in_flight_wave = self._launch_direct_placement_wave(
+            direct_placer=direct_placer,
+            results=results,
+            kv_caches=kv_caches,
+            slot_mapping=slot_mapping,
+            chunk_starts=chunk_starts,
+            state_tracker=state_tracker,
+            launch_start_chunk=launch_start_chunk,
+            launch_chunk_count=launch_chunk_count,
+            return_target_chunks=return_target_chunks,
+            wave_name=wave_name,
+            do_prepare=do_prepare,
+        )
+        return self._wait_direct_placement_wave(
+            in_flight_wave=in_flight_wave,
+            state_tracker=state_tracker,
+        )
+
+    def _start_direct_placement_request(
+        self,
+        *,
+        token_database: Any,
+        tokens: torch.Tensor,
+        mask: Optional[torch.Tensor],
+        kv_caches: list[torch.Tensor],
+        slot_mapping: torch.Tensor,
+        kv_cache_dtype: str,
+    ) -> Optional[_InFlightDirectPlacementRequest]:
+        """启动一次 direct placement request，并返回后续可 poll/finalize 的句柄。
+
+        这是把“整次 request 的控制面”从旧的一口气大函数中拆出来的第一步。
+        当前它只负责：
+
+        1. 收集 prefix hit entries
+        2. 读取 BaM pages
+        3. 初始化 request 级 state tracker
+        4. 完成 prepare，并 launch 第一波 frontier wave
+
+        它刻意不做：
+
+        - 等待 wave 完成
+        - 构造 ret_mask
+        - 做 rebuilt 语义收口
+
+        这样后续无论是：
+        - 继续保留当前同步 finalize
+        - 还是把 handle 上提给 runtime 做周期性 poll
+
+        都能复用同一套 request 启动逻辑。
+        """
+        if not envs.VLLM_BAM_KV_FAST_PATH:
+            self._last_direct_placement_state_tracker = None
+            return None
+
+        masked_tokens = int(mask.sum().item()) if mask is not None else len(tokens)
+        direct_total_start = time.perf_counter()
+        logger.info(
+            "[LMCACHE_BAM_DIRECT_PLACEMENT_ENTER] tokens=%d masked_tokens=%d "
+            "slot_mapping=%d",
+            len(tokens),
+            masked_tokens,
+            int(slot_mapping.numel()),
+        )
+        entries = self._collect_direct_placement_entries(
+            token_database=token_database,
+            tokens=tokens,
+            mask=mask,
+        )
+        collect_entries_ms = (time.perf_counter() - direct_total_start) * 1000.0
+        if not entries:
+            self._last_direct_placement_state_tracker = None
+            logger.info(
+                "[LMCACHE_BAM_DIRECT_PLACEMENT_NO_PREFIX_HIT] "
+                "tokens=%d masked_tokens=%d",
+                len(tokens),
+                masked_tokens,
+            )
+            return None
+
+        keys = [key for _, _, key in entries]
+        chunk_ranges = ",".join(f"[{start},{end})" for start, end, _ in entries)
+        chunk_hashes = ",".join(_extract_chunk_hash(key)[:16] for key in keys)
+        logger.info(
+            "[LMCACHE_BAM_DIRECT_PLACEMENT_PREFIX_HIT] chunks=%d ranges=%s "
+            "chunk_hashes=%s",
+            len(entries),
+            chunk_ranges,
+            chunk_hashes,
+        )
+
+        read_start = time.perf_counter()
+        logger.info(
+            "[LMCACHE_BAM_DIRECT_PLACEMENT_READ_BEGIN] batch_size=%d "
+            "chunk_hashes=%s",
+            len(keys),
+            chunk_hashes,
+        )
+        results = self.read_chunk_pages_kv_fast_path_batch(keys)
+        read_ms = (time.perf_counter() - read_start) * 1000.0
+        if not results:
+            self._last_direct_placement_state_tracker = None
+            logger.info(
+                "[LMCACHE_BAM_DIRECT_PLACEMENT_READ_EMPTY] batch_size=%d "
+                "read_ms=%.3f",
+                len(keys),
+                read_ms,
+            )
+            return None
+
+        # token_database 和 slot_mapping 使用同一段 tokens 的局部坐标系。
+        # 例如 mask 前缀有 False 时，第一条可 retrieve 的 chunk 起点可能不是 0。
+        # 这里必须保留这个局部偏移，不能人为重编号，否则 placement 会把数据写
+        # 到错误的 vLLM physical slot。
+        chunk_starts = [start for start, _, _ in entries]
+        prefix_hit_chunks = len(entries)
+        prefix_hit_tokens = sum(
+            int(result.descriptor.actual_tokens) for result in results)
+        launch_chunk_limit = (
+            self._resolve_direct_placement_frontier_chunk_limit(
+                total_chunks=prefix_hit_chunks))
+        descriptor_start = time.perf_counter()
+        batch_descriptor = self._build_direct_placement_descriptor(
+            entries=entries,
+            results=results,
+        )
+        descriptor_ms = (time.perf_counter() - descriptor_start) * 1000.0
+        tracker_start = time.perf_counter()
+        state_tracker = BaMDirectPlacementStateTracker(batch_descriptor)
+        state_tracker.mark_all_read_ready()
+        self._last_direct_placement_state_tracker = state_tracker
+        self._log_direct_placement_state(stage="read_ready", tracker=state_tracker)
+        tracker_init_ms = (time.perf_counter() - tracker_start) * 1000.0
+        direct_placer = self._ensure_direct_kv_placer(
+            kv_cache_dtype=kv_cache_dtype)
+        first_wave_launch_chunks = (launch_chunk_limit
+                                    if launch_chunk_limit is not None else
+                                    prefix_hit_chunks)
+        # 对正常推理引擎主线来说，“当前请求应该返回的 prefix 长度”必须先于
+        # placement 执行语义被确定下来。
+        #
+        # 当前默认就是：
+        #   命中了多少连续 prefix chunk
+        #     -> 就准备返回多少连续 prefix chunk
+        #
+        # 只有显式打开 frontier 限制实验时，返回目标才会收缩到首波 launch 范围。
+        first_wave_return_target_chunks = first_wave_launch_chunks
+        first_wave_launch_tokens = sum(
+            int(result.descriptor.actual_tokens)
+            for result in results[:first_wave_launch_chunks])
+        followup_chunk_limit = (
+            self._resolve_direct_placement_followup_chunk_limit(
+                total_chunks=prefix_hit_chunks,
+                first_wave_chunks=first_wave_launch_chunks,
+            ))
+        logger.info(
+            "[LMCACHE_BAM_DIRECT_PLACEMENT_LAUNCH_POLICY] total_chunks=%d "
+            "prefix_hit_chunks=%d prefix_hit_tokens=%d "
+            "frontier_launch_chunks=%d frontier_launch_tokens=%d "
+            "return_target_chunks=%d launch_chunk_limit=%s "
+            "followup_chunk_limit=%d",
+            prefix_hit_chunks,
+            prefix_hit_chunks,
+            prefix_hit_tokens,
+            first_wave_launch_chunks,
+            first_wave_launch_tokens,
+            first_wave_return_target_chunks,
+            ("all" if launch_chunk_limit is None else
+             str(launch_chunk_limit)),
+            followup_chunk_limit,
+        )
+        # 第一波是真正决定“当前请求要返回多少可消费前缀”的关键 wave。
+        # 在真正启动第一波 placement 之前，先把一次性准备成本前移掉：
+        # - Triton/JIT warmup
+        # - pointer 初始化
+        #
+        # 这样 `DIRECT_RETRIEVE elapsed_ms` 会更接近 steady-state，而不会被
+        # 首发编译/初始化一次性成本干扰。
+        prepare_start = time.perf_counter()
+        prepare_bam_results_for_vllm_kvcache(
+            results=results,
+            layout=self.layout,
+            kv_caches=kv_caches,
+            slot_mapping=slot_mapping,
+            chunk_starts=chunk_starts,
+            kv_cache_dtype=kv_cache_dtype,
+            placer=direct_placer,
+            launch_start_chunk=0,
+            max_chunks_to_launch=launch_chunk_limit,
+        )
+        prepare_ms = (time.perf_counter() - prepare_start) * 1000.0
+        frontier_wave_start = time.perf_counter()
+        frontier_wave = self._launch_direct_placement_wave(
+            direct_placer=direct_placer,
+            results=results,
+            kv_caches=kv_caches,
+            slot_mapping=slot_mapping,
+            chunk_starts=chunk_starts,
+            state_tracker=state_tracker,
+            launch_start_chunk=0,
+            launch_chunk_count=launch_chunk_limit,
+            return_target_chunks=first_wave_return_target_chunks,
+            wave_name="frontier",
+            do_prepare=False,
+        )
+        return _InFlightDirectPlacementRequest(
+            tokens=tokens,
+            kv_caches=kv_caches,
+            slot_mapping=slot_mapping,
+            results=results,
+            state_tracker=state_tracker,
+            direct_placer=direct_placer,
+            chunk_starts=chunk_starts,
+            frontier_wave=frontier_wave,
+            prefix_hit_chunks=prefix_hit_chunks,
+            prefix_hit_tokens=prefix_hit_tokens,
+            first_wave_launch_chunks=first_wave_launch_chunks,
+            first_wave_return_target_chunks=first_wave_return_target_chunks,
+            followup_chunk_limit=followup_chunk_limit,
+            bootstrap_profile=_DirectPlacementRequestBootstrapProfile(
+                collect_entries_ms=collect_entries_ms,
+                read_ms=read_ms,
+                descriptor_ms=descriptor_ms,
+                tracker_init_ms=tracker_init_ms,
+                prepare_ms=prepare_ms,
+                direct_total_start_time=direct_total_start,
+                frontier_wave_start_time=frontier_wave_start,
+            ),
+        )
+
+    def _poll_direct_placement_request(
+        self,
+        *,
+        in_flight_request: _InFlightDirectPlacementRequest,
+    ) -> BaMDirectPlacementBatchStateSnapshot:
+        """非阻塞推进一次 request 当前已 launch frontier 的 ready 状态。
+
+        当前版本先只轮询第一波 frontier wave，因为真正决定“本次请求现在能不能
+        返回”的仍然是连续 consumable prefix frontier。
+
+        返回值始终落到 request 级 snapshot，而不是 wave 局部结构，这样以后上层
+        runtime 如果直接持有 request handle，就不需要理解 wave 细节。
+        """
+        frontier_snapshot = (
+            in_flight_request.frontier_wave.direct_execution.advance_ready())
+        if frontier_snapshot is not None:
+            return frontier_snapshot
+        return in_flight_request.state_tracker.snapshot()
+
+    def _finalize_direct_placement_request(
+        self,
+        *,
+        in_flight_request: _InFlightDirectPlacementRequest,
+    ) -> torch.Tensor:
+        """同步收口一次已经 start 的 direct placement request。
+
+        这里保留当前主线需要的同步语义：
+
+        - 先等待 frontier wave 满足当前请求的返回目标
+        - 再构造 ret_mask 并做返回语义校验
+        - 最后如果 followup 实验开关开启，再继续补齐 resident cache
+
+        但和旧版本不同的是，所有“已启动 request 的稳定上下文”都来自
+        `in_flight_request`，不再依赖一个大函数里的局部变量链式传递。
+        """
+        bootstrap_profile = in_flight_request.bootstrap_profile
+        state_tracker = in_flight_request.state_tracker
+        place_stats, first_wave_snapshot = self._wait_direct_placement_wave(
+            in_flight_wave=in_flight_request.frontier_wave,
+            state_tracker=state_tracker,
+        )
+        frontier_wave_ms = (
+            time.perf_counter() - bootstrap_profile.frontier_wave_start_time
+        ) * 1000.0
+        cache_ready_log_start = time.perf_counter()
+        self._log_direct_placement_state(stage="cache_ready", tracker=state_tracker)
+        cache_ready_log_ms = (time.perf_counter() - cache_ready_log_start) * 1000.0
+
+        # ret_mask 必须绑定到第一波完成时的 contiguous consumable frontier，
+        # 而不能绑定到后续 followup wave 的最终 resident 状态。
+        #
+        # 否则第一波只想先返回 1 个 chunk、第二波只是顺手把后续 chunk 补进
+        # cache 的情况下，上层会错误地把后续 chunk 也当成当前请求已经可消费的
+        # prefix。
+        ret_mask_start = time.perf_counter()
+        ret_mask = self._build_consumable_ret_mask(
+            tokens=in_flight_request.tokens,
+            snapshot=first_wave_snapshot,
+        )
+        ret_mask_ms = (time.perf_counter() - ret_mask_start) * 1000.0
+        return_snapshot = first_wave_snapshot
+        self._validate_direct_placement_return_semantics(
+            tokens=in_flight_request.tokens,
+            ret_mask=ret_mask,
+            return_snapshot=return_snapshot,
+            prefix_hit_chunks=in_flight_request.prefix_hit_chunks,
+            return_target_chunks=in_flight_request.first_wave_return_target_chunks,
+        )
+
+        # 第二波 followup 是一个默认关闭的实验控制面能力。
+        # 它当前的目标不是立刻改变返回给上层的 hit_tokens，而是把：
+        # - 从 chunk 偏移处继续 launch
+        # - 继续复用同一个 tracker 推进 ready 状态
+        # - 真实 store 日志里可观察到第二波行为
+        # 这条链路先在真实路径中接通。
+        followup_total_ms = 0.0
+        followup_log_ms = 0.0
+        if in_flight_request.followup_chunk_limit > 0:
+            logger.info(
+                "[LMCACHE_BAM_DIRECT_PLACEMENT_FOLLOWUP_BEGIN] "
+                "start_chunk=%d launch_chunks=%d",
+                in_flight_request.first_wave_launch_chunks,
+                in_flight_request.followup_chunk_limit,
+            )
+            followup_start = time.perf_counter()
+            followup_wave = self._launch_direct_placement_wave(
+                direct_placer=in_flight_request.direct_placer,
+                results=in_flight_request.results,
+                kv_caches=in_flight_request.kv_caches,
+                slot_mapping=in_flight_request.slot_mapping,
+                chunk_starts=in_flight_request.chunk_starts,
+                state_tracker=state_tracker,
+                launch_start_chunk=in_flight_request.first_wave_launch_chunks,
+                launch_chunk_count=in_flight_request.followup_chunk_limit,
+                return_target_chunks=(
+                    in_flight_request.first_wave_launch_chunks +
+                    in_flight_request.followup_chunk_limit
+                ),
+                wave_name="followup",
+            )
+            _followup_stats, followup_snapshot = self._wait_direct_placement_wave(
+                in_flight_wave=followup_wave,
+                state_tracker=state_tracker,
+            )
+            followup_total_ms = (time.perf_counter() - followup_start) * 1000.0
+            followup_log_start = time.perf_counter()
+            self._log_direct_placement_state(
+                stage="followup_cache_ready",
+                tracker=state_tracker,
+            )
+            logger.info(
+                "[LMCACHE_BAM_DIRECT_PLACEMENT_FOLLOWUP_DONE] "
+                "resident_cache_ready_chunks=%d resident_consumable_chunks=%d "
+                "resident_consumable_tokens=%d return_consumable_chunks=%d "
+                "return_consumable_tokens=%d",
+                followup_snapshot.cache_ready_chunks,
+                followup_snapshot.consumable_chunks,
+                followup_snapshot.consumable_tokens,
+                return_snapshot.consumable_chunks,
+                return_snapshot.consumable_tokens,
+            )
+            followup_log_ms = (time.perf_counter() - followup_log_start) * 1000.0
+
+        final_log_start = time.perf_counter()
+        total_bytes = sum(
+            int(result.descriptor.total_bytes)
+            for result in in_flight_request.results
+        )
+        total_tokens = int(return_snapshot.consumable_tokens)
+        batch_stats = in_flight_request.results[0].stats
+        logger.info(
+            "[LMCACHE_BAM_DIRECT_PLACEMENT_READ] batch_size=%d total_bytes=%d "
+            "submit_ms=%.3f poll_ms=%.3f poll_iters=%d get_ms=%.3f "
+            "read_ms=%.3f executor=%s worker_backend=%s",
+            len(in_flight_request.results),
+            total_bytes,
+            batch_stats.submit_ms,
+            batch_stats.poll_ms,
+            batch_stats.poll_iters,
+            batch_stats.get_ms,
+            bootstrap_profile.read_ms,
+            getattr(batch_stats, "executor_name", "rowctx"),
+            getattr(batch_stats, "worker_backend", "rowctx"),
+        )
+        logger.info(
+            "[LMCACHE_BAM_DIRECT_PLACEMENT] chunks=%d tokens=%d "
+            "impl=%s read_ms=%.3f refill_ms=%.3f transfer_ms=%.3f "
+            "fused_ms=%.3f place_ms=%.3f total_ms=%.3f",
+            in_flight_request.prefix_hit_chunks,
+            total_tokens,
+            place_stats.impl,
+            bootstrap_profile.read_ms,
+            place_stats.refill_ms,
+            place_stats.transfer_ms,
+            place_stats.fused_ms,
+            place_stats.place_ms,
+            bootstrap_profile.read_ms + place_stats.place_ms,
+        )
+        final_log_ms = (time.perf_counter() - final_log_start) * 1000.0
+        direct_total_ms = (
+            time.perf_counter() - bootstrap_profile.direct_total_start_time
+        ) * 1000.0
+        logger.info(
+            "[LMCACHE_BAM_DIRECT_PLACEMENT_PROFILE] collect_entries_ms=%.3f "
+            "read_ms=%.3f descriptor_ms=%.3f tracker_init_ms=%.3f "
+            "prepare_ms=%.3f frontier_wave_wall_ms=%.3f "
+            "cache_ready_log_ms=%.3f ret_mask_ms=%.3f "
+            "followup_wave_wall_ms=%.3f followup_log_ms=%.3f "
+            "final_log_ms=%.3f direct_total_ms=%.3f",
+            bootstrap_profile.collect_entries_ms,
+            bootstrap_profile.read_ms,
+            bootstrap_profile.descriptor_ms,
+            bootstrap_profile.tracker_init_ms,
+            bootstrap_profile.prepare_ms,
+            frontier_wave_ms,
+            cache_ready_log_ms,
+            ret_mask_ms,
+            followup_total_ms,
+            followup_log_ms,
+            final_log_ms,
+            direct_total_ms,
+        )
+        return ret_mask
+
+    def start_direct_placement_request(
+        self,
+        *,
+        token_database: Any,
+        tokens: torch.Tensor,
+        mask: Optional[torch.Tensor],
+        kv_caches: list[torch.Tensor],
+        slot_mapping: torch.Tensor,
+        kv_cache_dtype: str = "auto",
+    ) -> Optional[Any]:
+        """公开 direct placement request 的 start 边界。
+
+        当前返回值仍然故意声明为 `Any`，原因是这只是第一版对外暴露的 request
+        handle，调用方只需要把它当成一个“后续可 poll/finalize 的不透明句柄”
+        来传递，而不应该依赖内部 dataclass 字段。
+
+        这样后续如果我们继续调整 request handle 的内部组织方式，就不需要同步改
+        上层 runtime / adapter 的类型依赖。
+        """
+        return self._start_direct_placement_request(
+            token_database=token_database,
+            tokens=tokens,
+            mask=mask,
+            kv_caches=kv_caches,
+            slot_mapping=slot_mapping,
+            kv_cache_dtype=kv_cache_dtype,
+        )
+
+    def poll_direct_placement_request(
+        self,
+        *,
+        in_flight_request: Any,
+    ) -> BaMDirectPlacementBatchStateSnapshot:
+        """公开 direct placement request 的非阻塞 poll 边界。"""
+        return self._poll_direct_placement_request(
+            in_flight_request=in_flight_request,
+        )
+
+    def finalize_direct_placement_request(
+        self,
+        *,
+        in_flight_request: Any,
+    ) -> torch.Tensor:
+        """公开 direct placement request 的同步 finalize 边界。"""
+        return self._finalize_direct_placement_request(
+            in_flight_request=in_flight_request,
+        )
+
+    def _build_consumable_ret_mask(
+        self,
+        *,
+        tokens: torch.Tensor,
+        snapshot: BaMDirectPlacementBatchStateSnapshot,
+    ) -> torch.Tensor:
+        """基于当前 contiguous cache-ready frontier 构造返回给 LMCache 的 ret_mask。
+
+        这里刻意不用“所有命中的 chunk”直接生成 mask，而是只暴露当前真正
+        `consumable` 的连续前缀。原因是：
+
+        - prefix 语义要求必须是“从开头连续命中”
+        - 后续如果某个 chunk 已经命中但还没 placement 完成，它不能被上层当成
+          已恢复 prefix 使用
+
+        因此 ret_mask 的口径应当绑定到：
+
+        ```text
+        contiguous cache-ready frontier
+        ```
+
+        而不是“这轮一共命中了多少个 chunk”。
+        """
+        ret_mask = torch.zeros_like(tokens, dtype=torch.bool, device="cpu")
+        for chunk_state in snapshot.chunk_states:
+            if not chunk_state.cache_ready:
+                break
+            ret_mask[chunk_state.descriptor.chunk_start:chunk_state.descriptor.
+                     chunk_end] = True
+        return ret_mask
+
+    @staticmethod
+    def _count_ret_mask_tokens(ret_mask: torch.Tensor) -> int:
+        """统计返回给 LMCache / vLLM 的 prefix token 数。"""
+        return int(ret_mask.sum().item())
+
+    def _validate_direct_placement_return_semantics(
+        self,
+        *,
+        tokens: torch.Tensor,
+        ret_mask: torch.Tensor,
+        return_snapshot: BaMDirectPlacementBatchStateSnapshot,
+        prefix_hit_chunks: int,
+        return_target_chunks: int,
+    ) -> None:
+        """校验 direct placement 主线的“返回语义”是否自洽。
+
+        这里故意把检查集中在 store 内部，而不是分散到多个调用点，原因是：
+
+        - 这里同时能看到底层状态快照和最终返回给上层的 `ret_mask`
+        - 这正是“正常推理引擎语义”最容易被未来优化破坏的边界
+
+        当前要求至少满足：
+
+        1. `ret_mask` 只能覆盖当前 contiguous consumable frontier
+        2. `ret_mask` token 数必须等于 snapshot 的 `consumable_tokens`
+        3. 当前返回目标不能超过 prefix hit，也不能超过 snapshot 已暴露的范围
+        """
+        ret_mask_tokens = self._count_ret_mask_tokens(ret_mask)
+        consumable_tokens = int(return_snapshot.consumable_tokens)
+        consumable_chunks = int(return_snapshot.consumable_chunks)
+
+        if ret_mask_tokens != consumable_tokens:
+            raise RuntimeError(
+                "direct placement return semantics mismatch: "
+                f"ret_mask_tokens={ret_mask_tokens} "
+                f"consumable_tokens={consumable_tokens} "
+                f"consumable_chunks={consumable_chunks}")
+
+        if consumable_chunks > int(prefix_hit_chunks):
+            raise RuntimeError(
+                "direct placement consumable frontier exceeds prefix hit range: "
+                f"consumable_chunks={consumable_chunks} "
+                f"prefix_hit_chunks={prefix_hit_chunks}")
+
+        if consumable_chunks < int(return_target_chunks):
+            raise RuntimeError(
+                "direct placement returned before target prefix became consumable: "
+                f"consumable_chunks={consumable_chunks} "
+                f"return_target_chunks={return_target_chunks}")
+
+        if ret_mask.shape != tokens.shape:
+            raise RuntimeError(
+                "direct placement ret_mask shape mismatch: "
+                f"ret_mask_shape={tuple(ret_mask.shape)} "
+                f"tokens_shape={tuple(tokens.shape)}")
+
+        logger.info(
+            "[LMCACHE_BAM_DIRECT_PLACEMENT_RETURN_SEMANTICS] "
+            "prefix_hit_chunks=%d return_target_chunks=%d "
+            "consumable_chunks=%d ret_mask_tokens=%d",
+            prefix_hit_chunks,
+            return_target_chunks,
+            consumable_chunks,
+            ret_mask_tokens,
+        )
+
     def direct_place_chunks_to_vllm_kvcache(
         self,
         *,
@@ -840,112 +1928,39 @@ class LMCacheBaMStore:
         原始 LMCache SSD retrieve。否则 direct placement 开关一开，BaM 没命中
         时就会直接返回 miss，后面的 LMCache fallback 根本没有机会执行。
         """
-        if not envs.VLLM_BAM_KV_FAST_PATH:
-            return None
-
-        masked_tokens = int(mask.sum().item()) if mask is not None else len(tokens)
-        logger.info(
-            "[LMCACHE_BAM_DIRECT_PLACEMENT_ENTER] tokens=%d masked_tokens=%d "
-            "slot_mapping=%d",
-            len(tokens),
-            masked_tokens,
-            int(slot_mapping.numel()),
-        )
-        entries = self._collect_direct_placement_entries(
+        in_flight_request = self.start_direct_placement_request(
             token_database=token_database,
             tokens=tokens,
             mask=mask,
-        )
-        if not entries:
-            logger.info(
-                "[LMCACHE_BAM_DIRECT_PLACEMENT_NO_PREFIX_HIT] "
-                "tokens=%d masked_tokens=%d",
-                len(tokens),
-                masked_tokens,
-            )
-            return None
-
-        keys = [key for _, _, key in entries]
-        chunk_ranges = ",".join(f"[{start},{end})" for start, end, _ in entries)
-        chunk_hashes = ",".join(_extract_chunk_hash(key)[:16] for key in keys)
-        logger.info(
-            "[LMCACHE_BAM_DIRECT_PLACEMENT_PREFIX_HIT] chunks=%d ranges=%s "
-            "chunk_hashes=%s",
-            len(entries),
-            chunk_ranges,
-            chunk_hashes,
-        )
-
-        read_start = time.perf_counter()
-        logger.info(
-            "[LMCACHE_BAM_DIRECT_PLACEMENT_READ_BEGIN] batch_size=%d "
-            "chunk_hashes=%s",
-            len(keys),
-            chunk_hashes,
-        )
-        results = self.read_chunk_pages_kv_fast_path_batch(keys)
-        read_ms = (time.perf_counter() - read_start) * 1000.0
-        if not results:
-            logger.info(
-                "[LMCACHE_BAM_DIRECT_PLACEMENT_READ_EMPTY] batch_size=%d "
-                "read_ms=%.3f",
-                len(keys),
-                read_ms,
-            )
-            return None
-
-        # token_database 和 slot_mapping 使用同一段 tokens 的局部坐标系。
-        # 例如 mask 前缀有 False 时，第一条可 retrieve 的 chunk 起点可能不是 0。
-        # 这里必须保留这个局部偏移，不能人为重编号，否则 placement 会把数据写
-        # 到错误的 vLLM physical slot。
-        chunk_starts = [start for start, _, _ in entries]
-        place_stats = place_bam_results_to_vllm_kvcache(
-            results=results,
-            layout=self.layout,
             kv_caches=kv_caches,
             slot_mapping=slot_mapping,
-            chunk_starts=chunk_starts,
             kv_cache_dtype=kv_cache_dtype,
-            num_kv_heads=num_kv_heads,
-            head_size=head_size,
+        )
+        if in_flight_request is None:
+            return None
+
+        # 当前同步主线仍然会在同一次 direct retrieve 里把 request 收口，但这里
+        # 先显式保留一次 request 级 poll，作为后续 runtime 周期性推进 ready
+        # 状态的统一入口。
+        self.poll_direct_placement_request(
+            in_flight_request=in_flight_request,
+        )
+        return self.finalize_direct_placement_request(
+            in_flight_request=in_flight_request,
         )
 
-        ret_mask = torch.zeros_like(tokens, dtype=torch.bool, device="cpu")
-        for start, end, _ in entries:
-            ret_mask[start:end] = True
-
-        total_bytes = sum(int(result.descriptor.total_bytes) for result in results)
-        total_tokens = int(ret_mask.sum().item())
-        batch_stats = results[0].stats
-        logger.info(
-            "[LMCACHE_BAM_DIRECT_PLACEMENT_READ] batch_size=%d total_bytes=%d "
-            "submit_ms=%.3f poll_ms=%.3f poll_iters=%d get_ms=%.3f "
-            "read_ms=%.3f executor=%s worker_backend=%s",
-            len(results),
-            total_bytes,
-            batch_stats.submit_ms,
-            batch_stats.poll_ms,
-            batch_stats.poll_iters,
-            batch_stats.get_ms,
-            read_ms,
-            getattr(batch_stats, "executor_name", "rowctx"),
-            getattr(batch_stats, "worker_backend", "rowctx"),
-        )
-        logger.info(
-            "[LMCACHE_BAM_DIRECT_PLACEMENT] chunks=%d tokens=%d "
-            "impl=%s read_ms=%.3f refill_ms=%.3f transfer_ms=%.3f "
-            "fused_ms=%.3f place_ms=%.3f total_ms=%.3f",
-            len(entries),
-            total_tokens,
-            place_stats.impl,
-            read_ms,
-            place_stats.refill_ms,
-            place_stats.transfer_ms,
-            place_stats.fused_ms,
-            place_stats.place_ms,
-            read_ms + place_stats.place_ms,
-        )
-        return ret_mask
+    def _ensure_direct_kv_placer(
+        self,
+        *,
+        kv_cache_dtype: str,
+    ) -> BaMDirectKVPlacer:
+        """按 BaM store 生命周期复用一个 direct KV placer。"""
+        if self._direct_kv_placer is None:
+            self._direct_kv_placer = BaMDirectKVPlacer(
+                layout=self.layout,
+                kv_cache_dtype=kv_cache_dtype,
+            )
+        return self._direct_kv_placer
 
     def enqueue_kv_fast_path_prefetch_key(self, key: Any) -> bool:
         """登记本轮 LMCache retrieve 可能会读取的 key。
@@ -1111,8 +2126,7 @@ class LMCacheBaMStorageManager:
             envs.VLLM_BAM_CTRL_IDX,
         )
         logger.info(
-            "[LMCACHE_BAM] env gids_registered_poll_impl=%s gids_kv_worker_poll_impl=%s",
-            os.environ.get("GIDS_REGISTERED_POLL_IMPL", "<unset>"),
+            "[LMCACHE_BAM] env gids_kv_worker_poll_impl=%s",
             os.environ.get("GIDS_KV_WORKER_POLL_IMPL", "<unset>"),
         )
 
@@ -1409,7 +2423,7 @@ class LMCacheBaMStorageManager:
           -> token_database.process_tokens()
           -> [CacheEngineKey, ...]
           -> BaM KV batch read pages
-          -> place_bam_results_to_vllm_kvcache()
+          -> direct placement prepare/start/wait
           -> ret_mask
         ```
 
@@ -1436,6 +2450,64 @@ class LMCacheBaMStorageManager:
             kv_cache_dtype=kv_cache_dtype,
             num_kv_heads=num_kv_heads,
             head_size=head_size,
+        )
+
+    def start_direct_retrieve_to_vllm_kvcache(
+        self,
+        *,
+        token_database: Any,
+        tokens: torch.Tensor,
+        mask: Optional[torch.Tensor],
+        kv_caches: list[torch.Tensor],
+        slot_mapping: torch.Tensor,
+        kv_cache_dtype: str = "auto",
+        num_kv_heads: int,
+        head_size: int,
+    ) -> Optional[Any]:
+        """公开 direct retrieve request 的 start 边界，供更高层 runtime 编排。
+
+        当前 `num_kv_heads/head_size` 还保留在接口上，主要是为了和现有
+        `direct_retrieve_to_vllm_kvcache()` 的调用签名保持一致，避免后续 adapter
+        切换时再做一轮分叉。当前 store 侧 request handle 本身还不直接依赖这两个
+        参数，但保留这层签名有助于未来继续向 runtime 抬升控制面。
+        """
+        del num_kv_heads, head_size
+        if self._bam_store is None:
+            return None
+        if not envs.VLLM_BAM_KV_FAST_PATH:
+            return None
+
+        return self._bam_store.start_direct_placement_request(
+            token_database=token_database,
+            tokens=tokens,
+            mask=mask,
+            kv_caches=kv_caches,
+            slot_mapping=slot_mapping,
+            kv_cache_dtype=kv_cache_dtype,
+        )
+
+    def poll_direct_retrieve_to_vllm_kvcache(
+        self,
+        *,
+        in_flight_request: Any,
+    ) -> Optional[BaMDirectPlacementBatchStateSnapshot]:
+        """公开 direct retrieve request 的非阻塞 poll 边界。"""
+        if self._bam_store is None:
+            return None
+        return self._bam_store.poll_direct_placement_request(
+            in_flight_request=in_flight_request,
+        )
+
+    def finalize_direct_retrieve_to_vllm_kvcache(
+        self,
+        *,
+        in_flight_request: Any,
+    ) -> Optional[torch.Tensor]:
+        """公开 direct retrieve request 的 finalize 边界。"""
+        if self._bam_store is None:
+            return None
+        return self._bam_store.finalize_direct_placement_request(
+            in_flight_request=in_flight_request,
         )
 
     def __getattr__(self, name: str) -> Any:

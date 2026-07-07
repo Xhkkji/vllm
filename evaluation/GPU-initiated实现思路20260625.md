@@ -114,6 +114,74 @@ BaMKVStore
    “BaM pages -> final vLLM KV cache” 的进一步收缩。
 ```
 
+### 1.2.1 当前 wave 收口方式（2026-07-04）
+
+direct placement 这条线最近又往 GPU-initiated 主线收了一步，重点不是改数据格式，而是先把“等待边界”收紧：
+
+```text
+旧逻辑：
+  start_batch()
+    -> execution.wait()
+    -> torch.cuda.synchronize(device)
+    -> 整个 wave 结束
+
+新逻辑：
+  start_batch()
+    -> execution.advance_ready()
+    -> execution.wait_until_launched_range_cache_ready()
+    -> 只轮询当前 wave 自己的 completion events
+    -> 当前 wave 结束
+```
+
+这一步的意义：
+
+```text
+1. 不再用整卡 synchronize 把本 wave 之外的 CUDA 工作一起卡住
+2. execution 层已经显式具备两类等待语义：
+   - wait_until_launched_range_cache_ready()
+   - wait_until_contiguous_cache_ready(target_chunks)
+3. store 层仍然保持“本请求内同步收口”，因此当前主线不会引入
+   “返回后后台继续改写同一份 kv_cache” 的竞态
+4. 但后续如果要继续推进真正的 chunk-ready -> chunk-consumable，
+   可以直接复用这层 execution 接口，而不必重新拆 direct placement 主流程
+```
+
+一句话理解：
+
+```text
+当前还不是“完全异步返回”，
+但已经从“整卡同步等待”收成了“只等本 wave 的 completion event”，
+这是继续往 GPU-initiated 推进时一个更安全、也更贴近主线的中间态。
+```
+
+2026-07-06 进一步收敛后的当前主线语义：
+
+```text
+当前请求命中了多少连续 prefix
+  -> 先把这段 prefix 长度显式记成 return target
+  -> direct placement 仍然可以有自己的 launch 范围
+  -> 但 store 主路径优先等待：
+       contiguous cache-ready frontier >= return target
+  -> 再生成 ret_mask 返回给 LMCache / vLLM
+```
+
+这意味着当前主线已经不再优先按“本 wave launch 了多少 chunk”来决定返回时机，
+而是优先按“当前请求准备返回给正常推理引擎多少 prefix”来收口。
+
+对接现成推理框架时，应该把它理解成：
+
+```text
+ret_mask 语义
+  == 当前这轮真实恢复完成、并且可以立刻被 attention 消费的连续 prefix
+```
+
+而不是：
+
+```text
+ret_mask 语义
+  == 这次内部 launch 了哪些 chunk
+```
+
 2026-06-28 最新判断：
 
 ```text
@@ -1939,6 +2007,54 @@ LMCache prefix hit
 I/O 已经 batch 化，
 placement 仍处于“BaM pages -> merged LMCache tensor -> one transfer”
 这个过渡阶段。
+```
+
+补充一条 2026-06-30 当天代码侧的最新推进：
+
+```text
+direct placement 的 fused 实验路径已经从：
+
+  单个 chunk
+    -> 每个 layer
+       -> 每个 K/V
+          -> 多次 kernel launch
+
+收缩成：
+
+  单个 chunk
+    -> 一次 fused kernel launch
+       -> 同时覆盖全部 layer + K/V
+```
+
+这一步的意义不是“已经替代当前 lmcache 主线”，而是先把 direct placement v1
+需要的最内层数据搬运收紧：
+
+```text
+旧 fused:
+  Python for chunk
+    Python for layer
+      Python for K/V
+        Triton launch
+
+新 fused:
+  Python for chunk
+    Triton launch
+```
+
+当前仍保留逐 chunk 的 Python 层，原因是：
+
+```text
+1. 这样可以继续复用现有 placement plan / chunk 边界；
+2. 便于和当前稳定的 lmcache 实现做 A/B；
+3. 后续如果继续往 batch-level fused placement 收缩，
+   只需要替换“逐 chunk 执行器”这一层，而不用改上层 direct placement 入口。
+```
+
+因此可以把这一步理解成：
+
+```text
+先把 chunk 内部的数据面收紧，
+再考虑把多个 chunk 合并成更大的 batch placement kernel。
 ```
 
 ### 12.8 和 baseline 的对比应该怎么理解

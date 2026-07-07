@@ -54,6 +54,10 @@ if TYPE_CHECKING:
     VLLM_BAM_KV_FAST_PATH: bool = False
     VLLM_BAM_DIRECT_PLACEMENT: bool = False
     VLLM_BAM_DIRECT_PLACEMENT_IMPL: str = "lmcache"
+    VLLM_BAM_DIRECT_PLACEMENT_FRONTIER_CHUNKS: int = 0
+    VLLM_BAM_DIRECT_PLACEMENT_FOLLOWUP_CHUNKS: int = 0
+    VLLM_BAM_XFORMERS_PREFIX_FALLBACK_PROFILE: bool = False
+    VLLM_BAM_TRY_PAGED_PREFIX_ZERO_ALIBI: bool = False
     VLLM_BAM_IMPORT_PATH: Optional[str] = None
     VLLM_BAM_CACHE_SIZE_MB: int = 512
     VLLM_BAM_NUM_SSD: int = 1
@@ -451,6 +455,52 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # - fused: 实验版本，BaM pages -> vLLM flat paged KV cache
     "VLLM_BAM_DIRECT_PLACEMENT_IMPL":
     lambda: os.getenv("VLLM_BAM_DIRECT_PLACEMENT_IMPL", "lmcache"),
+
+    # 一次 direct placement 真实 launch 的连续前缀 chunk 数。
+    #
+    # 语义：
+    # - 0: launch 当前命中的全部连续 prefix chunks（默认主路径）
+    # - N>0: 只 launch 前 N 个连续 prefix chunks 的 placement
+    #
+    # 这为 chunk-ready / chunk-consumable frontier 试验保留了一个最小开关：
+    # 当前可以先只暴露前若干个 chunk 给上层 rebuild / consume，避免一次性把
+    # 全部命中 chunk 都推进到最终 cache。
+    "VLLM_BAM_DIRECT_PLACEMENT_FRONTIER_CHUNKS":
+    lambda: int(os.getenv("VLLM_BAM_DIRECT_PLACEMENT_FRONTIER_CHUNKS", "0")),
+
+    # 实验开关：在第一波 direct placement 之后，再额外补多少个 followup
+    # chunks。
+    #
+    # 语义：
+    # - 0: 关闭 followup wave（默认，保持当前主路径不变）
+    # - N>0: 第一波返回后，再按 chunk 顺序额外执行至多 N 个 followup chunks
+    #
+    # 注意：
+    # 当前这条真实 store 路径仍然是“同步收口的控制面验证版本”，它的目标是先把
+    # wave 组织、tracker 推进和日志打通，而不是已经实现最终的异步重叠收益。
+    "VLLM_BAM_DIRECT_PLACEMENT_FOLLOWUP_CHUNKS":
+    lambda: int(os.getenv("VLLM_BAM_DIRECT_PLACEMENT_FOLLOWUP_CHUNKS", "0")),
+
+    # 是否为 xformers prefix fallback 打开细粒度阶段计时。
+    # 默认关闭，避免在正常跑分时引入额外 synchronize 干扰口径。
+    "VLLM_BAM_XFORMERS_PREFIX_FALLBACK_PROFILE":
+    lambda: bool(
+        int(os.getenv("VLLM_BAM_XFORMERS_PREFIX_FALLBACK_PROFILE", "0"))),
+
+    # 实验开关：
+    # 在 V100/Turing 等 `sm < 80` 且模型本身没有 alibi 时，尝试给
+    # `PagedAttention.forward_prefix()` 注入一组全 0 的 alibi slope，
+    # 借道 `_fwd_kernel_alibi` 这条另一套 Triton kernel。
+    #
+    # 动机：
+    # 当前已确认真正不稳定的是 no-alibi 那条 prefix kernel。全 0 alibi 在
+    # 语义上等价于“无 alibi”，但会切到不同实现，因此适合作为一个低侵入、
+    # 可随时关闭的局部修复试验入口。
+    #
+    # 默认保持关闭，避免影响当前已经稳定的 xformers fallback 主线。
+    "VLLM_BAM_TRY_PAGED_PREFIX_ZERO_ALIBI":
+    lambda: bool(
+        int(os.getenv("VLLM_BAM_TRY_PAGED_PREFIX_ZERO_ALIBI", "0"))),
 
     # 可选：显式指定 BaM Python 模块搜索路径。
     "VLLM_BAM_IMPORT_PATH":

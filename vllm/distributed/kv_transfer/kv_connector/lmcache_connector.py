@@ -228,6 +228,24 @@ class LMCacheConnector(KVConnectorBase):
         kv_caches: List[torch.Tensor]
     ) -> Tuple[Union[torch.Tensor, IntermediateTensors], bool,
                "ModelInputForGPUWithSamplingMetadata"]:
+        """按当前 V0 connector 契约同步收口一次 retrieve。
+
+        这里需要明确当前 runtime 边界：
+
+        - `recv_kv_caches_and_hidden_states()` 是 blocking 调用
+        - 返回值只有两种稳定语义：
+          1. `bypass_model_exec=True`：完全跳过当前前向
+          2. `bypass_model_exec=False`：立刻用返回的 `model_input` 继续当前前向
+
+        因此即使下层 BaM direct placement 已经具备 `start/poll/finalize`
+        request-handle 结构，当前 V0 主线里它也只能在这一次 blocking `recv`
+        调用内部完成同步收口。
+
+        如果未来要把 live in-flight request 跨 `recv` 调用保留下来，就必须先
+        扩展 connector / model_runner 的 runtime 契约，引入“延后当前 request、
+        下轮再继续执行”的安全中间态；否则后台 direct placement 可能会和当前
+        正常 model forward 对同一片 paged KV cache 发生写入竞争。
+        """
 
         retrieve_status = self.lmcache_should_retrieve(model_input)
         self._maybe_prefetch_bam_chunks(model_input, retrieve_status)

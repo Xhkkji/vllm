@@ -279,3 +279,27 @@ class InputProcessingError(Exception):
     def __str__(self):
         return "Failed to prepare inputs for sequence group with request id: " \
                 f"{self.request_id}, Error: {self.message}"
+
+
+class DeferredModelExecution(Exception):
+    """当前 batch 的 model execution 被 connector/runtime 主动延后。
+
+    这不是错误，而是一个显式控制流信号：
+
+    - 某个 connector 已经为当前 batch 启动了 in-flight retrieve
+    - 但这轮还不能安全继续 forward
+    - 因此 engine 应保留原调度结果，并在下一轮继续执行同一批输入
+
+    当前实现按“整批 defer”处理，而不是在同一 batch 内拆分一部分继续 forward、
+    一部分继续等待。这样语义最直接，也更贴近现阶段 direct placement request
+    handle 的组织方式。
+    """
+
+    def __init__(self, request_ids: List[str], message: str):
+        self.request_ids = request_ids
+        self.message = message
+        super().__init__(self.message)
+
+    def __str__(self):
+        return ("Deferred model execution for request batch "
+                f"{self.request_ids}: {self.message}")

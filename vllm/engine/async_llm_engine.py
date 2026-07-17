@@ -36,6 +36,7 @@ from vllm.sequence import ExecuteModelRequest
 from vllm.transformers_utils.tokenizer import AnyTokenizer
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils import Device, deprecate_kwargs, weak_bind
+from vllm.worker.model_runner_base import DeferredModelExecution
 
 logger = init_logger(__name__)
 ENGINE_ITERATION_TIMEOUT_S = envs.VLLM_ENGINE_ITERATION_TIMEOUT_S
@@ -353,8 +354,26 @@ class _AsyncLLMEngine(LLMEngine):
                     virtual_engine]
 
             # Execute the model.
-            outputs = await self.model_executor.execute_model_async(
-                execute_model_req)
+            try:
+                outputs = await self.model_executor.execute_model_async(
+                    execute_model_req)
+            except DeferredModelExecution as e:
+                # 与同步引擎同理：当前 batch 已经拥有 live in-flight retrieve，
+                # 但这轮还不能安全 forward，因此保留原调度结果，下轮继续 poll。
+                self._skip_scheduling_next_step = True
+                self._cache_scheduler_outputs_for_multi_step(
+                    virtual_engine=virtual_engine,
+                    scheduler_outputs=scheduler_outputs,
+                    seq_group_metadata_list=seq_group_metadata_list,
+                    allow_async_output_proc=allow_async_output_proc,
+                )
+                logger.info(
+                    "Deferred current async model execution batch and will "
+                    "retry the same schedule on the next engine iteration. "
+                    "request_ids=%s",
+                    e.request_ids,
+                )
+                return ctx.request_outputs
 
             # we need to do this here so that last step's sampled_token_ids can
             # be passed to the next iteration for PP.

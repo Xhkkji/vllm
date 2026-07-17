@@ -16,11 +16,14 @@ vLLM/LMCache 接入逻辑。
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import time
 from typing import Any, Sequence
 
 import torch
 
+from vllm.bam.lmcache_bam_direct_placement import (
+    BaMRuntimeAttentionMetadataAttachment)
 from vllm.bam.lmcache_bam_refill import refill_pages_to_lmcache_tensor
 from vllm.bam.row_store_loader import import_bam_kv_store
 from vllm.logger import init_logger
@@ -28,6 +31,13 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 _KV_FAST_PATH_TIMEOUT_S = 10.0
+_KV_FRONTIER_COL_STATUS = 0
+_KV_FRONTIER_COL_LAUNCH_FRONTIER_CHUNKS = 1
+_KV_FRONTIER_COL_READ_READY_FRONTIER_CHUNKS = 2
+_KV_FRONTIER_COL_CACHE_READY_FRONTIER_CHUNKS = 3
+_KV_FRONTIER_COL_CONSUMABLE_FRONTIER_CHUNKS = 4
+_KV_FRONTIER_COL_TOTAL_CHUNKS = 5
+_KV_FRONTIER_COL_ERROR_CODE = 6
 
 
 def _kv_batch_status_name(status: int) -> str:
@@ -83,6 +93,96 @@ def _kv_completion_error_summary(values: object) -> str:
     return _kv_completion_bytes_summary(values)
 
 
+def _kv_frontier_value(frontier_row: Sequence[int], column: int) -> int:
+    """安全读取 frontier row 中的某一列。
+
+    这里统一做“缺列则返回 0”的薄封装，避免上层 request-handle 代码里到处散落
+    越界判断。当前 host frontier mirror 在老扩展/调试场景下可能暂时缺失部分列，
+    但这不应该让 KV fast path 的控制面直接崩掉。
+    """
+    if len(frontier_row) <= int(column):
+        return 0
+    return int(frontier_row[int(column)])
+
+
+@dataclass(frozen=True)
+class LMCacheBaMKVBatchReadPollSnapshot:
+    """一次 batch read handle 轮询后的只读快照。
+
+    这层对象只保存 direct placement request 当前真正需要观察的控制面信息：
+
+    - `ready`
+      整个 native batch 是否已经到达 `IO_DONE`
+    - `frontier_row`
+      来自 BaM KV request 的 request-level frontier ABI
+    - `read_ready_frontier_chunks`
+      当前从 batch 开头起，连续多少个 chunk 已经 page-read ready
+
+    注意：
+    `cache_ready/consumable` 这两列当前分两种语义来源：
+
+    1. 普通 native read / materialized finalize 路径
+       这两列还只是底层 KV request 生命周期的保留列，不能直接视为
+       “最终 vLLM KV cache 已经可计算”。
+    2. runtime direct placement 已 attach 的路径
+       persistent GPU service 会在同一张 frontier table 上直接发布：
+       `BaM cache -> 最终 KV cache` 的完成前缀。
+       这时 `consumable_frontier_chunks` 就已经是上层可直接调度的权威语义。
+
+    这样上层就不必直接依赖 `BaMKVStatusSnapshot` 的内部字段细节，可以在后续
+    继续把 request-handle 往 runtime 抬升时保持接口收敛。
+    """
+
+    ready: bool
+    poll_iters: int
+    host_status: int
+    frontier_row: tuple[int, ...]
+    launch_frontier_chunks: int
+    read_ready_frontier_chunks: int
+    cache_ready_frontier_chunks: int
+    consumable_frontier_chunks: int
+    total_chunks: int
+    error_code: int
+
+
+@dataclass
+class LMCacheBaMKVBatchReadRequestHandle:
+    """一批已经 submit、后续可 poll/consume 的 KV page read request。"""
+
+    items: tuple[tuple[str, Any], ...]
+    native_handle: Any
+    last_poll_snapshot: LMCacheBaMKVBatchReadPollSnapshot | None = None
+    runtime_direct_placement_attached: bool = False
+    runtime_attention_metadata_attached: bool = False
+
+
+@dataclass(frozen=True)
+class LMCacheBaMKVBatchReadRuntimeSnapshot:
+    """KV batch read request 当前对应的 runtime 观察快照。
+
+    这层对象的目的，是把 BaM_IOStack 里的 runtime slot 表细节收成一份更薄、
+    更稳定的上层观察接口。当前 direct placement / deferred runtime 可以用它来
+    回答三个问题：
+
+    - persistent service 当前是否真的在运行
+    - 这批 native read 是否已经登记进 runtime slot
+    - 当前 request/frontier/completion 三张 GPU-visible 表的所有权是否稳定
+
+    它不参与 ready 判定，也不改变现有 submit/poll/consume 语义，只作为后续
+    GPU-resident frontier/service kernel 阶段的观测桥。
+    """
+
+    service_running: bool
+    active_count: int
+    request_id: int
+    worker_backend: str
+    request_table_ptr: int
+    frontier_table_ptr: int
+    completion_table_ptr: int
+    matched_runtime_row: tuple[int, ...] | None
+    runtime_rows: tuple[tuple[int, ...], ...]
+
+
 class LMCacheBaMKVFastPath:
     """KVCache 专用读取路径。
 
@@ -129,6 +229,16 @@ class LMCacheBaMKVFastPath:
             page_count=self.layout.pages_per_chunk,
             actual_tokens=metadata.actual_tokens,
         )
+
+    def _make_requests_for_items(
+        self,
+        items: Sequence[tuple[str, Any]],
+    ) -> list[Any]:
+        """把 `(chunk_hash, metadata)` 列表统一转换成底层 KV request。"""
+        return [
+            self._make_request(chunk_id=metadata.slot_id, metadata=metadata)
+            for _, metadata in items
+        ]
 
     def _refill_pages(self, pages: torch.Tensor, metadata: Any) -> torch.Tensor:
         """把 `[page_count, 128KB]` pages 还原成 LMCache KV tensor。"""
@@ -218,12 +328,8 @@ class LMCacheBaMKVFastPath:
             return {}
 
         total_start = time.perf_counter()
-        requests = [
-            self._make_request(chunk_id=metadata.slot_id, metadata=metadata)
-            for _, metadata in items
-        ]
-        results = self.kv_store.read_pages_batch(
-            requests,
+        results = self.consume_chunk_pages_batch_request(
+            self.submit_chunk_pages_batch_request(items),
             timeout_s=_KV_FAST_PATH_TIMEOUT_S,
         )
 
@@ -316,11 +422,428 @@ class LMCacheBaMKVFastPath:
         if not items:
             return []
 
-        requests = [
-            self._make_request(chunk_id=metadata.slot_id, metadata=metadata)
-            for _, metadata in items
-        ]
-        return self.kv_store.read_pages_batch(
-            requests,
+        return self.consume_chunk_pages_batch_request(
+            self.submit_chunk_pages_batch_request(items),
             timeout_s=_KV_FAST_PATH_TIMEOUT_S,
         )
+
+    def read_chunk_pages_direct_batch(
+        self,
+        items: Sequence[tuple[str, Any]],
+    ) -> list[Any]:
+        """直接从当前 BaM store 可见页中同步读取指定 chunk 子集。
+
+        这个入口不会触发新的 KV native batch request，而是直接基于 metadata 生成
+        page ids，再走 `row_store.load_rows()`。
+
+        它的目标不是替代主线 `submit/poll/consume`，而是给更细的 request runtime
+        语义提供一个桥：
+
+        - 主线 native handle 继续在后台推进整批 read
+        - 上层只为当前需要返回的连续前缀同步取出那一小段 pages
+        """
+        if not items:
+            return []
+        requests = self._make_requests_for_items(items)
+        return self.kv_store.load_pages_direct_batch(requests)
+
+    def load_chunk_tensors_direct_batch(
+        self,
+        items: Sequence[tuple[str, Any]],
+    ) -> dict[str, torch.Tensor]:
+        """通过 direct-cache-load 旁路同步读取 pages，并本地还原成 KV tensor。
+
+        这条入口和 `load_chunk_tensors_batch()` 的目标输出一致，都是：
+
+        ```text
+        {chunk_hash: [2, num_layers, tokens, hidden]}
+        ```
+
+        但它刻意不走 native submit/poll/runtime 状态机，而是：
+
+        1. 直接基于 metadata 生成 page ids
+        2. 走 `row_store.load_rows()` 同步搬出当前 BaM cache 可见页
+        3. 在本地做 page -> KV tensor refill
+
+        因此它非常适合做“安全校验”：
+
+        - 不会重入当前正在运行的 persistent KV runtime
+        - 不会额外创建第二条 native batch request
+        - 仍然能拿到和旧 materialize 语义一致的期望 tensor
+        """
+        if not items:
+            return {}
+
+        total_start = time.perf_counter()
+        results = self.read_chunk_pages_direct_batch(items)
+
+        refill_start = time.perf_counter()
+        tensors: dict[str, torch.Tensor] = {}
+        for (chunk_hash, metadata), result in zip(items, results):
+            tensors[chunk_hash] = self._refill_pages(result.pages, metadata)
+        refill_ms = (time.perf_counter() - refill_start) * 1000.0
+        total_ms = (time.perf_counter() - total_start) * 1000.0
+
+        total_bytes = sum(result.descriptor.total_bytes for result in results)
+        elapsed_s = total_ms / 1000.0
+        gib_per_s = (total_bytes / elapsed_s /
+                     (1024**3)) if elapsed_s > 0 else 0.0
+        batch_stats = results[0].stats
+        logger.info(
+            "[LMCACHE_BAM_KV_FAST_PATH_DIRECT_BATCH_READ] "
+            "batch_size=%d total_bytes=%d get_ms=%.3f refill_ms=%.3f "
+            "total_ms=%.3f bw_gib_s=%.3f executor=%s worker_backend=%s",
+            len(items),
+            total_bytes,
+            batch_stats.get_ms,
+            refill_ms,
+            total_ms,
+            gib_per_s,
+            getattr(batch_stats, "executor_name", "direct_cache_load"),
+            getattr(batch_stats, "worker_backend", "direct_cache_load"),
+        )
+        return tensors
+
+    def load_chunk_tensors_from_live_request_pages(
+        self,
+        handle: LMCacheBaMKVBatchReadRequestHandle,
+        *,
+        max_chunks: int | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """直接复用当前 live request 的 pages buffer，还原期望 chunk tensor。
+
+        这条接口刻意不做任何新的 BaM 读操作。它只假设两件事：
+
+        1. 当前 handle 对应的 request 已经进入 `CONSUMED`
+        2. 底层 persistent service 已经把同一批 pages 镜像到
+           `handle.native_handle.request_table.pages`
+
+        这样我们就能在 cleanup 前后安全复用这块现成 GPU buffer，构造：
+
+        - “旧 materialize 语义”下的期望 chunk tensor
+
+        用于和最终 vLLM KV cache 中已经写进去的值做逐项对照，而不会：
+
+        - 重入 native submit/poll
+        - 重新走 `row_store.load_rows()`
+        - 干扰当前 persistent request 的生命周期
+        """
+        native_handle = handle.native_handle
+        request_table = native_handle.request_table
+        batch_size = int(request_table.batch_size)
+        page_count = int(request_table.page_count)
+        logger.info(
+            "[LMCACHE_BAM_LIVE_PAGES_DECODE_BEGIN] "
+            "request_id=%s batch_size=%d page_count=%d max_chunks=%s "
+            "ready_snapshot=%s",
+            getattr(native_handle, "request_id", None),
+            batch_size,
+            page_count,
+            str(max_chunks),
+            str(native_handle.ready_snapshot is not None).lower(),
+        )
+        logger.info(
+            "[LMCACHE_BAM_LIVE_PAGES_STATUS_BEGIN] request_id=%s",
+            getattr(native_handle, "request_id", None),
+        )
+        host_status = int(
+            (native_handle.ready_snapshot or
+             self.kv_store.snapshot_native_batch(native_handle)).host_status)
+        logger.info(
+            "[LMCACHE_BAM_LIVE_PAGES_STATUS_DONE] request_id=%s "
+            "host_status=%d",
+            getattr(native_handle, "request_id", None),
+            host_status,
+        )
+        if host_status < 3:
+            raise RuntimeError(
+                "load_chunk_tensors_from_live_request_pages requires "
+                f"CONSUMED request, got host_status={host_status}")
+
+        items = tuple(handle.items)
+        if max_chunks is not None:
+            items = items[:max(int(max_chunks), 0)]
+        if not items:
+            return {}
+        if len(items) > batch_size:
+            raise RuntimeError(
+                "live request pages slice exceeds batch size: "
+                f"items={len(items)} batch_size={batch_size}")
+        logger.info(
+            "[LMCACHE_BAM_LIVE_PAGES_ITEMS] request_id=%s items=%d "
+            "batch_size=%d page_count=%d pages_shape=%s pages_device=%s",
+            getattr(native_handle, "request_id", None),
+            len(items),
+            batch_size,
+            page_count,
+            tuple(request_table.pages.shape),
+            str(request_table.pages.device),
+        )
+
+        tensors: dict[str, torch.Tensor] = {}
+        for idx, (chunk_hash, metadata) in enumerate(items):
+            start = idx * page_count
+            end = start + page_count
+            logger.info(
+                "[LMCACHE_BAM_LIVE_PAGES_CHUNK_SLICE_BEGIN] "
+                "request_id=%s idx=%d chunk_hash=%s start=%d end=%d "
+                "actual_tokens=%d",
+                getattr(native_handle, "request_id", None),
+                idx,
+                chunk_hash[:16],
+                start,
+                end,
+                int(metadata.actual_tokens),
+            )
+            pages = request_table.pages[start:end]
+            logger.info(
+                "[LMCACHE_BAM_LIVE_PAGES_CHUNK_SLICE_DONE] "
+                "request_id=%s idx=%d chunk_hash=%s pages_shape=%s "
+                "pages_stride=%s",
+                getattr(native_handle, "request_id", None),
+                idx,
+                chunk_hash[:16],
+                tuple(pages.shape),
+                tuple(pages.stride()),
+            )
+            # 注意：这条 helper 当前只服务 one-copy correctness repair / verify，
+            # 不在 steady-state 热路径里高频调用。
+            #
+            # 这里必须复用“正确 materialized 线路”同一套 GPU refill kernel，
+            # 而不能再走旁路 `layout.decode_pages()`：
+            #
+            # - `decode_pages()` 只是按 Python view/reshape 解释 page 布局；
+            # - materialized 正确线路实际使用的是
+            #   `refill_pages_to_lmcache_tensor()`；
+            # - one-copy repair 如果继续拿旁路 decode 结果当 reference，就会形成
+            #   “runtime scatter / official repair / verify 都和同一份旁路 reference
+            #   自洽，但模型输出仍错误”的循环校验。
+            #
+            # 因此 one-copy 的 dense prefix correctness anchor 现在明确对齐到
+            # 已知可正确输出的 materialized refill 语义：
+            #
+            #   live request pages
+            #     -> refill_pages_to_lmcache_tensor()
+            #     -> dense chunk [2, layers, tokens, hidden]
+            #
+            # 调用方会在 cleanup 后、确认 runtime service idle 时再进入这里，避免
+            # V100 上常驻 service CTA 和这条 refill kernel 互相抢占导致卡住。
+            logger.info(
+                "[LMCACHE_BAM_LIVE_PAGES_CHUNK_DECODE_BEGIN] "
+                "request_id=%s idx=%d chunk_hash=%s mode=materialized_refill",
+                getattr(native_handle, "request_id", None),
+                idx,
+                chunk_hash[:16],
+            )
+            tensors[chunk_hash] = refill_pages_to_lmcache_tensor(
+                pages, metadata, self.layout)
+            decoded = tensors[chunk_hash]
+            logger.info(
+                "[LMCACHE_BAM_LIVE_PAGES_CHUNK_DECODE_DONE] "
+                "request_id=%s idx=%d chunk_hash=%s tensor_shape=%s "
+                "tensor_device=%s",
+                getattr(native_handle, "request_id", None),
+                idx,
+                chunk_hash[:16],
+                tuple(decoded.shape),
+                str(decoded.device),
+            )
+        logger.info(
+            "[LMCACHE_BAM_LIVE_PAGES_DECODE_DONE] request_id=%s tensors=%d",
+            getattr(native_handle, "request_id", None),
+            len(tensors),
+        )
+        return tensors
+
+    def submit_chunk_pages_batch_request(
+        self,
+        items: Sequence[tuple[str, Any]],
+    ) -> LMCacheBaMKVBatchReadRequestHandle:
+        """显式提交一批 chunk pages read，不等待完成。
+
+        这是把 KV fast path 从“阻塞读黑盒”推进成 request-handle 三段式的关键
+        边界：
+
+        ```text
+        items
+          -> BaMKVRequest[]
+          -> submit_native_batch()
+          -> 后续由 poll/consume 分别推进
+        ```
+
+        这样 direct placement / runtime 层就可以把 BaM I/O 的生命周期跨越多个
+        engine iteration 保留下来，而不是在 `start()` 阶段同步等完整批次读完。
+        """
+        if not items:
+            raise ValueError(
+                "submit_chunk_pages_batch_request requires non-empty items")
+
+        requests = self._make_requests_for_items(items)
+        native_handle = self.kv_store.submit_native_batch(requests)
+        return LMCacheBaMKVBatchReadRequestHandle(
+            items=tuple(items),
+            native_handle=native_handle,
+        )
+
+    def poll_chunk_pages_batch_request(
+        self,
+        handle: LMCacheBaMKVBatchReadRequestHandle,
+    ) -> LMCacheBaMKVBatchReadPollSnapshot:
+        """推进一次 batch read request，并返回当前 frontier 快照。
+
+        注意这里的语义是：
+
+        - persistent runtime 已活跃时，底层 `poll_native_batch()` 会尽量退化成
+          只读 request/runtime 状态；
+        - 兼容路径下，仍可能顺手推进一次 batch/service poll façade；
+        - 但不会做 consume，因此还不会把 pages buffer 暴露给上层。
+
+        这正好对应当前 direct placement request 的第一阶段目标：
+        先让“read-ready frontier”在 runtime 里变成可观察状态；后续再把
+        consume/placement 进一步往更细粒度推进。
+        """
+        ready = bool(self.kv_store.poll_native_batch(handle.native_handle))
+        status_snapshot = self.kv_store.snapshot_native_batch(
+            handle.native_handle)
+        frontier_row = tuple(status_snapshot.frontier_row or ())
+        poll_snapshot = LMCacheBaMKVBatchReadPollSnapshot(
+            ready=ready,
+            poll_iters=int(handle.native_handle.poll_iters),
+            host_status=int(status_snapshot.host_status),
+            frontier_row=frontier_row,
+            launch_frontier_chunks=_kv_frontier_value(
+                frontier_row,
+                _KV_FRONTIER_COL_LAUNCH_FRONTIER_CHUNKS,
+            ),
+            read_ready_frontier_chunks=_kv_frontier_value(
+                frontier_row,
+                _KV_FRONTIER_COL_READ_READY_FRONTIER_CHUNKS,
+            ),
+            cache_ready_frontier_chunks=_kv_frontier_value(
+                frontier_row,
+                _KV_FRONTIER_COL_CACHE_READY_FRONTIER_CHUNKS,
+            ),
+            consumable_frontier_chunks=_kv_frontier_value(
+                frontier_row,
+                _KV_FRONTIER_COL_CONSUMABLE_FRONTIER_CHUNKS,
+            ),
+            total_chunks=max(
+                int(len(handle.items)),
+                _kv_frontier_value(frontier_row, _KV_FRONTIER_COL_TOTAL_CHUNKS),
+            ),
+            error_code=_kv_frontier_value(frontier_row,
+                                          _KV_FRONTIER_COL_ERROR_CODE),
+        )
+        handle.last_poll_snapshot = poll_snapshot
+        return poll_snapshot
+
+    def consume_chunk_pages_batch_request(
+        self,
+        handle: LMCacheBaMKVBatchReadRequestHandle,
+        *,
+        timeout_s: float | None = None,
+    ) -> list[Any]:
+        """消费一批已经 submit 的 KV pages read。
+
+        如果 batch 还没 ready，这里会继续阻塞等待到底层 `IO_DONE`；这保证了：
+
+        - 同步路径仍然可以直接复用这组 API；
+        - 而 runtime/deferred 路径也可以在真正 finalize 前，先跨轮次保留同一批
+          live handle。
+        """
+        native_result = self.kv_store.wait_native_batch(
+            handle.native_handle,
+            timeout_s=timeout_s,
+        )
+        return native_result.results
+
+    def get_chunk_pages_batch_request_runtime_snapshot(
+        self,
+        handle: LMCacheBaMKVBatchReadRequestHandle,
+    ) -> LMCacheBaMKVBatchReadRuntimeSnapshot:
+        """读取一批 KV native read 当前对应的 runtime 观察快照。
+
+        这层接口不主动 poll，也不推进 consume，只把底层 runtime slot/service
+        状态收成上层可直接消费的稳定结构。
+        """
+        runtime_snapshot = self.kv_store.runtime_state_for_native_batch(
+            handle.native_handle)
+        return LMCacheBaMKVBatchReadRuntimeSnapshot(
+            service_running=bool(runtime_snapshot.service_running),
+            active_count=int(runtime_snapshot.active_count),
+            request_id=int(runtime_snapshot.request_id),
+            worker_backend=str(runtime_snapshot.worker_backend),
+            request_table_ptr=int(runtime_snapshot.request_table_ptr),
+            frontier_table_ptr=int(runtime_snapshot.frontier_table_ptr),
+            completion_table_ptr=int(runtime_snapshot.completion_table_ptr),
+            matched_runtime_row=runtime_snapshot.matched_runtime_row,
+            runtime_rows=tuple(runtime_snapshot.runtime_rows),
+        )
+
+    def attach_chunk_pages_batch_request_runtime_direct_placement(
+        self,
+        handle: LMCacheBaMKVBatchReadRequestHandle,
+        *,
+        slot_mapping: torch.Tensor,
+        chunk_starts: torch.Tensor,
+        kv_cache_pointers_gpu: torch.Tensor,
+        page_buffer_size: int,
+        block_size: int,
+        page_token_capacity: int,
+        pages_per_kv_layer: int,
+        num_layers: int,
+        num_kv_heads: int,
+        head_size: int,
+        pack_size: int,
+    ) -> bool:
+        """给当前 native batch request 绑定设备侧 direct placement 描述符。"""
+        attached = bool(self.kv_store.attach_native_batch_runtime_placement(
+            handle.native_handle,
+            slot_mapping=slot_mapping,
+            chunk_starts=chunk_starts,
+            kv_cache_pointers_gpu=kv_cache_pointers_gpu,
+            page_buffer_size=page_buffer_size,
+            block_size=block_size,
+            page_token_capacity=page_token_capacity,
+            pages_per_kv_layer=pages_per_kv_layer,
+            num_layers=num_layers,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            pack_size=pack_size,
+            slot_mapping_len=int(slot_mapping.numel()),
+            kv_cache_ptrs_len=int(kv_cache_pointers_gpu.numel()),
+        ))
+        handle.runtime_direct_placement_attached = attached
+        return attached
+
+    def attach_chunk_pages_batch_request_runtime_attention_metadata(
+        self,
+        handle: LMCacheBaMKVBatchReadRequestHandle,
+        *,
+        attachment: BaMRuntimeAttentionMetadataAttachment,
+    ) -> bool:
+        """给当前 native batch request 绑定 attention metadata workspace。"""
+        attached = bool(
+            self.kv_store.attach_native_batch_runtime_attention_metadata(
+                handle.native_handle,
+                attachment=attachment,
+            ))
+        handle.runtime_attention_metadata_attached = attached
+        return attached
+
+    def finalize_chunk_pages_batch_request_runtime_direct_placement(
+        self,
+        handle: LMCacheBaMKVBatchReadRequestHandle,
+        *,
+        timeout_s: float | None = None,
+    ) -> bool:
+        """对 runtime-direct-placement 请求执行 cleanup-only finalize。
+
+        这条路径不会再构造 Python `results`，只在底层已经进入 `CONSUMED` 时，
+        完成 request 生命周期收尾与资源回收。
+        """
+        finalized = bool(self.kv_store.finalize_runtime_attached_native_batch(
+            handle.native_handle,
+            timeout_s=timeout_s,
+        ))
+        return finalized

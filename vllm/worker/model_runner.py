@@ -54,11 +54,13 @@ from vllm.utils import (DeviceMemoryProfiler, GiB_bytes, PyObjectCache,
                         is_pin_memory_available, supports_dynamo,
                         weak_ref_tensor)
 from vllm.worker.model_runner_base import (
-    InputProcessingError, ModelRunnerBase, ModelRunnerInputBase,
+    DeferredModelExecution, InputProcessingError, ModelRunnerBase,
+    ModelRunnerInputBase,
     ModelRunnerInputBuilderBase, _add_attn_metadata_broadcastable_dict,
     _add_sampling_metadata_broadcastable_dict,
     _init_attn_metadata_from_tensor_dict,
     _init_sampling_metadata_from_tensor_dict)
+from vllm.distributed.kv_transfer.kv_connector.base import KVReceiveStatus
 
 if TYPE_CHECKING:
     from vllm.attention.backends.abstract import AttentionBackend
@@ -68,6 +70,111 @@ logger = init_logger(__name__)
 LORA_WARMUP_RANK = 8
 
 _NUM_WARMUP_ITERS = 2
+
+
+def _bam_tensor_sample_for_log(tensor: Optional[torch.Tensor],
+                               limit: int = 8) -> object:
+    """把少量 tensor 内容转成日志友好的 Python 值。
+
+    这个 helper 只服务 BaM correctness 排查日志。它会触发很小规模的
+    GPU->CPU 同步，因此必须放在显式 debug 开关后面，不能进入默认热路径。
+    """
+    if tensor is None:
+        return None
+    try:
+        flat = tensor.detach().flatten()
+        if flat.numel() == 0:
+            return []
+        return flat[:limit].cpu().tolist()
+    except Exception:
+        return "<unavailable>"
+
+
+def _maybe_log_bam_logits_semantic_debug(
+    *,
+    model_input: "ModelInputForGPUWithSamplingMetadata",
+    hidden_or_intermediate_states: Union[torch.Tensor, IntermediateTensors],
+    logits: Optional[torch.Tensor],
+) -> None:
+    """打印 BaM direct retrieve 后进入 logits/sampling 前的最小语义摘要。
+
+    当前 rowctx 路径能正确输出，而 runtime/persistent 路径在 BaM 读写、
+    xFormers gather、attention reference 都通过后仍输出乱码。这个 probe 的
+    目的就是把问题继续切到更窄：
+
+    - 如果 rowctx/runtime 的 hidden/logits top-k 已经不同，根因仍在模型
+      forward 内部或 KV/control plane；
+    - 如果 logits top-k 一致但最终 token 不同，再去查 sampler / decode 状态。
+
+    注意：这里为了定位会做少量 `.cpu()` / `topk()`，因此必须由
+    `VLLM_BAM_LOGITS_SEMANTIC_DEBUG=1` 显式打开。
+    """
+    if not envs.VLLM_BAM_LOGITS_SEMANTIC_DEBUG:
+        return
+    if not isinstance(hidden_or_intermediate_states, torch.Tensor):
+        logger.info(
+            "[BAM_LOGITS_SEMANTIC_DEBUG] skipped reason=intermediate_tensors "
+            "type=%s",
+            type(hidden_or_intermediate_states).__name__,
+        )
+        return
+
+    sampling_metadata = model_input.sampling_metadata
+    selected = (
+        getattr(sampling_metadata, "selected_token_indices", None)
+        if sampling_metadata is not None else None)
+    selected_hidden_norms: object = None
+    if selected is not None and selected.numel() > 0:
+        try:
+            selected_hidden = hidden_or_intermediate_states.index_select(
+                0, selected.to(device=hidden_or_intermediate_states.device))
+            selected_hidden_norms = (
+                torch.linalg.vector_norm(
+                    selected_hidden.float(),
+                    dim=-1,
+                ).detach().cpu().tolist())
+        except Exception:
+            logger.exception(
+                "[BAM_LOGITS_SEMANTIC_DEBUG] "
+                "failed_to_collect_selected_hidden")
+            selected_hidden_norms = "<unavailable>"
+
+    logits_top_ids: object = None
+    logits_top_values: object = None
+    if logits is not None and logits.numel() > 0:
+        try:
+            topk = min(8, int(logits.shape[-1]))
+            values, indices = torch.topk(logits.float(), k=topk, dim=-1)
+            logits_top_ids = indices.detach().cpu().tolist()
+            logits_top_values = values.detach().cpu().tolist()
+        except Exception:
+            logger.exception(
+                "[BAM_LOGITS_SEMANTIC_DEBUG] failed_to_collect_logits_topk")
+            logits_top_ids = "<unavailable>"
+            logits_top_values = "<unavailable>"
+
+    logger.info(
+        "[BAM_LOGITS_SEMANTIC_DEBUG] is_prompt=%s input_tokens_shape=%s "
+        "input_positions_shape=%s hidden_shape=%s logits_shape=%s "
+        "seq_lens=%s query_lens=%s selected_token_indices=%s "
+        "input_token_sample=%s input_position_sample=%s "
+        "selected_hidden_norms=%s logits_top_ids=%s logits_top_values=%s",
+        str(bool(model_input.is_prompt)).lower(),
+        (tuple(model_input.input_tokens.shape)
+         if model_input.input_tokens is not None else None),
+        (tuple(model_input.input_positions.shape)
+         if model_input.input_positions is not None else None),
+        tuple(hidden_or_intermediate_states.shape),
+        (tuple(logits.shape) if logits is not None else None),
+        getattr(model_input, "seq_lens", None),
+        getattr(model_input, "query_lens", None),
+        _bam_tensor_sample_for_log(selected),
+        _bam_tensor_sample_for_log(model_input.input_tokens),
+        _bam_tensor_sample_for_log(model_input.input_positions),
+        selected_hidden_norms,
+        logits_top_ids,
+        logits_top_values,
+    )
 
 TModelInputForGPU = TypeVar('TModelInputForGPU', bound="ModelInputForGPU")
 
@@ -1734,15 +1841,28 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         # NOTE: The receive operation is blocking
         bypass_model_exec = False
         if self.need_recv_kv(model_input, kv_caches):
-            hidden_or_intermediate_states, bypass_model_exec, model_input = \
-                get_kv_transfer_group().recv_kv_caches_and_hidden_states(
-                    # model is used to know which layer the current worker
-                    # is working on, so that we can receive KV for only those
-                    # layers.
-                    model_executable,
-                    model_input,
-                    kv_caches=kv_caches
+            recv_result = get_kv_transfer_group().recv_kv_caches_and_hidden_states(
+                # model is used to know which layer the current worker
+                # is working on, so that we can receive KV for only those
+                # layers.
+                model_executable,
+                model_input,
+                kv_caches=kv_caches,
+            )
+            if recv_result.status == KVReceiveStatus.DEFERRED:
+                request_ids = list(
+                    (model_input.request_ids_to_seq_ids or {}).keys())
+                raise DeferredModelExecution(
+                    request_ids=request_ids,
+                    message=(
+                        "connector returned DEFERRED; keep the current batch "
+                        "scheduled and retry the same recv on the next "
+                        "engine iteration"),
                 )
+            hidden_or_intermediate_states = (
+                recv_result.hidden_or_intermediate_states)
+            bypass_model_exec = recv_result.bypass_model_exec
+            model_input = recv_result.model_input
 
         multi_modal_kwargs = model_input.multi_modal_kwargs or {}
         seqlen_agnostic_kwargs = {
@@ -1809,6 +1929,11 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
 
         logits = self.model.compute_logits(hidden_or_intermediate_states,
                                            model_input.sampling_metadata)
+        _maybe_log_bam_logits_semantic_debug(
+            model_input=model_input,
+            hidden_or_intermediate_states=hidden_or_intermediate_states,
+            logits=logits,
+        )
 
         if not self.is_driver_worker:
             return []

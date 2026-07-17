@@ -34,6 +34,7 @@ BaM 128KB pages
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass
 from typing import Any, Sequence
@@ -53,34 +54,53 @@ except Exception:  # pragma: no cover - 运行环境可能禁用 Triton
 
 logger = init_logger(__name__)
 
+_DIRECT_FRONTIER_STATUS_SUBMITTED = 1
+_DIRECT_FRONTIER_STATUS_READ_READY = 2
+_DIRECT_FRONTIER_STATUS_CACHE_READY = 3
+_DIRECT_FRONTIER_STATUS_CONSUMABLE = 4
+_DIRECT_FRONTIER_COL_STATUS = 0
+_DIRECT_FRONTIER_COL_LAUNCH = 1
+_DIRECT_FRONTIER_COL_READ_READY = 2
+_DIRECT_FRONTIER_COL_CACHE_READY = 3
+_DIRECT_FRONTIER_COL_CONSUMABLE = 4
+_DIRECT_FRONTIER_COL_TOTAL = 5
+_DIRECT_FRONTIER_COL_ERROR = 6
+_DIRECT_FRONTIER_COL_COUNT = 7
+
 
 if triton is not None:
 
     @triton.jit
-    def _bam_pages_to_flat_paged_cache_kernel(
+    def _bam_pages_to_vllm_paged_cache_kernel(
         pages_ptr,
         kv_cache_pointers_ptr,
         slot_mapping_ptr,
         total_elements: tl.constexpr,
         actual_tokens: tl.constexpr,
         hidden_dim: tl.constexpr,
+        num_kv_heads: tl.constexpr,
+        head_size: tl.constexpr,
+        block_size: tl.constexpr,
+        pack_size: tl.constexpr,
         page_token_capacity: tl.constexpr,
         pages_per_kv_layer: tl.constexpr,
         num_layers: tl.constexpr,
         page_buffer_size: tl.constexpr,
         BLOCK_SIZE: tl.constexpr,
     ):
-        """把一个 chunk 的某层 K 或 V 从 BaM pages 直接写到 flat paged cache。
+        """把一个 chunk 的 K/V page 直接写到 vLLM/LMCache 官方 paged KV ABI。
 
-        这里匹配 LMCache V0 `multi_layer_kv_transfer` 的 flat paged buffer 口径：
+        关键点：
 
-        ```text
-        kv_cache[layer] 逻辑视图: [2, page_buffer_size, hidden_dim]
-        slot_mapping[token]     : vLLM physical token slot
-        ```
+        - 输入 `pages` 仍然是 BaM 自己的连续 row/page 组织
+        - 输出必须严格匹配 LMCache `multi_layer_kv_transfer(direction=false)`
+          对 vLLM V0 底层 paged buffer 的物理写入 ABI：
+          `[2, page_buffer_size, hidden_dim]`
+        - `slot_mapping[token]` 给出 token 最终应该落到哪个 physical slot
 
-        每个 program 处理一段 `(token, hidden)` 元素。CPU 只负责 launch，
-        数据寻址和 scatter 写入都在 GPU 上完成。
+        这样 direct placement 和当前已验证正确的 materialized 路径使用同一套
+        写入语义。读侧如果需要 packed key/value view，由 vLLM/xformers 在同一
+        块底层内存上解释；写端不再自己猜 packed key 的 offset。
         """
         offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         mask = offsets < total_elements
@@ -103,9 +123,11 @@ if triton is not None:
         layer_cache_ptr = tl.load(kv_cache_pointers_ptr + layer)
         layer_cache_ptr = layer_cache_ptr.to(
             tl.pointer_type(pages_ptr.dtype.element_ty))
-        dst_offsets = (layer_cache_ptr +
-                       kv_id * page_buffer_size * hidden_dim +
-                       slot * hidden_dim + hidden)
+        block_idx = slot // block_size
+        block_offset = slot % block_size
+        plane_elements = page_buffer_size * hidden_dim
+        dst_index = kv_id * plane_elements + slot * hidden_dim + hidden
+        dst_offsets = layer_cache_ptr + dst_index
         values = tl.load(pages_ptr + src_offsets, mask=valid)
         tl.store(dst_offsets, values, mask=valid)
 
@@ -202,6 +224,85 @@ class BaMDirectPlacementBatchStateSnapshot:
     consumable_tokens: int
 
 
+@dataclass(frozen=True)
+class BaMDirectPlacementFrontierSnapshot:
+    """placement 执行器对外暴露的 request-level frontier 快照。
+
+    这层对象的定位，是把当前 placement 阶段真正需要暴露给上层控制面的信息
+    收敛成统一接口，而不是让 storage/runtime 继续直接依赖 tracker 内部细节。
+
+    当前字段分两组：
+
+    - `frontier_row`
+      一个紧凑、稳定的 request-level frontier ABI：
+      `[status, launch, read_ready, cache_ready, consumable, total, error]`
+    - `*_frontier_*`
+      便于上层直接读写的具名字段，避免到处手工解码列号
+
+    注意这里的 `cache_ready/consumable` 已经是 placement 语义，而不是底层
+    BaM native read request 的保留观测列；这正是它和 native KV read frontier
+    的语义边界。
+    """
+
+    frontier_row: tuple[int, ...]
+    launch_frontier_chunks: int
+    read_ready_frontier_chunks: int
+    staged_ready_frontier_chunks: int
+    cache_ready_frontier_chunks: int
+    consumable_frontier_chunks: int
+    total_chunks: int
+    read_ready_frontier_tokens: int
+    staged_ready_frontier_tokens: int
+    cache_ready_frontier_tokens: int
+    consumable_frontier_tokens: int
+    error_code: int = 0
+
+    @property
+    def launch_chunks(self) -> int:
+        """兼容旧调用方的 launch 前缀 chunk 字段名。"""
+        return int(self.launch_frontier_chunks)
+
+    @property
+    def read_ready_chunks(self) -> int:
+        """兼容旧调用方的 read-ready 前缀 chunk 字段名。"""
+        return int(self.read_ready_frontier_chunks)
+
+    @property
+    def staged_ready_chunks(self) -> int:
+        """兼容旧调用方的 staged-ready 前缀 chunk 字段名。"""
+        return int(self.staged_ready_frontier_chunks)
+
+    @property
+    def cache_ready_chunks(self) -> int:
+        """兼容旧调用方的 cache-ready 前缀 chunk 字段名。"""
+        return int(self.cache_ready_frontier_chunks)
+
+    @property
+    def consumable_chunks(self) -> int:
+        """兼容旧调用方的 consumable 前缀 chunk 字段名。"""
+        return int(self.consumable_frontier_chunks)
+
+    @property
+    def read_ready_tokens(self) -> int:
+        """兼容旧调用方的 read-ready token 字段名。"""
+        return int(self.read_ready_frontier_tokens)
+
+    @property
+    def staged_ready_tokens(self) -> int:
+        """兼容旧调用方的 staged-ready token 字段名。"""
+        return int(self.staged_ready_frontier_tokens)
+
+    @property
+    def cache_ready_tokens(self) -> int:
+        """兼容旧调用方的 cache-ready token 字段名。"""
+        return int(self.cache_ready_frontier_tokens)
+
+    @property
+    def consumable_tokens(self) -> int:
+        """兼容旧调用方的 consumable token 字段名。"""
+        return int(self.consumable_frontier_tokens)
+
+
 class BaMDirectPlacementStateTracker:
     """跟踪一次 direct placement batch 的 ready 状态。
 
@@ -232,28 +333,53 @@ class BaMDirectPlacementStateTracker:
         """把一个 chunk 标记为“pages 已经读回”。"""
         self._read_ready[chunk_index] = True
 
+    def mark_chunks_read_ready_upto(self, ready_chunks: int) -> None:
+        """把从 batch 开头起的连续若干 chunk 标记为 read-ready。
+
+        这层 helper 的语义刻意绑定到“连续前缀 frontier”，而不是“任意若干个
+        chunk”。原因是当前 direct placement 与上层 prefix 语义都只关心：
+
+        - 从 batch 开头起
+        - 连续多少个 chunk
+        - 已经可以安全继续推进
+
+        后续无论这个 ready frontier 来自：
+
+        - BaM native KV read 的 request-level frontier table
+        - direct placement 自己的 GPU 事件推进
+        - 更进一步的 GPU-resident runtime state machine
+
+        都可以先收敛到这条统一入口，避免上层到处散落手写 `for` 循环。
+        """
+        self._mark_ready_prefix(self._read_ready, ready_chunks)
+
     def mark_all_read_ready(self) -> None:
         """把整个 batch 标记为“pages 已经全部读回”。"""
-        for chunk_index in range(len(self._read_ready)):
-            self._read_ready[chunk_index] = True
+        self.mark_chunks_read_ready_upto(len(self._read_ready))
 
     def mark_chunk_staged_ready(self, chunk_index: int) -> None:
         """把一个 chunk 标记为“placement staging 已完成”。"""
         self._staged_ready[chunk_index] = True
 
+    def mark_chunks_staged_ready_upto(self, ready_chunks: int) -> None:
+        """把从 batch 开头起的连续若干 chunk 标记为 staged-ready。"""
+        self._mark_ready_prefix(self._staged_ready, ready_chunks)
+
     def mark_all_staged_ready(self) -> None:
         """把整个 batch 标记为“placement staging 已完成”。"""
-        for chunk_index in range(len(self._staged_ready)):
-            self._staged_ready[chunk_index] = True
+        self.mark_chunks_staged_ready_upto(len(self._staged_ready))
 
     def mark_chunk_cache_ready(self, chunk_index: int) -> None:
         """把一个 chunk 标记为“最终 vLLM cache 已可见”。"""
         self._cache_ready[chunk_index] = True
 
+    def mark_chunks_cache_ready_upto(self, ready_chunks: int) -> None:
+        """把从 batch 开头起的连续若干 chunk 标记为 cache-ready。"""
+        self._mark_ready_prefix(self._cache_ready, ready_chunks)
+
     def mark_all_cache_ready(self) -> None:
         """把整个 batch 标记为“最终 vLLM cache 已可见”。"""
-        for chunk_index in range(len(self._cache_ready)):
-            self._cache_ready[chunk_index] = True
+        self.mark_chunks_cache_ready_upto(len(self._cache_ready))
 
     def snapshot(self) -> BaMDirectPlacementBatchStateSnapshot:
         """导出当前 batch 的不可变状态快照。"""
@@ -287,6 +413,25 @@ class BaMDirectPlacementStateTracker:
             chunk.actual_tokens for chunk, ready in zip(self._descriptor.chunks,
                                                         ready_flags)
             if ready)
+
+    @staticmethod
+    def _mark_ready_prefix(
+        ready_flags: list[bool],
+        ready_chunks: int,
+    ) -> None:
+        """把一个 ready flag 数组的连续前缀推进到指定 chunk 数。
+
+        注意这里是“只增不减”的单调推进语义：
+
+        - 已经 ready 的前缀不会被回退
+        - 超出数组长度的目标会自动截断
+
+        这样 tracker 就能安全复用到底层 frontier poll、placement event 推进、
+        以及同步 finalize 收口这三类不同来源的状态更新中。
+        """
+        final_ready_chunks = min(max(int(ready_chunks), 0), len(ready_flags))
+        for chunk_index in range(final_ready_chunks):
+            ready_flags[chunk_index] = True
 
     def get_contiguous_cache_ready_chunk_count(self) -> int:
         """统计从 batch 开头起，连续已经 cache-ready 的 chunk 数。
@@ -373,12 +518,30 @@ class BaMDirectPlacementExecution:
         *,
         launched_batch: _BaMDirectPlacementLaunchedBatch,
         state_tracker: BaMDirectPlacementStateTracker | None,
+        frontier_table: torch.Tensor | None = None,
     ) -> None:
         self._launched_batch = launched_batch
         self._state_tracker = state_tracker
         self._committed_staged_chunks = 0
         self._committed_cache_chunks = 0
         self._finished = False
+        # 第三步的轻量化推进版本里，先把 placement frontier 收敛成：
+        #
+        # 1. 一张 GPU-visible frontier table
+        # 2. 一份 host 侧 mirror
+        #
+        # 这样做的目标不是立刻把整个 control plane 下沉成 persistent kernel，
+        # 而是先把“统一 frontier ABI”稳定下来：
+        #
+        # - 当前 host 侧可以继续用 mirror 低成本读状态
+        # - 后续 GPU-resident frontier / persistent service 可以直接复用这张表
+        #
+        # frontier row ABI:
+        #   [status, launch, read_ready, cache_ready, consumable, total, error]
+        self._frontier_table = self._resolve_frontier_table(frontier_table)
+        self._frontier_snapshot_mirror: Optional[
+            BaMDirectPlacementFrontierSnapshot] = None
+        self._publish_frontier_snapshot_from_tracker()
 
     @property
     def state_tracker(self) -> BaMDirectPlacementStateTracker | None:
@@ -390,6 +553,56 @@ class BaMDirectPlacementExecution:
         if self._state_tracker is None:
             return None
         return self._state_tracker.snapshot()
+
+    def frontier_snapshot(self) -> Optional[BaMDirectPlacementFrontierSnapshot]:
+        """返回当前 placement request-level frontier 快照。
+
+        这层接口是当前“placement 控制面收敛”的关键边界：
+
+        - 上层不再需要直接理解 tracker 里的 read/staged/cache 三组 flag
+        - 后续如果 frontier 真正改成 GPU-resident table，也可以只替换这里的
+          具体来源，而不必重改 storage/runtime 调用方
+        """
+        table_snapshot = self._build_frontier_snapshot_from_table()
+        if table_snapshot is not None:
+            return table_snapshot
+        if self._frontier_snapshot_mirror is not None:
+            return self._frontier_snapshot_mirror
+        self._publish_frontier_snapshot_from_tracker()
+        return self._build_frontier_snapshot_from_table(
+        ) or self._frontier_snapshot_mirror
+
+    def frontier_table(self) -> Optional[torch.Tensor]:
+        """返回当前 execution 持有的 frontier table。
+
+        返回值语义：
+
+        - CUDA 可用且当前 execution 绑定到 CUDA device 时：
+          返回 GPU-visible table，后续可被更底层 runtime 直接复用。
+        - 单测或无 CUDA 环境：
+          返回 CPU fallback table，用来保持 ABI 与状态推进逻辑一致。
+
+        当前显式对齐到底层 KV native frontier 的 ABI 形状：
+
+        ```text
+        frontier_table: [7] int64
+        ```
+
+        这样可以让“控制面 ABI”先稳定下来，而不把测试环境强绑到真 CUDA 上。
+        """
+        return self._frontier_table
+
+    def frontier_row_host(self) -> Optional[tuple[int, ...]]:
+        """返回 host mirror 中当前可见的 frontier row。"""
+        frontier_snapshot = self.frontier_snapshot()
+        if frontier_snapshot is None:
+            return None
+        return frontier_snapshot.frontier_row
+
+    def poll_frontier(self) -> Optional[BaMDirectPlacementFrontierSnapshot]:
+        """非阻塞推进一次 ready 状态，并返回统一 frontier 快照。"""
+        self.advance_ready()
+        return self.frontier_snapshot()
 
     def get_stats(self) -> BaMDirectPlacementStats:
         """返回当前执行句柄可见的 placement 统计信息。
@@ -418,7 +631,9 @@ class BaMDirectPlacementExecution:
             self._advance_fused_ready_nonblocking()
         else:
             self._advance_lmcache_ready_nonblocking()
-        return self.snapshot()
+        snapshot = self.snapshot()
+        self._publish_frontier_snapshot(snapshot)
+        return snapshot
 
     def wait(self) -> tuple[BaMDirectPlacementStats, Optional[
             BaMDirectPlacementBatchStateSnapshot]]:
@@ -490,6 +705,28 @@ class BaMDirectPlacementExecution:
             stop_when_wave_finishes=True,
         )
         return self.snapshot()
+
+    def wait_until_contiguous_cache_ready_frontier(
+        self,
+        target_chunks: int,
+        *,
+        timeout_s: float | None = None,
+    ) -> Optional[BaMDirectPlacementFrontierSnapshot]:
+        """等待到目标连续前缀后，直接返回统一 frontier 快照。
+
+        这个 helper 的意义不是增加新语义，而是给 storage/runtime 提供一个更薄、
+        更稳定的等待边界：
+
+        - 旧接口返回 batch state snapshot，调用方仍需知道 tracker 细节
+        - 新接口直接返回 frontier snapshot，调用方可以只面向 request-level ABI
+        """
+        batch_snapshot = self.wait_until_contiguous_cache_ready(
+            target_chunks,
+            timeout_s=timeout_s,
+        )
+        if batch_snapshot is None:
+            return None
+        return self._build_frontier_snapshot(batch_snapshot)
 
     def _advance_fused_ready_nonblocking(self) -> None:
         """推进 fused 路径下已经完成的 chunk ready 状态。
@@ -586,13 +823,49 @@ class BaMDirectPlacementExecution:
             return True
         return bool(query())
 
+    def _frontier_value_from_table(self, col: int) -> Optional[int]:
+        """读取共享 frontier table 中某一列的当前值。
+
+        这层 helper 的目标很简单：让 execution 内部的等待判断也开始围绕 shared
+        frontier table 工作，而不是继续优先读取 tracker / Python 局部变量。
+
+        这样后续如果 frontier 更新权继续往 GPU runtime 下放，wait/poll 这层
+        条件判断逻辑也不需要再改一次。
+        """
+        frontier_row = self._read_frontier_row_from_table()
+        if len(frontier_row) <= int(col):
+            return None
+        return int(frontier_row[int(col)])
+
     def _is_launched_range_cache_ready(self) -> bool:
         """判断本次 launched batch 负责的 chunk 是否已全部 cache-ready。"""
+        # 只有当前 wave 本身从 batch 开头 launch 时，`cache_ready_frontier_chunks`
+        # 这列才能直接表达“本 wave 负责的 launched range 是否都 ready”。
+        #
+        # 对非零 offset 的 wave 来说，这一列仍然是“从 batch 开头起的连续前缀”
+        # 语义，例如：
+        #   - wave 从 chunk1 开始 launch 1 个 chunk
+        #   - chunk1 已 ready，但 chunk0 还没 ready
+        #   - 此时 cache_ready_frontier_chunks 仍可能是 0 或 1
+        #
+        # 它并不能直接等价为“offset=1 这波已经完成”。所以这里刻意只在
+        # `chunk_index_offset == 0` 时优先信 shared table；非零 offset 的局部波次
+        # 仍回退到 execution 自己维护的 launched-range committed 计数。
+        if int(self._launched_batch.chunk_index_offset) == 0:
+            table_cache_ready_chunks = self._frontier_value_from_table(
+                _DIRECT_FRONTIER_COL_CACHE_READY)
+            if table_cache_ready_chunks is not None:
+                launch_end_chunk = len(self._launched_batch.plan.entries)
+                return int(table_cache_ready_chunks) >= int(launch_end_chunk)
         return (self._committed_cache_chunks >=
                 len(self._launched_batch.plan.entries))
 
     def _snapshot_reaches_contiguous_target(self, target_chunks: int) -> bool:
         """判断当前 snapshot 是否已经达到目标连续前缀长度。"""
+        table_consumable_chunks = self._frontier_value_from_table(
+            _DIRECT_FRONTIER_COL_CONSUMABLE)
+        if table_consumable_chunks is not None:
+            return int(table_consumable_chunks) >= int(target_chunks)
         snapshot = self.snapshot()
         return snapshot is not None and snapshot.consumable_chunks >= target_chunks
 
@@ -601,6 +874,46 @@ class BaMDirectPlacementExecution:
         if timeout_s is not None:
             return max(float(timeout_s), 0.0)
         return max(float(envs.VLLM_ENGINE_ITERATION_TIMEOUT_S), 1.0)
+
+    def _build_frontier_snapshot(
+        self,
+        snapshot: BaMDirectPlacementBatchStateSnapshot,
+    ) -> BaMDirectPlacementFrontierSnapshot:
+        """把 batch-level ready 状态整理成统一的 request-level frontier 快照。"""
+        launch_frontier_chunks = min(
+            len(snapshot.chunk_states),
+            int(self._launched_batch.chunk_index_offset) +
+            len(self._launched_batch.plan.entries),
+        )
+        status = _DIRECT_FRONTIER_STATUS_SUBMITTED
+        if snapshot.read_ready_chunks > 0:
+            status = _DIRECT_FRONTIER_STATUS_READ_READY
+        if snapshot.cache_ready_chunks > 0:
+            status = _DIRECT_FRONTIER_STATUS_CACHE_READY
+        if snapshot.consumable_chunks > 0:
+            status = _DIRECT_FRONTIER_STATUS_CONSUMABLE
+        return BaMDirectPlacementFrontierSnapshot(
+            frontier_row=(
+                int(status),
+                int(launch_frontier_chunks),
+                int(snapshot.read_ready_chunks),
+                int(snapshot.cache_ready_chunks),
+                int(snapshot.consumable_chunks),
+                int(len(snapshot.chunk_states)),
+                0,
+            ),
+            launch_frontier_chunks=int(launch_frontier_chunks),
+            read_ready_frontier_chunks=int(snapshot.read_ready_chunks),
+            staged_ready_frontier_chunks=int(snapshot.staged_ready_chunks),
+            cache_ready_frontier_chunks=int(snapshot.cache_ready_chunks),
+            consumable_frontier_chunks=int(snapshot.consumable_chunks),
+            total_chunks=int(len(snapshot.chunk_states)),
+            read_ready_frontier_tokens=int(snapshot.read_ready_tokens),
+            staged_ready_frontier_tokens=int(snapshot.staged_ready_tokens),
+            cache_ready_frontier_tokens=int(snapshot.cache_ready_tokens),
+            consumable_frontier_tokens=int(snapshot.consumable_tokens),
+            error_code=0,
+        )
 
     def _poll_until_ready(
         self,
@@ -644,7 +957,248 @@ class BaMDirectPlacementExecution:
         # 真实运行时经过上面的 event 轮询，这里理论上已经自然推进到了终态；
         # 仍保留一次最小兜底，兼容测试桩或未来某条特殊实现遗漏状态推进。
         self._mark_all_remaining_ready()
+        self._publish_frontier_snapshot_from_tracker()
         self._finished = True
+
+    def _allocate_frontier_table(self) -> Optional[torch.Tensor]:
+        """为当前 execution 分配一张轻量的 frontier table。
+
+        这里故意只分配 `[7] int64` 一维表，而不是现在就引入更复杂的多行
+        request table / page table，原因是第三步当前只需要先把 placement
+        request 的统一 frontier ABI 固定下来。
+
+        同时这里有一个非常明确的兼容目标：尽量和底层 native KV read 已经在用的
+        frontier table 口径保持一致。这样后续如果把 placement frontier 真正并入
+        GPU runtime，就不需要再做一轮 dtype / shape 迁移。
+
+        单测里通常没有真实 CUDA，因此这里允许自动回退到 CPU tensor；
+        真正运行在 GPU 环境时，会优先把这张表放到 execution 绑定的 device 上。
+        """
+        device = self._launched_batch.device
+        tensor_device = torch.device("cpu")
+        if device.type == "cuda" and torch.cuda.is_available():
+            tensor_device = device
+        return torch.zeros(
+            (_DIRECT_FRONTIER_COL_COUNT,),
+            dtype=torch.int64,
+            device=tensor_device,
+        )
+
+    def _resolve_frontier_table(
+        self,
+        frontier_table: torch.Tensor | None,
+    ) -> Optional[torch.Tensor]:
+        """解析 execution 当前应使用的 frontier table。
+
+        当前优先级非常简单：
+
+        - 调用方显式传入时，直接复用这张共享 request frontier table
+        - 否则 execution 自己按旧逻辑分配一张独立 table
+
+        这样 request handle 就可以把同一张 GPU-visible frontier table 贯穿：
+
+        ```text
+        native read frontier
+          -> placement execution frontier
+          -> finalize 后的稳定 request frontier
+        ```
+
+        后续如果 persistent GPU runtime 需要直接接手更新 frontier，也只需要接管
+        这一张共享表，而不需要再跨阶段搬运 ABI。
+        """
+        if frontier_table is None:
+            return self._allocate_frontier_table()
+        if frontier_table.ndim != 1 or int(
+                frontier_table.shape[0]) < _DIRECT_FRONTIER_COL_COUNT:
+            raise ValueError(
+                "frontier_table must have shape [>=7], "
+                f"got {tuple(frontier_table.shape)}")
+        if frontier_table.dtype != torch.int64:
+            raise TypeError(
+                "frontier_table.dtype must be torch.int64, "
+                f"got {frontier_table.dtype}")
+        if not frontier_table.is_contiguous():
+            raise ValueError("frontier_table must be contiguous")
+        return frontier_table
+
+    def _read_frontier_row_from_table(self) -> tuple[int, ...]:
+        """读取当前共享 frontier table 的 host 快照。"""
+        if self._frontier_table is None:
+            return ()
+        return tuple(
+            int(value) for value in self._frontier_table.detach().cpu().tolist())
+
+    @staticmethod
+    def _count_descriptor_tokens_upto(
+        descriptor: BaMDirectPlacementBatchDescriptor,
+        ready_chunks: int,
+    ) -> int:
+        """按连续前缀 chunk 数统计 token 数。"""
+        final_ready_chunks = min(max(int(ready_chunks), 0), len(descriptor.chunks))
+        return sum(
+            int(chunk.actual_tokens)
+            for chunk in descriptor.chunks[:final_ready_chunks]
+        )
+
+    def _build_frontier_snapshot_from_table(
+        self,
+    ) -> Optional[BaMDirectPlacementFrontierSnapshot]:
+        """优先基于共享 frontier table 重建 execution 可见的 frontier 快照。
+
+        当前 execution 仍保留 host mirror，但 getter 这里开始把共享 table 当成
+        主事实来源。这样后续如果 frontier 更新权进一步下放给 GPU runtime，
+        execution 侧读取逻辑不需要再改。
+
+        staged 信息当前还不在 7 列 ABI 中，因此仍从 tracker snapshot 补齐。
+        """
+        tracker_snapshot = self.snapshot()
+        if tracker_snapshot is None:
+            return self._frontier_snapshot_mirror
+        frontier_row = self._read_frontier_row_from_table()
+        if not frontier_row:
+            return self._frontier_snapshot_mirror
+        descriptor = tracker_snapshot.descriptor
+        status = int(frontier_row[_DIRECT_FRONTIER_COL_STATUS])
+        launch_frontier_chunks = max(
+            int(frontier_row[_DIRECT_FRONTIER_COL_LAUNCH]), 0)
+        read_ready_frontier_chunks = max(
+            int(frontier_row[_DIRECT_FRONTIER_COL_READ_READY]), 0)
+        cache_ready_frontier_chunks = max(
+            int(frontier_row[_DIRECT_FRONTIER_COL_CACHE_READY]), 0)
+        consumable_frontier_chunks = max(
+            int(frontier_row[_DIRECT_FRONTIER_COL_CONSUMABLE]), 0)
+        total_chunks = max(
+            int(frontier_row[_DIRECT_FRONTIER_COL_TOTAL]),
+            len(tracker_snapshot.chunk_states),
+        )
+        error_code = int(frontier_row[_DIRECT_FRONTIER_COL_ERROR])
+        return BaMDirectPlacementFrontierSnapshot(
+            frontier_row=(
+                int(status),
+                int(launch_frontier_chunks),
+                int(read_ready_frontier_chunks),
+                int(cache_ready_frontier_chunks),
+                int(consumable_frontier_chunks),
+                int(total_chunks),
+                int(error_code),
+            ),
+            launch_frontier_chunks=int(launch_frontier_chunks),
+            read_ready_frontier_chunks=int(read_ready_frontier_chunks),
+            staged_ready_frontier_chunks=int(
+                tracker_snapshot.staged_ready_chunks),
+            cache_ready_frontier_chunks=int(cache_ready_frontier_chunks),
+            consumable_frontier_chunks=int(consumable_frontier_chunks),
+            total_chunks=int(total_chunks),
+            read_ready_frontier_tokens=self._count_descriptor_tokens_upto(
+                descriptor, read_ready_frontier_chunks),
+            staged_ready_frontier_tokens=int(
+                tracker_snapshot.staged_ready_tokens),
+            cache_ready_frontier_tokens=self._count_descriptor_tokens_upto(
+                descriptor, cache_ready_frontier_chunks),
+            consumable_frontier_tokens=self._count_descriptor_tokens_upto(
+                descriptor, consumable_frontier_chunks),
+            error_code=int(error_code),
+        )
+
+    def _publish_frontier_snapshot_from_tracker(self) -> None:
+        """从 tracker 重建 frontier snapshot，并同步到 table/mirror。"""
+        snapshot = self.snapshot()
+        self._publish_frontier_snapshot(snapshot)
+
+    def _publish_frontier_snapshot(
+        self,
+        snapshot: Optional[BaMDirectPlacementBatchStateSnapshot],
+    ) -> None:
+        """把最新 frontier 状态同步到 host mirror 与 GPU-visible table。
+
+        这一层是第三步里最关键的“轻量桥接”：
+
+        - host 侧继续通过 mirror 做低成本控制面判断
+        - GPU 侧已经能看到同一份 row ABI
+
+        这样后续如果继续做 persistent service / GPU-resident frontier，只需要让
+        更底层 runtime 改写这张表，而不用重新设计上层 storage 接口。
+        """
+        if snapshot is None:
+            self._frontier_snapshot_mirror = None
+            if self._frontier_table is not None:
+                self._frontier_table.zero_()
+            return
+        self._write_frontier_table_from_snapshot(snapshot)
+        # table 现在已经是 request/execution getter 的主事实来源，因此这里把
+        # mirror 也尽量改成“由 table 反解出来的快照”，而不是继续把 mirror 当成
+        # 主来源。这样后续如果 frontier 更新权继续往 GPU runtime 下放，这里的
+        # 读取语义就不需要再次调整。
+        self._frontier_snapshot_mirror = (
+            self._build_frontier_snapshot_from_table()
+            or self._build_frontier_snapshot(snapshot)
+        )
+
+    def _write_frontier_table_from_snapshot(
+        self,
+        snapshot: BaMDirectPlacementBatchStateSnapshot,
+    ) -> None:
+        """把 snapshot 中真正属于统一 frontier ABI 的列原位写回共享表。
+
+        这里刻意改成“按列原位更新”，而不是每次重新构造一个完整 tensor 再 copy，
+        原因有两个：
+
+        1. 当前 getter 已经把 shared frontier table 当成主事实来源；
+        2. 后续如果继续往 persistent service / GPU runtime 推进，最自然的形态
+           就是持续原位更新这几列，而不是每次重建整行对象。
+
+        staged 信息当前仍然不在 7 列 ABI 中，因此不会写进这张表。
+        """
+        if self._frontier_table is None:
+            return
+        launch_frontier_chunks = min(
+            len(snapshot.chunk_states),
+            int(self._launched_batch.chunk_index_offset) +
+            len(self._launched_batch.plan.entries),
+        )
+        status = _DIRECT_FRONTIER_STATUS_SUBMITTED
+        if snapshot.read_ready_chunks > 0:
+            status = _DIRECT_FRONTIER_STATUS_READ_READY
+        if snapshot.cache_ready_chunks > 0:
+            status = _DIRECT_FRONTIER_STATUS_CACHE_READY
+        if snapshot.consumable_chunks > 0:
+            status = _DIRECT_FRONTIER_STATUS_CONSUMABLE
+        # shared frontier table 现在已经越来越接近“由更底层 runtime 持续维护”的
+        # 目标形态。因此 host 侧这里回写时必须遵守一个很关键的约束：
+        #
+        # - 只能单调前进
+        # - 不能把 table 已有的更前状态回退掉
+        #
+        # 否则一旦未来真的出现“GPU runtime 比 host 先更新这张表”的情况，
+        # host 再跑一遍旧 snapshot 回写，就会把 frontier 误回退。
+        self._frontier_table[_DIRECT_FRONTIER_COL_STATUS] = max(
+            int(self._frontier_table[_DIRECT_FRONTIER_COL_STATUS]),
+            int(status),
+        )
+        self._frontier_table[_DIRECT_FRONTIER_COL_LAUNCH] = max(
+            int(self._frontier_table[_DIRECT_FRONTIER_COL_LAUNCH]),
+            int(launch_frontier_chunks),
+        )
+        self._frontier_table[_DIRECT_FRONTIER_COL_READ_READY] = max(
+            int(self._frontier_table[_DIRECT_FRONTIER_COL_READ_READY]),
+            int(snapshot.read_ready_chunks),
+        )
+        self._frontier_table[_DIRECT_FRONTIER_COL_CACHE_READY] = max(
+            int(self._frontier_table[_DIRECT_FRONTIER_COL_CACHE_READY]),
+            int(snapshot.cache_ready_chunks),
+        )
+        self._frontier_table[_DIRECT_FRONTIER_COL_CONSUMABLE] = max(
+            int(self._frontier_table[_DIRECT_FRONTIER_COL_CONSUMABLE]),
+            int(snapshot.consumable_chunks),
+        )
+        self._frontier_table[_DIRECT_FRONTIER_COL_TOTAL] = max(
+            int(self._frontier_table[_DIRECT_FRONTIER_COL_TOTAL]),
+            int(len(snapshot.chunk_states)),
+        )
+        self._frontier_table[_DIRECT_FRONTIER_COL_ERROR] = max(
+            int(self._frontier_table[_DIRECT_FRONTIER_COL_ERROR]),
+            0,
+        )
 
     def _build_stats(self) -> BaMDirectPlacementStats:
         """在同步收口后汇总本次 placement 的耗时统计。"""
@@ -704,6 +1258,106 @@ class _BaMDirectPlacementPlan:
     total_tokens: int
 
 
+@dataclass(frozen=True)
+class BaMRuntimeDirectPlacementAttachment:
+    """给底层 GPU runtime 使用的最小 direct placement 描述符。
+
+    这层对象刻意不包含 `pages` 本身，因为 `pages` 的来源仍由 BaM KV native
+    request/runtime 管理。它只描述“当 pages 已经 ready 后，最终该写到哪里”：
+
+    - `slot_mapping`: 当前 request 的 flat slot mapping
+    - `chunk_starts`: 每个 chunk 在 slot_mapping 中的起始 token 偏移
+    - `kv_cache_pointers_gpu`: 每层 paged KV cache 的 data_ptr 表
+    - 若干布局参数：帮助设备侧按和 fused Triton 路径一致的方式做 scatter
+    """
+
+    slot_mapping: torch.Tensor
+    chunk_starts: torch.Tensor
+    kv_cache_pointers_gpu: torch.Tensor
+    page_buffer_size: int
+    block_size: int
+    page_token_capacity: int
+    pages_per_kv_layer: int
+    num_layers: int
+    num_kv_heads: int
+    head_size: int
+    pack_size: int
+    slot_mapping_len: int
+    kv_cache_ptrs_len: int
+
+
+@dataclass(frozen=True)
+class BaMRuntimeAttentionMetadataAttachment:
+    """给现有 persistent service CTA 使用的 attention metadata workspace。
+
+    这层 attachment 的目标非常收敛：
+
+    - 不再让前台 adapter 在 request finalize 后临时 `torch.cat/pad/rebuild`
+      大量 GPU metadata；
+    - 改成在 request start 时一次性预分配好本条 sequence 需要的 workspace；
+    - 等 BaM persistent service 完成：
+        `BaM cache -> vLLM paged KV cache`
+      之后，顺手把当前 sequence 对应的 attention metadata 也原地填好；
+    - 前台只做“薄封装”和必要的只读校验，不再承担 metadata rebuild 主工作。
+
+    当前这层只覆盖“单条 sequence request”语义，因为 direct retrieve request
+    本身就是按 sequence 单独启动的。后续如果要做 batch 级 metadata 收口，
+    也可以继续复用这份 per-seq ABI。
+    """
+
+    # `full_query_slot_mapping_src` 是“当前 sequence 在本轮原始 model_input 里，
+    # 从当前 sequence 起点开始到本轮 total_seq_len 结束”的完整 slot-mapping
+    # 切片。
+    #
+    # 这里刻意保留 full-seq 口径，而不是只传当前 suffix/query 的那一段，原因是
+    # 后端 persistent service 需要同时处理两类不同语义：
+    #
+    # 1. `rebuilt_slot_mapping_dst`
+    #    这是 query/suffix 级别的控制面。它会根据最终补回了多少 prefix token，
+    #    从 `full_query_slot_mapping_src` 中截取一个后缀写回。
+    #
+    # 2. `rebuilt_block_table_dst`
+    #    这是 full-seq 级别的控制面。即便当前真正要计算的 query 只是一个后缀，
+    #    block table 仍然必须描述“到当前 total_seq_len 为止”的整条 sequence
+    #    paged-cache block 布局。
+    #
+    # 因此这份 source tensor 既服务 suffix slot_mapping rebuild，也服务 full-seq
+    # block_table rebuild；两者不能混成同一个坐标系。
+    full_query_slot_mapping_src: torch.Tensor
+    rebuilt_slot_mapping_dst: torch.Tensor
+
+    # `original_block_table_src` 若非空，表示原始 attn metadata 已经给出了可直接
+    # 复用的 row；若为空，则 persistent service 按 `full_query_slot_mapping_src`
+    # 和 `block_size` 在 GPU 上保守恢复 block_table。
+    original_block_table_src: torch.Tensor
+    rebuilt_block_table_dst: torch.Tensor
+
+    # 下列 tensor 都是“单条 sequence”的最终 metadata workspace：
+    # - `context_lens_dst[0]`      : 本轮 attention 看到的 context_len
+    # - `seq_lens_dst[0]`          : 本轮 attention 看到的总 seq_len
+    # - `query_start_loc_dst[:2]`  : 固定写成 [0, q_len]
+    # - `selected_token_indices_dst`
+    # - `metadata_ready_flag`
+    #
+    # 其中 `metadata_ready_flag` 现在只保留为一个轻量调试/观测标记。
+    #
+    # 当前 authoritative 的“这条 request 是否已经可以直接消费 runtime
+    # metadata”语义，已经收口到 storage/finalize 发布的 request-level
+    # completion 主线上；前台不再依赖这里的 `.item()` 结果做硬门槛分叉。
+    context_lens_dst: torch.Tensor
+    seq_lens_dst: torch.Tensor
+    query_start_loc_dst: torch.Tensor
+    selected_token_indices_dst: torch.Tensor
+    metadata_ready_flag: torch.Tensor
+
+    total_seq_len: int
+    vllm_num_computed_tokens: int
+    vllm_num_computed_tokens_align: int
+    block_size: int
+    is_chunk_prefill: bool
+    do_sample: bool
+
+
 class BaMDirectKVPlacer:
     """把 BaM page batch 直接写入 vLLM paged KV cache。
 
@@ -733,6 +1387,8 @@ class BaMDirectKVPlacer:
         self._kv_cache_pointer_values: tuple[int, ...] = ()
         self._page_buffer_size = 0
         self._block_size = 0
+        self._configured_num_kv_heads = 0
+        self._configured_head_size = 0
         # merged refill 的第一个真实 step 目前会承担明显的一次性 Triton/JIT
         # 初始化成本。这里记录“当前这组 shape/layout 是否已经预热过”，把这部分
         # 开销尽量前移到首次 placement 入口，而不是落到 request_2 的热路径上。
@@ -751,6 +1407,8 @@ class BaMDirectKVPlacer:
         kv_caches: Sequence[torch.Tensor],
         slot_mapping: torch.Tensor,
         chunk_starts: Sequence[int],
+        num_kv_heads: int = 0,
+        head_size: int = 0,
         state_tracker: BaMDirectPlacementStateTracker | None = None,
         launch_start_chunk: int = 0,
         max_chunks_to_launch: int | None = None,
@@ -777,12 +1435,18 @@ class BaMDirectKVPlacer:
                 f"expected={self.layout.num_layers}, got={len(kv_caches)}")
         if not slot_mapping.is_cuda:
             raise ValueError("slot_mapping must be CUDA tensor")
+        if int(num_kv_heads) > 0:
+            self._configured_num_kv_heads = int(num_kv_heads)
+        if int(head_size) > 0:
+            self._configured_head_size = int(head_size)
 
         launched_batch = self.start_batch(
             results=results,
             kv_caches=kv_caches,
             slot_mapping=slot_mapping,
             chunk_starts=chunk_starts,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
             launch_start_chunk=launch_start_chunk,
             max_chunks_to_launch=max_chunks_to_launch,
         )
@@ -794,6 +1458,53 @@ class BaMDirectKVPlacer:
         self.log_launched_batch_step_timings(launched_batch)
         return stats
 
+    def _resolve_effective_impl(
+        self,
+        *,
+        phase: str,
+    ) -> str:
+        """解析当前 direct placement 应实际使用的数据面实现。
+
+        当前保留两套 host materialized finalize 数据面：
+
+        - `fused`
+          直接把 BaM pages scatter 到最终 paged KV cache
+        - `lmcache`
+          先 refill 成 merged KV tensor，再走一跳 LMCache connector transfer
+
+        结合最近几轮日志，已经可以比较确定：
+
+        - persistent/runtime 模式下，控制面 prepare 已经跑通
+        - 但真正进入 fused launch 时仍会长时间卡住
+        - 而当前阶段最重要的目标是先把
+          “GPU 后台 poll/read + host materialized finalize”
+          这条主线稳定跑通
+
+        因此这里在 persistent/runtime 模式下，显式把 host materialized finalize
+        的实现收敛到 `lmcache`。这不是长期终点，而是当前主线下最小、最清晰的
+        收敛策略：
+
+        - 不改 request-level 控制面
+        - 不改上层调用链
+        - 只把最不稳定的 fused 数据面替换成已验证更稳的一跳实现
+        """
+        impl = envs.VLLM_BAM_DIRECT_PLACEMENT_IMPL.strip().lower()
+        if impl not in ("lmcache", "fused"):
+            raise ValueError(
+                "VLLM_BAM_DIRECT_PLACEMENT_IMPL must be 'lmcache' or 'fused', "
+                f"got {impl!r}")
+        if impl == "fused" and triton is None:
+            raise RuntimeError("Triton is required for fused direct placement")
+        if impl == "fused" and self._should_skip_prepare_warmup():
+            logger.info(
+                "[LMCACHE_BAM_DIRECT_PLACEMENT_IMPL_DEMOTE] "
+                "phase=%s configured_impl=fused effective_impl=lmcache "
+                "reason=persistent_gpu_service_enabled",
+                phase,
+            )
+            return "lmcache"
+        return impl
+
     def start_batch(
         self,
         *,
@@ -801,6 +1512,8 @@ class BaMDirectKVPlacer:
         kv_caches: Sequence[torch.Tensor],
         slot_mapping: torch.Tensor,
         chunk_starts: Sequence[int],
+        num_kv_heads: int = 0,
+        head_size: int = 0,
         launch_start_chunk: int = 0,
         max_chunks_to_launch: int | None = None,
     ) -> _BaMDirectPlacementLaunchedBatch:
@@ -817,13 +1530,11 @@ class BaMDirectKVPlacer:
         """
         total_start = time.perf_counter()
         self._ensure_lmcache_connector_state(kv_caches)
-        impl = envs.VLLM_BAM_DIRECT_PLACEMENT_IMPL.strip().lower()
-        if impl not in ("lmcache", "fused"):
-            raise ValueError(
-                "VLLM_BAM_DIRECT_PLACEMENT_IMPL must be 'lmcache' or 'fused', "
-                f"got {impl!r}")
-        if impl == "fused" and triton is None:
-            raise RuntimeError("Triton is required for fused direct placement")
+        if int(num_kv_heads) > 0:
+            self._configured_num_kv_heads = int(num_kv_heads)
+        if int(head_size) > 0:
+            self._configured_head_size = int(head_size)
+        impl = self._resolve_effective_impl(phase="start")
 
         plan = self._build_plan(
             results=results,
@@ -849,7 +1560,27 @@ class BaMDirectKVPlacer:
                 fused_step_events=(),
                 transfer_completion_event=None,
             )
-        if impl == "fused":
+        if self._should_skip_prepare_warmup():
+            # `prepare_for_batch()` 已经在 persistent/runtime 模式下显式跳过 warmup。
+            # 这里必须复用同一判定，避免：
+            #
+            # 1. prepare 阶段不 warmup；
+            # 2. 但真正 launch wave 时，`start_batch()` 又偷偷跑一遍 fused/merged
+            #    warmup；
+            #
+            # 否则日志上就会表现成：
+            #
+            # - `FINALIZE_PREPARE_DONE` 已经出现
+            # - `FINALIZE_WAVE_BEGIN` 之后又卡在 `FUSED_WARMUP`
+            #   或 `MERGED_REFILL_WARMUP`
+            #
+            # 这正是最新一轮日志已经证明的停点。
+            logger.info(
+                "[LMCACHE_BAM_DIRECT_PLACEMENT_START_WARMUP_SKIP] "
+                "reason=persistent_gpu_service_enabled impl=%s",
+                impl,
+            )
+        elif impl == "fused":
             self._maybe_warmup_fused(launch_plan, kv_caches)
         else:
             self._maybe_warmup_merged_refill(launch_plan)
@@ -908,11 +1639,13 @@ class BaMDirectKVPlacer:
         *,
         launched_batch: _BaMDirectPlacementLaunchedBatch,
         state_tracker: BaMDirectPlacementStateTracker | None = None,
+        frontier_table: torch.Tensor | None = None,
     ) -> BaMDirectPlacementExecution:
         """把一次已 launch 的 batch 封装成 execution 句柄。"""
         return BaMDirectPlacementExecution(
             launched_batch=launched_batch,
             state_tracker=state_tracker,
+            frontier_table=frontier_table,
         )
 
     def log_launched_batch_step_timings(
@@ -950,6 +1683,8 @@ class BaMDirectKVPlacer:
         kv_caches: Sequence[torch.Tensor],
         slot_mapping: torch.Tensor,
         chunk_starts: Sequence[int],
+        num_kv_heads: int = 0,
+        head_size: int = 0,
         launch_start_chunk: int = 0,
         max_chunks_to_launch: int | None = None,
     ) -> None:
@@ -976,32 +1711,66 @@ class BaMDirectKVPlacer:
 
         ensure_state_start = time.perf_counter()
         self._ensure_lmcache_connector_state(kv_caches)
+        if int(num_kv_heads) > 0:
+            self._configured_num_kv_heads = int(num_kv_heads)
+        if int(head_size) > 0:
+            self._configured_head_size = int(head_size)
         ensure_state_ms = (time.perf_counter() - ensure_state_start) * 1000.0
-        impl = envs.VLLM_BAM_DIRECT_PLACEMENT_IMPL.strip().lower()
-        if impl not in ("lmcache", "fused"):
-            raise ValueError(
-                "VLLM_BAM_DIRECT_PLACEMENT_IMPL must be 'lmcache' or 'fused', "
-                f"got {impl!r}")
-        if impl == "fused" and triton is None:
-            raise RuntimeError("Triton is required for fused direct placement")
+        impl = self._resolve_effective_impl(phase="prepare")
 
         build_plan_start = time.perf_counter()
+        logger.info(
+            "[LMCACHE_BAM_DIRECT_PLACEMENT_PREPARE_BUILD_PLAN_BEGIN] "
+            "results=%d launch_start_chunk=%d",
+            len(results),
+            int(launch_start_chunk),
+        )
         plan = self._build_plan(
             results=results,
             slot_mapping=slot_mapping,
             chunk_starts=chunk_starts,
+        )
+        logger.info(
+            "[LMCACHE_BAM_DIRECT_PLACEMENT_PREPARE_BUILD_PLAN_DONE] "
+            "entries=%d total_tokens=%d",
+            len(plan.entries),
+            int(plan.total_tokens),
         )
         launch_plan = self._build_launch_plan(
             plan=plan,
             launch_start_chunk=launch_start_chunk,
             max_chunks_to_launch=max_chunks_to_launch,
         )
+        logger.info(
+            "[LMCACHE_BAM_DIRECT_PLACEMENT_PREPARE_BUILD_LAUNCH_PLAN_DONE] "
+            "launch_entries=%d launch_tokens=%d",
+            len(launch_plan.entries),
+            int(launch_plan.total_tokens),
+        )
         build_plan_ms = (time.perf_counter() - build_plan_start) * 1000.0
         if not launch_plan.entries:
             return
 
         warmup_start = time.perf_counter()
-        if impl == "fused":
+        if self._should_skip_prepare_warmup():
+            # 这里显式跳过 warmup，不是为了“偷懒”，而是因为当前主线下
+            # GPU worker persistent service 可能已经常驻运行：
+            #
+            # 1. warmup 本身只用于首轮 Triton/JIT 编译前移；
+            # 2. 但一旦它落到默认 stream，再配合同步，就很容易与后台
+            #    persistent service 形成隐式串行或设备级等待；
+            # 3. 对 materialized finalize 来说，这类一次性优化绝不应该影响
+            #    功能正确性，因此在 persistent 模式下直接关掉最稳妥。
+            #
+            # steady-state 性能优化后续仍可以通过“专用 warmup stream”再做，
+            # 但当前先保证主线跑通，避免 request 卡死在 prepare 阶段。
+            warmup_executed = False
+            logger.info(
+                "[LMCACHE_BAM_DIRECT_PLACEMENT_PREPARE_WARMUP_SKIP] "
+                "reason=persistent_gpu_service_enabled impl=%s",
+                impl,
+            )
+        elif impl == "fused":
             warmup_executed = self._maybe_warmup_fused(launch_plan, kv_caches)
         else:
             warmup_executed = self._maybe_warmup_merged_refill(launch_plan)
@@ -1020,6 +1789,166 @@ class BaMDirectKVPlacer:
             warmup_ms,
             str(bool(warmup_executed)).lower(),
             prepare_total_ms,
+        )
+
+    def ensure_kv_cache_pointer_state(
+        self,
+        *,
+        kv_caches: Sequence[torch.Tensor],
+    ) -> None:
+        """提前准备 fused/materialized finalize 需要的 KV cache 指针状态。
+
+        这层 helper 故意只做一件事：确保 `_ensure_lmcache_connector_state()`
+        已完成。
+
+        这么拆出来，是为了把“第一次 GPU 元数据初始化”的时机从：
+
+        - finalize/prepare 阶段
+
+        前移到：
+
+        - direct placement read submit 之前
+
+        当前 persistent service 主线下，这个时序差异非常关键。因为一旦 native
+        read request 已经挂进后台 service，再在 finalize 里首次构造：
+
+        - `kv_cache_pointers_gpu`
+        - `page_buffer_size`
+        - block-size 相关派生状态
+
+        就可能与仍处在活跃状态的后台 service 发生资源争用，表现成
+        `FINALIZE_PREPARE_BEGIN` 后长时间无后续日志。
+
+        提前初始化后，finalize 只复用稳定状态，不再在 request 活跃期首次做
+        这类 GPU metadata 准备。
+        """
+        self._ensure_lmcache_connector_state(kv_caches)
+
+    @staticmethod
+    def _should_skip_prepare_warmup() -> bool:
+        """判断当前这轮 prepare 是否应彻底跳过 warmup。
+
+        当前直接使用环境变量做判定，原因有两个：
+
+        1. 这层 direct placement 组件本身不持有 BaM runtime / kv_store 句柄，
+           不应该为了问“后台 service 在不在跑”而反向依赖更底层对象；
+        2. 这次要解决的是“persistent 模式下 materialized finalize 卡住”，
+           而 persistent/runtime 开关本来就是由脚本和环境变量统一控制的。
+
+        只要启用了 GPU worker runtime 或 persistent service，就把 prepare
+        warmup 视作不安全操作并直接跳过。这样不改变真正的数据搬运逻辑，只是
+        去掉了首轮编译前移这一步，能最大限度降低与后台常驻 kernel 互相等待的
+        风险。
+        """
+
+        def _env_enabled(name: str) -> bool:
+            value = os.getenv(name)
+            if value is None:
+                return False
+            return value.strip().lower() not in ("", "0", "false", "off", "no")
+
+        return (_env_enabled("GIDS_KV_GPU_WORKER_RUNTIME_ENABLE")
+                or _env_enabled("GIDS_KV_GPU_WORKER_PERSISTENT_ENABLE"))
+
+    def _resolve_vllm_paged_kv_layout(
+        self,
+        *,
+        kv_caches: Sequence[torch.Tensor],
+        num_kv_heads: int = 0,
+        head_size: int = 0,
+    ) -> tuple[int, int, int]:
+        """解析 direct placement 写最终 paged KV cache 必需的布局参数。
+
+        这里显式收敛三件事：
+
+        - `hidden_dim == num_kv_heads * head_size`
+        - `block_size` 已由 `_ensure_lmcache_connector_state()` 推导完成
+        - key packed layout 里的 `pack_size = 16 / element_size`
+
+        之前 runtime/host 写端缺的正是这组参数，因此只能错误地退回 flat
+        token-row 线性写法。现在统一从这里拿，避免两边再各自猜布局。
+        """
+        hidden_dim = int(self.layout.hidden_dim)
+        num_kv_heads = int(num_kv_heads)
+        head_size = int(head_size)
+        if num_kv_heads <= 0:
+            num_kv_heads = int(self._configured_num_kv_heads)
+        if head_size <= 0:
+            head_size = int(self._configured_head_size)
+        if num_kv_heads <= 0 or head_size <= 0:
+            # host 侧 fused 单测/实验路径允许退化成“把整条 hidden 向量视作 1 个 head”。
+            # 这样不会影响 runtime 主线的严格校验，但能保持旧控制面调用接口兼容。
+            num_kv_heads = 1
+            head_size = hidden_dim
+        if num_kv_heads <= 0 or head_size <= 0:
+            raise ValueError(
+                "direct placement requires positive num_kv_heads/head_size, "
+                f"got num_kv_heads={num_kv_heads} head_size={head_size}")
+        if hidden_dim != num_kv_heads * head_size:
+            raise ValueError(
+                "direct placement hidden_dim mismatch: "
+                f"hidden_dim={hidden_dim} num_kv_heads={num_kv_heads} "
+                f"head_size={head_size}")
+        if self._block_size <= 0:
+            # 一些轻量单测会直接调用 fused warmup/helper，而不会先经过
+            # `start_batch()/prepare_for_batch()` 的完整初始化流程。
+            # 这里允许按当前 `kv_caches` 的 shape 惰性补齐 block_size，避免把
+            # “尚未初始化 pointer state”误判成布局错误。
+            self._ensure_lmcache_connector_state(kv_caches)
+        if self._block_size <= 0:
+            raise ValueError(
+                "direct placement block_size has not been initialized")
+        pack_size = 16 // int(kv_caches[0].element_size())
+        if pack_size <= 0 or head_size % pack_size != 0:
+            raise ValueError(
+                "direct placement cannot derive valid packed key layout: "
+                f"head_size={head_size} pack_size={pack_size}")
+        return num_kv_heads, head_size, int(pack_size)
+
+    def build_runtime_direct_placement_attachment(
+        self,
+        *,
+        kv_caches: Sequence[torch.Tensor],
+        slot_mapping: torch.Tensor,
+        chunk_starts: Sequence[int],
+        num_kv_heads: int,
+        head_size: int,
+    ) -> BaMRuntimeDirectPlacementAttachment:
+        """构造给底层 persistent runtime 使用的设备侧 placement 描述符。
+
+        这一步不做任何 pages 搬运，也不 launch placement kernel；它只把 fused
+        direct placement 真正需要的 GPU-visible 元信息收成一份稳定结构，供
+        BaM persistent service 在 `pages` ready 后继续推进到最终 paged KV cache。
+        """
+        if not slot_mapping.is_cuda:
+            raise ValueError("slot_mapping must be CUDA tensor")
+        self._ensure_lmcache_connector_state(kv_caches)
+        if self._kv_cache_pointers_gpu is None:
+            raise RuntimeError("kv cache pointer table is not initialized")
+        (num_kv_heads, head_size,
+         pack_size) = self._resolve_vllm_paged_kv_layout(
+             kv_caches=kv_caches,
+             num_kv_heads=num_kv_heads,
+             head_size=head_size,
+         )
+        return BaMRuntimeDirectPlacementAttachment(
+            slot_mapping=slot_mapping.contiguous(),
+            chunk_starts=torch.tensor(
+                list(int(value) for value in chunk_starts),
+                dtype=torch.int64,
+                device=slot_mapping.device,
+            ),
+            kv_cache_pointers_gpu=self._kv_cache_pointers_gpu,
+            page_buffer_size=int(self._page_buffer_size),
+            block_size=int(self._block_size),
+            page_token_capacity=int(self.layout.page_token_capacity),
+            pages_per_kv_layer=int(self.layout.pages_per_kv_layer),
+            num_layers=int(self.layout.num_layers),
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            pack_size=int(pack_size),
+            slot_mapping_len=int(slot_mapping.numel()),
+            kv_cache_ptrs_len=int(len(kv_caches)),
         )
 
     def _maybe_warmup_merged_refill(
@@ -1084,7 +2013,7 @@ class BaMDirectKVPlacer:
             actual_tokens=int(first_entry.actual_tokens),
             layout=self.layout,
         )
-        torch.cuda.synchronize(first_pages.device)
+        self._synchronize_current_cuda_stream(first_pages.device)
         self._merged_refill_warmup_done = True
         self._merged_refill_warmup_signature = warmup_signature
         return True
@@ -1169,6 +2098,10 @@ class BaMDirectKVPlacer:
             dtype=first_entry.slot_mapping.dtype,
             device=first_entry.slot_mapping.device,
         )
+        (num_kv_heads, head_size,
+         pack_size) = self._resolve_vllm_paged_kv_layout(
+             kv_caches=kv_caches,
+         )
 
         self._launch_fused_pages_to_vllm_cache(
             first_pages,
@@ -1176,8 +2109,12 @@ class BaMDirectKVPlacer:
             dummy_kv_cache_pointers_gpu,
             actual_tokens=int(first_entry.actual_tokens),
             page_buffer_size=int(self._page_buffer_size),
+            num_kv_heads=int(num_kv_heads),
+            head_size=int(head_size),
+            block_size=int(self._block_size),
+            pack_size=int(pack_size),
         )
-        torch.cuda.synchronize(first_pages.device)
+        self._synchronize_current_cuda_stream(first_pages.device)
         self._fused_warmup_done = True
         self._fused_warmup_signature = warmup_signature
         return True
@@ -1218,7 +2155,21 @@ class BaMDirectKVPlacer:
                     "slot_mapping slice is shorter than chunk tokens: "
                     f"start={chunk_start} actual_tokens={actual_tokens} "
                     f"slice={chunk_slots.numel()}")
-            if bool((chunk_slots < 0).any().item()):
+            # 这里不要在 CUDA 热路径里做 `.any().item()` 这类 host 同步检查。
+            #
+            # 当前 persistent service 会常驻在同一张卡上持续推进 native read；
+            # 如果 finalize/prepare 阶段再在 `slot_mapping` 上做设备到主机的同步
+            # 读取，就可能把前台线程卡在这一步。
+            #
+            # `slot_mapping` 的非负性本身属于上层 vLLM/LMCache 已经保证的契约，
+            # 因此这里把强校验收窄到：
+            #
+            # - CPU / 单测桩场景：仍保留检查，便于尽早发现非法输入
+            # - 真实 CUDA 热路径：相信上层契约，避免无意义同步
+            #
+            # 这样既保住了主线性能/可运行性，也没有把无效输入默默吞掉到所有场景。
+            if (not chunk_slots.is_cuda
+                    and bool((chunk_slots < 0).any().item())):
                 raise ValueError(
                     "direct placement does not support negative slot_mapping "
                     f"in a retrieved chunk yet: start={chunk_start} "
@@ -1422,6 +2373,28 @@ class BaMDirectKVPlacer:
         """
         return sum(float(start.elapsed_time(end)) for start, end in events)
 
+    @staticmethod
+    def _synchronize_current_cuda_stream(device: torch.device) -> None:
+        """只同步当前 launch stream，避免把后台 persistent service 也等住。
+
+        这里不能再使用 `torch.cuda.synchronize(device)` 这类 device-wide 同步。
+        原因是当前 KV 主线下，GPU worker persistent service 可能长期常驻在同一张
+        卡上的另一条 stream；如果 warmup 这里等待整张卡空闲，就会把：
+
+        - 当前 prepare/warmup 自己刚 launch 的 kernel
+        - 与之无关、但本来就设计成持续运行的后台 service kernel
+
+        一起纳入等待范围，最终表现成 materialized/fused finalize 在
+        `prepare_for_batch()` 里“看起来像卡住了”。
+
+        warmup 真正需要的语义其实更窄：
+
+        - 只保证当前默认 stream 上这次 launch 的 kernel 已经完成
+
+        因此这里显式收窄到 current stream，同步边界更贴近真实需要。
+        """
+        torch.cuda.current_stream(device=device).synchronize()
+
     def _ensure_lmcache_connector_state(
         self,
         kv_caches: Sequence[torch.Tensor],
@@ -1492,6 +2465,10 @@ class BaMDirectKVPlacer:
         的放置成本是否均匀。
         """
         step_events: list[tuple[int, int, torch.cuda.Event, torch.cuda.Event]] = []
+        (num_kv_heads, head_size,
+         pack_size) = self._resolve_vllm_paged_kv_layout(
+             kv_caches=kv_caches,
+         )
         for entry in plan.entries:
             step_start, step_end = self._new_cuda_event_pair()
             step_start.record()
@@ -1500,6 +2477,9 @@ class BaMDirectKVPlacer:
                 entry.slot_mapping,
                 kv_caches,
                 actual_tokens=entry.actual_tokens,
+                num_kv_heads=num_kv_heads,
+                head_size=head_size,
+                pack_size=pack_size,
             )
             step_end.record()
             step_events.append((entry.chunk_start, entry.actual_tokens,
@@ -1513,24 +2493,20 @@ class BaMDirectKVPlacer:
         kv_caches: Sequence[torch.Tensor],
         *,
         actual_tokens: int,
+        num_kv_heads: int,
+        head_size: int,
+        pack_size: int,
     ) -> None:
         """实验版 fused direct placement。
 
         数据通路：
 
         ```text
-        BaM pages [112, 128KB]
+        BaM pages [pages_per_chunk, 128KB]
           -> Triton kernel
-          -> kv_caches[layer][K/V, slot, hidden]
-        ```
-
-        这条路径刻意对齐 LMCache `multi_layer_kv_transfer` 的 flat paged cache
-        口径，而不是 vLLM `reshape_and_cache` 的 packed-key 口径。也就是说，
-        对当前 V0 cache：
-
-        ```text
-        kv_caches[layer]: [2, num_blocks, block_size * hidden_dim]
-        逻辑视图:         [2, num_blocks * block_size, hidden_dim]
+          -> vLLM paged KV cache
+             key  : [num_blocks, num_kv_heads, head_size/pack, block_size, pack]
+             value: [num_blocks, num_kv_heads, head_size, block_size]
         ```
 
         当前版本已经把“单个 chunk 内部”收缩成一次 kernel launch：
@@ -1561,6 +2537,10 @@ class BaMDirectKVPlacer:
             self._kv_cache_pointers_gpu,
             actual_tokens=int(actual_tokens),
             page_buffer_size=int(self._page_buffer_size),
+            num_kv_heads=int(num_kv_heads),
+            head_size=int(head_size),
+            block_size=int(self._block_size),
+            pack_size=int(pack_size),
         )
 
     def _launch_fused_pages_to_vllm_cache(
@@ -1571,6 +2551,10 @@ class BaMDirectKVPlacer:
         *,
         actual_tokens: int,
         page_buffer_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        block_size: int,
+        pack_size: int,
     ) -> None:
         """执行一次 fused pages -> vLLM paged cache kernel launch。
 
@@ -1582,20 +2566,24 @@ class BaMDirectKVPlacer:
         pages_typed = pages.view(self.layout.dtype).view(-1)
         total_elements = int(actual_tokens) * int(self.layout.hidden_dim) * 2 * int(
             self.layout.num_layers)
-        block_size = 256
-        grid = (triton.cdiv(total_elements, block_size), )
-        _bam_pages_to_flat_paged_cache_kernel[grid](
+        launch_block_size = 256
+        grid = (triton.cdiv(total_elements, launch_block_size), )
+        _bam_pages_to_vllm_paged_cache_kernel[grid](
             pages_typed,
             kv_cache_pointers_gpu,
             slot_mapping,
             total_elements,
             int(actual_tokens),
             int(self.layout.hidden_dim),
+            int(num_kv_heads),
+            int(head_size),
+            int(block_size),
+            int(pack_size),
             int(self.layout.page_token_capacity),
             int(self.layout.pages_per_kv_layer),
             int(self.layout.num_layers),
             int(page_buffer_size),
-            BLOCK_SIZE=block_size,
+            BLOCK_SIZE=launch_block_size,
         )
 
     def _lmcache_transfer_to_vllm_cache(

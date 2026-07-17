@@ -5,7 +5,7 @@ This implementation is a shim wrapper on two APIs exposed by `kv_connector`:
 1. `send_kv_caches_and_hidden_states`
 2. `recv_kv_caches_and_hidden_states
 """
-from typing import TYPE_CHECKING, List, Tuple, Union
+from typing import TYPE_CHECKING, List, Union
 
 if TYPE_CHECKING:
     from vllm.worker.model_runner import ModelInputForGPUWithSamplingMetadata
@@ -15,8 +15,8 @@ import torch
 
 from vllm.distributed.kv_transfer.kv_connector.factory import (
     KVConnectorFactory)
+from vllm.distributed.kv_transfer.kv_connector.base import KVReceiveResult
 from vllm.logger import init_logger
-from vllm.sequence import IntermediateTensors
 
 logger = init_logger(__name__)
 
@@ -69,8 +69,7 @@ class KVTransferAgent:
         self, model_executable: torch.nn.Module,
         model_input: "ModelInputForGPUWithSamplingMetadata",
         kv_caches: List[torch.Tensor]
-    ) -> Tuple[Union[torch.Tensor, IntermediateTensors], bool,
-               "ModelInputForGPUWithSamplingMetadata"]:
+    ) -> KVReceiveResult:
 
         return self.connector.recv_kv_caches_and_hidden_states(
             model_executable, model_input, kv_caches)

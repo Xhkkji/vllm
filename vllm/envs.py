@@ -54,10 +54,29 @@ if TYPE_CHECKING:
     VLLM_BAM_KV_FAST_PATH: bool = False
     VLLM_BAM_DIRECT_PLACEMENT: bool = False
     VLLM_BAM_DIRECT_PLACEMENT_IMPL: str = "lmcache"
-    VLLM_BAM_DIRECT_PLACEMENT_FRONTIER_CHUNKS: int = 0
-    VLLM_BAM_DIRECT_PLACEMENT_FOLLOWUP_CHUNKS: int = 0
+    VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE: bool = False
+    VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_ALLOW_LIVE_REFILL: bool = False
+    VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_SAMPLE_TOKENS: int = 2
+    VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_SAMPLE_DIMS: int = 8
+    VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_FULL_COMPARE: bool = False
+    VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE: bool = False
+    VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_MAX_CHUNKS: int = 4
+    VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_MAX_LAYERS: int = 1
+    VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_SAMPLE_TOKENS: int = 8
+    VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_SAMPLE_HEADS: int = 2
+    VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_SAMPLE_DIMS: int = 8
+    VLLM_BAM_DIRECT_PLACEMENT_RUNTIME_ONE_COPY: bool = False
+    VLLM_BAM_DIRECT_PLACEMENT_REQUIRE_RUNTIME_ONE_COPY: bool = False
+    VLLM_BAM_DIRECT_PLACEMENT_DEFER_RUNTIME: bool = False
+    VLLM_BAM_DIRECT_PLACEMENT_DEFER_MIN_POLLS: int = 0
     VLLM_BAM_XFORMERS_PREFIX_FALLBACK_PROFILE: bool = False
-    VLLM_BAM_TRY_PAGED_PREFIX_ZERO_ALIBI: bool = False
+    VLLM_BAM_XFORMERS_PREFIX_BACKEND: str = "auto"
+    VLLM_BAM_XFORMERS_QUERY_BACKEND: str = "auto"
+    VLLM_BAM_XFORMERS_VERIFY_PREFIX_GATHER: bool = False
+    VLLM_BAM_XFORMERS_VERIFY_ATTENTION_OUTPUT: bool = False
+    VLLM_BAM_XFORMERS_VERIFY_ATTENTION_OUTPUT_FULL: bool = False
+    VLLM_BAM_XFORMERS_VERIFY_ATTENTION_OUTPUT_FULL_LAYER: int = 0
+    VLLM_BAM_LOGITS_SEMANTIC_DEBUG: bool = False
     VLLM_BAM_IMPORT_PATH: Optional[str] = None
     VLLM_BAM_CACHE_SIZE_MB: int = 512
     VLLM_BAM_NUM_SSD: int = 1
@@ -456,30 +475,220 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_BAM_DIRECT_PLACEMENT_IMPL":
     lambda: os.getenv("VLLM_BAM_DIRECT_PLACEMENT_IMPL", "lmcache"),
 
-    # 一次 direct placement 真实 launch 的连续前缀 chunk 数。
+    # 调试开关：
+    # 在 runtime cleanup-only direct placement 主线里，额外走一遍“旧的
+    # materialize 语义”来重建期望 chunk tensor，然后按真实 slot_mapping
+    # 与当前 vLLM paged KV cache 中已经写入的内容逐项比对。
     #
-    # 语义：
-    # - 0: launch 当前命中的全部连续 prefix chunks（默认主路径）
-    # - N>0: 只 launch 前 N 个连续 prefix chunks 的 placement
+    # 这条开关只用于定位：
+    #   GPU persistent service 已经把数据写进了 vLLM cache，
+    #   但最终输出仍然错误
+    # 这种场景下，问题究竟在“数据面写坏了”，还是在更上层 control plane。
     #
-    # 这为 chunk-ready / chunk-consumable frontier 试验保留了一个最小开关：
-    # 当前可以先只暴露前若干个 chunk 给上层 rebuild / consume，避免一次性把
-    # 全部命中 chunk 都推进到最终 cache。
-    "VLLM_BAM_DIRECT_PLACEMENT_FRONTIER_CHUNKS":
-    lambda: int(os.getenv("VLLM_BAM_DIRECT_PLACEMENT_FRONTIER_CHUNKS", "0")),
+    # 默认关闭，避免在正式性能口径里引入额外 blocking reread / compare 开销。
+    "VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE":
+    lambda: bool(
+        int(os.getenv("VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE", "0"))),
 
-    # 实验开关：在第一波 direct placement 之后，再额外补多少个 followup
-    # chunks。
+    # 是否允许 runtime one-copy 主线在 cleanup 之后，继续复用 live request
+    # 的 pages buffer 做“期望 tensor 重建”。
+    #
+    # 说明：
+    # - 这一步只服务更深层的调试核对，不属于当前性能主线。
+    # - 它会额外触发 Triton refill / compare，因此很容易把“主线已经完成”
+    #   和“调试校验还在跑”混在一起，造成看起来像是 persistent poll 卡住。
+    # - 默认关闭，避免误把调试验证当成主路径的一部分。
+    #
+    # 真要排查 runtime one-copy 数据面时，需要显式同时打开：
+    #   VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE=1
+    #   VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_ALLOW_LIVE_REFILL=1
+    "VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_ALLOW_LIVE_REFILL":
+    lambda: bool(
+        int(
+            os.getenv(
+                "VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_ALLOW_LIVE_REFILL",
+                "0",
+            ))),
+
+    # runtime direct placement 写后校验默认只做“快速定责版”：
+    #
+    # - 只验前 N 个 consumable chunk
+    # - 只验前 M 层
+    #
+    # 这样可以先快速回答最关键的问题：
+    #   现在到底是写端已经错了，还是 packed 读端解释错了？
+    #
+    # 默认值都设为 1，避免在 persistent service 常驻时，调试校验本身因为
+    # 规模过大而重新把 GPU 长时间拖住。若确实需要扩大覆盖面，再显式覆盖。
+    "VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_MAX_CHUNKS":
+    lambda: max(
+        1,
+        int(
+            os.getenv(
+                "VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_MAX_CHUNKS",
+                "1",
+            ))),
+
+    "VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_MAX_LAYERS":
+    lambda: max(
+        1,
+        int(
+            os.getenv(
+                "VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_MAX_LAYERS",
+                "1",
+            ))),
+
+    # 为了避免 verify 本身因为整块 CPU 回读而再次把 persistent service 的
+    # 现象搅乱，默认只抽很小的一段 packed 数据做样本核对：
+    #
+    # - 前 N 个 token（默认 2）
+    # - 每个 token 只看第一个 KV head
+    # - 每个 head 只看前 M 个 dim（默认 8）
+    #
+    # 这足以快速判断“最终 paged KV cache 是否明显写错”，同时又不会把
+    # 调试支线本身做得过重。
+    "VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_SAMPLE_TOKENS":
+    lambda: max(
+        1,
+        int(
+            os.getenv(
+                "VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_SAMPLE_TOKENS",
+                "2",
+            ))),
+
+    "VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_SAMPLE_DIMS":
+    lambda: max(
+        1,
+        int(
+            os.getenv(
+                "VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_SAMPLE_DIMS",
+                "8",
+            ))),
+
+    # 如需更重的“整块 packed tensor 精确对比”，再显式打开这项开关。
+    #
+    # 默认关闭，避免 verify 自己把正式主链再次拖进大规模 CPU 回读。
+    "VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_FULL_COMPARE":
+    lambda: bool(
+        int(
+            os.getenv(
+                "VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_FULL_COMPARE",
+                "0",
+            ))),
+
+    # official write repair 写后读校验。
+    #
+    # 这条调试支线只回答一个问题：
+    #   已经 materialize 出来的 dense prefix chunk，
+    #   通过 vLLM 官方 `reshape_and_cache` 写进 paged KV cache 后，
+    #   能否按官方 packed ABI 从最终 cache 中读回完全一致的值？
+    #
+    # 它不同于上面的 runtime-write verify：
+    # - 不再诊断旧 runtime packed scatter
+    # - 不再构造 host/oracle 多分支
+    # - 只贴着当前 correctness-first 的 official write repair 做定责
+    #
+    # 默认关闭，避免性能口径里引入额外 D2H 小样本拷贝。
+    "VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE":
+    lambda: bool(
+        int(os.getenv("VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE", "0"))),
+
+    "VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_MAX_CHUNKS":
+    lambda: max(
+        1,
+        int(
+            os.getenv(
+                "VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_MAX_CHUNKS",
+                "4",
+            ))),
+
+    "VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_MAX_LAYERS":
+    lambda: max(
+        1,
+        int(
+            os.getenv(
+                "VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_MAX_LAYERS",
+                "1",
+            ))),
+
+    "VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_SAMPLE_TOKENS":
+    lambda: max(
+        1,
+        int(
+            os.getenv(
+                "VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_SAMPLE_TOKENS",
+                "8",
+            ))),
+
+    "VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_SAMPLE_HEADS":
+    lambda: max(
+        1,
+        int(
+            os.getenv(
+                "VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_SAMPLE_HEADS",
+                "2",
+            ))),
+
+    "VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_SAMPLE_DIMS":
+    lambda: max(
+        1,
+        int(
+            os.getenv(
+                "VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_SAMPLE_DIMS",
+                "8",
+            ))),
+
+    # 是否启用 runtime one-copy 实验主线：
+    #
+    #   BaM cache -> 最终 vLLM paged KV cache
+    #
+    # 这条链路当前仍在低层排查中。为了保证正式主线先稳定跑通，默认先关闭；
+    # 关闭后仍然保留：
+    #
+    # - GPU worker / persistent service 负责后台 poll/read
+    # - 前台只在 pages ready 后发一跳已验证正确的 finalize kernel
+    #
+    # 继续调试一次搬运时，再显式打开：
+    #   VLLM_BAM_DIRECT_PLACEMENT_RUNTIME_ONE_COPY=1
+    "VLLM_BAM_DIRECT_PLACEMENT_RUNTIME_ONE_COPY":
+    lambda: bool(
+        int(os.getenv("VLLM_BAM_DIRECT_PLACEMENT_RUNTIME_ONE_COPY", "0"))),
+
+    # 是否要求当前请求必须严格走 runtime one-copy 主线。
+    #
+    # 打开后，storage 不再允许悄悄回退到：
+    #   results_materialized + host finalize
+    #
+    # 如果 runtime attach 失败，或者 one-copy 总开关没有打开，就应立即报错。
+    # 这个开关主要服务 GPU worker + persistent service 专用启动脚本。
+    "VLLM_BAM_DIRECT_PLACEMENT_REQUIRE_RUNTIME_ONE_COPY":
+    lambda: bool(
+        int(
+            os.getenv(
+                "VLLM_BAM_DIRECT_PLACEMENT_REQUIRE_RUNTIME_ONE_COPY",
+                "0",
+            ))),
+
+    # 是否把 direct placement request handle 上提到 runtime，允许当前
+    # batch 在 retrieve 未 ready 时显式返回 DEFERRED，并在下一轮继续 poll。
+    #
+    # 默认关闭，保持当前稳定的 blocking recv 主线不变。
+    "VLLM_BAM_DIRECT_PLACEMENT_DEFER_RUNTIME":
+    lambda: bool(
+        int(os.getenv("VLLM_BAM_DIRECT_PLACEMENT_DEFER_RUNTIME", "0"))),
+
+    # 运行时验证开关：direct placement request handle 至少要经历多少次
+    # `recv -> poll -> DEFERRED` 轮次之后，才允许 finalize。
     #
     # 语义：
-    # - 0: 关闭 followup wave（默认，保持当前主路径不变）
-    # - N>0: 第一波返回后，再按 chunk 顺序额外执行至多 N 个 followup chunks
+    # - 0: 不强制额外 defer；如果本轮已经 ready，就允许同轮 finalize
+    # - N>0: 至少 defer N 轮后，下一轮才允许 finalize
     #
-    # 注意：
-    # 当前这条真实 store 路径仍然是“同步收口的控制面验证版本”，它的目标是先把
-    # wave 组织、tracker 推进和日志打通，而不是已经实现最终的异步重叠收益。
-    "VLLM_BAM_DIRECT_PLACEMENT_FOLLOWUP_CHUNKS":
-    lambda: int(os.getenv("VLLM_BAM_DIRECT_PLACEMENT_FOLLOWUP_CHUNKS", "0")),
+    # 这个开关主要用于验证“跨 engine iteration 的 live handle”主线是否真的
+    # 跑通，默认关闭，不影响当前正式性能口径。
+    "VLLM_BAM_DIRECT_PLACEMENT_DEFER_MIN_POLLS":
+    lambda: int(
+        os.getenv("VLLM_BAM_DIRECT_PLACEMENT_DEFER_MIN_POLLS", "0")),
 
     # 是否为 xformers prefix fallback 打开细粒度阶段计时。
     # 默认关闭，避免在正常跑分时引入额外 synchronize 干扰口径。
@@ -487,20 +696,87 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: bool(
         int(os.getenv("VLLM_BAM_XFORMERS_PREFIX_FALLBACK_PROFILE", "0"))),
 
-    # 实验开关：
-    # 在 V100/Turing 等 `sm < 80` 且模型本身没有 alibi 时，尝试给
-    # `PagedAttention.forward_prefix()` 注入一组全 0 的 alibi slope，
-    # 借道 `_fwd_kernel_alibi` 这条另一套 Triton kernel。
+    # xFormers prefix fallback 的 prefix KV 读取 backend。
     #
-    # 动机：
-    # 当前已确认真正不稳定的是 no-alibi 那条 prefix kernel。全 0 alibi 在
-    # 语义上等价于“无 alibi”，但会切到不同实现，因此适合作为一个低侵入、
-    # 可随时关闭的局部修复试验入口。
+    # 默认 `auto`：保持当前主线，优先使用 packed_direct_to_workspace。
+    # 调试时可显式设为：
+    # - packed_direct_to_workspace：强制走当前 Triton packed 直读路径
+    # - gather_then_copy：强制走保守的 vLLM gather_cache + copy 路径
     #
-    # 默认保持关闭，避免影响当前已经稳定的 xformers fallback 主线。
-    "VLLM_BAM_TRY_PAGED_PREFIX_ZERO_ALIBI":
+    # 这个开关只用于定位“paged KV cache 写对了但 xformers 读错了”的问题，
+    # 不改变 BaM/GPU worker 的 submit、poll、direct placement 主线。
+    "VLLM_BAM_XFORMERS_PREFIX_BACKEND":
+    lambda: os.getenv("VLLM_BAM_XFORMERS_PREFIX_BACKEND", "auto").strip().lower(),
+
+    # xFormers prefix fallback 的 query KV 写入 backend。
+    #
+    # 默认 `auto`：沿用当前主线，能用 Triton direct scatter 就用。
+    # 调试时可显式设为：
+    # - direct_scatter：强制走当前 Triton query scatter 路径
+    # - segment_copy：强制走保守的逐 segment copy_ 路径
+    #
+    # 这个开关只影响 xFormers fallback 内部如何把“本轮新算出来的 query K/V”
+    # 放入连续 full-KV workspace，不改变 BaM 读、GPU persistent service、
+    # direct placement 或 paged-KV 写入语义。
+    "VLLM_BAM_XFORMERS_QUERY_BACKEND":
+    lambda: os.getenv("VLLM_BAM_XFORMERS_QUERY_BACKEND", "auto").strip().lower(),
+
+    # xFormers prefix fallback 的读端正确性抽样校验。
+    #
+    # 打开后会把 fallback 从 paged KV cache gather 出来的 prefix K/V，
+    # 和 BaM live pages 解码得到的 dense chunk reference 做少量点对点比较。
+    # 它只用于定位“最终输出乱”到底发生在 paged-cache/gather 读端，还是更后面
+    # 的 full workspace / attention bias / xFormers 消费语义；默认关闭，避免
+    # 正式性能实验里引入额外同步。
+    "VLLM_BAM_XFORMERS_VERIFY_PREFIX_GATHER":
     lambda: bool(
-        int(os.getenv("VLLM_BAM_TRY_PAGED_PREFIX_ZERO_ALIBI", "0"))),
+        int(os.getenv("VLLM_BAM_XFORMERS_VERIFY_PREFIX_GATHER", "0"))),
+
+    # xFormers prefix fallback 的最终 attention 输出抽样校验。
+    #
+    # 当 prefix gather 已经确认正确，但模型输出仍然异常时，打开该开关会用
+    # 同一份 query/full_key/full_value 按 bottom-right causal 语义手写少量
+    # PyTorch reference attention，并和 xFormers 输出比对。
+    #
+    # 这能继续把问题切成两段：
+    # - reference 与 xFormers 不一致：查 attention bias / full workspace 语义；
+    # - reference 与 xFormers 一致：查 rebuild 后 query/input position 语义。
+    "VLLM_BAM_XFORMERS_VERIFY_ATTENTION_OUTPUT":
+    lambda: bool(
+        int(os.getenv("VLLM_BAM_XFORMERS_VERIFY_ATTENTION_OUTPUT", "0"))),
+
+    # xFormers prefix fallback 的整层 attention 输出校验。
+    #
+    # `VLLM_BAM_XFORMERS_VERIFY_ATTENTION_OUTPUT` 只做少量 query/head 抽样。
+    # 当抽样通过但模型输出仍然乱码时，需要进一步确认：
+    #
+    #   xFormers 对整层所有 query token / head / dim 的输出
+    #   是否都等于同一份 query/full_key/full_value 上手写的
+    #   bottom-right causal reference。
+    #
+    # 这个校验会构造较大的 fp32 attention scores，开销明显，因此默认关闭，
+    # 并且默认只查第 0 层。若要查全部层，可把 FULL_LAYER 设为 -1，但一般
+    # correctness 定位不建议这么做。
+    "VLLM_BAM_XFORMERS_VERIFY_ATTENTION_OUTPUT_FULL":
+    lambda: bool(
+        int(os.getenv("VLLM_BAM_XFORMERS_VERIFY_ATTENTION_OUTPUT_FULL", "0"))),
+
+    "VLLM_BAM_XFORMERS_VERIFY_ATTENTION_OUTPUT_FULL_LAYER":
+    lambda: int(
+        os.getenv("VLLM_BAM_XFORMERS_VERIFY_ATTENTION_OUTPUT_FULL_LAYER", "0")),
+
+    # 模型输出边界诊断开关。
+    #
+    # 这条开关只做日志，不改计算。打开后会在 model_runner 里打印：
+    # - selected_token_indices / seq_lens / query_lens
+    # - hidden_states 的形状
+    # - 选中 hidden row 的范数
+    # - logits top-k token id/value
+    #
+    # 目标是和 rowctx 正常路径做一一对照，定位问题是否已经发生在
+    # xFormers attention 之后的 logits / sampling 入口。
+    "VLLM_BAM_LOGITS_SEMANTIC_DEBUG":
+    lambda: bool(int(os.getenv("VLLM_BAM_LOGITS_SEMANTIC_DEBUG", "0"))),
 
     # 可选：显式指定 BaM Python 模块搜索路径。
     "VLLM_BAM_IMPORT_PATH":

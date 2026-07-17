@@ -1,2496 +1,3011 @@
 # GPU-initiated BaM 实现思路
 
 日期：2026-06-25
+最近整理：2026-07-17
 
-最近整理：2026-06-30
+本文只保留当前 `vllm-bam` 中与 LMCache / vLLM KVCache 主线直接相关、并且仍有工程价值的实现思路。
+目标不是记录所有历史尝试，而是回答下面四个问题：
 
-本文记录 `vllm-bam` 中 BaM 接入 LMCache/vLLM KVCache 的当前状态、已经跑通的路径，以及后续参考 AGIO / Tutti / TARDIS 推进 GPU-initiated asynchronous I/O 的主线。
-
-这版文档只保留当前仍有工程价值的路线。早期过渡性方案、已经证明不是主线的临时路径，只在“归档/不再推进”中保留结论，避免后续实现时被旧路线干扰。
+```text
+1. 现在到底已经实现到哪里了？
+2. 当前真实跑通的数据通路是什么？
+3. 当前性能瓶颈到底在哪里？
+4. 下一步应该沿哪条主线继续推进？
+```
 
 建议阅读顺序：
 
 ```text
-1. 先看“1. 当前结论”和“1.2 当前最新口径（2026-06-30）”
-2. 再看“3. KVCache 数据组织”和“4. 当前调用流程”
-3. 再看“12.7 当前性能结论”和“12.7.1 当前 direct placement 的实际数据通路”
-4. 最后看“13. 下一阶段改进路线图（2026-06-30）”
+1. 先看“1. 当前主线结论”
+2. 再看“3. 当前真实数据通路”
+3. 再看“4. 当前异步/轮询逻辑到底是什么”
+4. 最后看“8. 下一步主线”
 ```
 
-## 1. 当前结论
+---
 
-当前主线已经从“把 KVCache 当成通用 feature 读写”推进到“KVCache 专用 fast path + executor 分层”。
+## 1. 当前主线结论
 
-已经跑通或验证过的路径：
+截至 2026-07-17，当前主线可以概括成一句话：
 
 ```text
-LMCache 原生 SSD baseline
-LMCache-style GDS replay baseline
-BaM sync 读写路径
-BaM page-level prefetch/refill 路径
-BaM KV fast path replay
-BaM KV fast path batch replay
-真实 vLLM + LMCache + BaM prefer-load + KV fast path
+BaM 读回、direct placement 和现有 attention 消费链路已经基本打通；
+当前开发主线不再只是继续收薄某一个局部数据搬运步骤，
+而是把 completion、frontier 和 request 状态管理继续下沉到
+GPU persistent service。
 ```
 
-当前真实系统分工：
+当前已经明确跑通的真实链路：
 
 ```text
-CPU 控制面:
-  vLLM scheduler
-  LMCache prefix/chunk lookup
-  chunk metadata 管理
-  batch request table 构造
-  当前仍调用 submit / poll / consume
-  Triton refill kernel launch
+request_1:
+  vLLM 正常 prefill
+    -> LMCache chunk 生成
+    -> LMCache shadow write 到 BaM
 
-GPU/BaM 数据面:
-  BaM page read
-  BaM page cache / DMA 数据路径
-  GPU pages buffer
-  GPU-visible request/status tensor
-  Triton refill 数据转换
+request_2:
+  LMCache prefer-load 命中共享 prefix
+    -> BaM direct placement 读回 prefix 对应 chunk
+    -> KV 恢复到 vLLM paged KV cache
+    -> xformers prefix fallback 消费 prefix + query
+    -> request_2 正常继续执行
 ```
 
-当前状态不是最终 GPU-initiated，但已经具备下一步接 GPU worker 的接口基础：
+### 1.0 2026-07-17 三条 KV 链路定版
+
+当前不再把所有实验都继续塞进同一条“fast path”里，而是明确保留三条链路：
 
 ```text
-BaMKVStore
-  -> native_executor
-     -> BaMRowCtxKVExecutor       # 默认，稳定可跑
-     -> BaMGPUWorkerKVExecutor    # 当前主线，底层 worker_backend=kv_cq_service_v1
+1. rowctx_baseline
+   作用：
+     稳定基线、正确性对照、回归兜底
+   数据流：
+     rowctx batch read
+       -> materialized pages
+       -> 已验证正确的 materialized placement
+       -> vLLM paged KV cache
 
-环境变量:
-  VLLM_BAM_KV_EXECUTOR=rowctx
-  VLLM_BAM_KV_EXECUTOR=gpu_worker
+2. gpu_worker_persistent_materialized
+   作用：
+     当前输出正确的 fast 路径，也是默认性能/回归口径
+   数据流：
+     gpu_worker submit
+       -> GPU persistent service 轮询/推进 read/stage
+       -> cleanup 后停止 idle service
+       -> host materialized finalize
+       -> vLLM paged KV cache
+
+3. gpu_worker_persistent_one_copy
+   作用：
+     最激进 one-copy 实验线，保留用于继续推进最终 GPU-resident 数据面。
+     当前它不是默认正确性口径，仍可能带 correctness repair / verify。
+   目标数据流：
+     gpu_worker submit
+       -> GPU persistent service 轮询/推进 read/stage
+       -> GPU persistent service 直接写最终 vLLM paged KV cache
+       -> host 只做 cleanup-only finalize
 ```
 
-一句话主线：
+最新端到端正确输出对应日志：
 
 ```text
-不要继续在 Python early-prefetch 上堆复杂度；
-保留现有 rowctx 稳定路径；
-让 gpu_worker 从 fallback 变成真实 KV worker 入口；
-再把 submit / poll / completion / refill 逐步下沉到 GPU；
-最终减少 LMCache tensor 中转，直接回填 vLLM paged KV cache。
+evaluation/logs/single_gpu_lmcache_no_prefix_reuse_qwen25/20260717_001108/run.log
 ```
 
-### 1.2 当前最新口径（2026-06-30）
-
-如果只看当前最重要的工程结论，可以先记住下面这组口径：
+这次日志里需要固定看的判断点：
 
 ```text
-1. 当前版本已经真实跑到我们实现的 direct placement / merged refill 逻辑。
-
-2. 之前 direct placement 失败的一个直接原因是：
-   BaM cache 默认只有 64MB，
-   在 4 chunk / 448 pages 的真实 batch read 下太小，
-   会触发 submit_error_code=1:
-     BAM_SUBMIT_ERR_FIND_SLOT_TIMEOUT
-
-3. 把 BaM cache 默认调到 512MB 后，
-   submit 路径已经稳定穿过，
-   能完整走到：
-     PREFIX_HIT
-     READ_BEGIN
-     MERGED_REFILL_STEP
-     DIRECT_PLACEMENT
-
-4. merged refill 的真正热点不是“4 个 step 都慢”，
-   而是首个 step 的一次性 Triton/JIT 初始化成本。
-
-5. 给 merged refill 补 warmup 后，
-   当前 steady-state placement 已经降到：
-     read_ms    ≈ 12.603
-     refill_ms  ≈ 1.021
-     transfer_ms≈ 0.769
-     place_ms   ≈ 1.790
-     request_2_elapsed_s ≈ 2.0111
-
-6. 因此当前 direct placement v0 的主要结论是：
-   placement/refill 这段已经基本打通，
-   后续瓶颈不再主要在 merged refill，
-   而应更多转向 read 侧、rebuild/prefix 侧，以及
-   “BaM pages -> final vLLM KV cache” 的进一步收缩。
+VLLM_BAM_KV_EXECUTOR=gpu_worker
+GIDS_KV_GPU_WORKER_RUNTIME_ENABLE=1
+GIDS_KV_GPU_WORKER_PERSISTENT_ENABLE=1
+VLLM_BAM_DIRECT_PLACEMENT_RUNTIME_ONE_COPY=0
+worker_backend=kv_persistent_service_v0
+BAM_KV_GPU_WORKER_CLEANUP_ONLY_DONE
+LMCACHE_BAM_RUNTIME_IDLE_STOP source=materialized_finalize active_count=0 stopped=true
+impl=lmcache fused_ms=0.000
 ```
 
-### 1.2.1 当前 wave 收口方式（2026-07-04）
-
-direct placement 这条线最近又往 GPU-initiated 主线收了一步，重点不是改数据格式，而是先把“等待边界”收紧：
+因此，当前正确 fast 路径不是退回 LMCache 原始路径，也不是 one-copy 已经完成，
+而是：
 
 ```text
-旧逻辑：
-  start_batch()
-    -> execution.wait()
-    -> torch.cuda.synchronize(device)
-    -> 整个 wave 结束
-
-新逻辑：
-  start_batch()
-    -> execution.advance_ready()
-    -> execution.wait_until_launched_range_cache_ready()
-    -> 只轮询当前 wave 自己的 completion events
-    -> 当前 wave 结束
+GPU 后台负责 poll/read/stage
+host 只在 service 空闲后执行已验证正确的 materialized placement
 ```
 
-这一步的意义：
+代码里对应的命名已经收束为：
 
 ```text
-1. 不再用整卡 synchronize 把本 wave 之外的 CUDA 工作一起卡住
-2. execution 层已经显式具备两类等待语义：
-   - wait_until_launched_range_cache_ready()
-   - wait_until_contiguous_cache_ready(target_chunks)
-3. store 层仍然保持“本请求内同步收口”，因此当前主线不会引入
-   “返回后后台继续改写同一份 kv_cache” 的竞态
-4. 但后续如果要继续推进真正的 chunk-ready -> chunk-consumable，
-   可以直接复用这层 execution 接口，而不必重新拆 direct placement 主流程
+pipeline=rowctx_baseline
+pipeline=gpu_worker_persistent_materialized
+pipeline=gpu_worker_persistent_one_copy
+```
+
+后续判断“跑的是哪条链路”，优先看日志：
+
+```text
+[LMCACHE_BAM_DIRECT_PLACEMENT_PIPELINE] pipeline=...
+[LMCACHE_BAM_DIRECT_PLACEMENT_READ] ... pipeline=... finalize_mode=...
+[LMCACHE_BAM_DIRECT_PLACEMENT] ... pipeline=...
+```
+
+当前代码也按这个口径做了函数级收束：
+
+```text
+start / poll / finalize 对外入口仍保持稳定：
+  start_direct_placement_request()
+  poll_direct_placement_request()
+  finalize_direct_placement_request()
+
+read 收口阶段拆成两条：
+  _consume_materialized_read_request()
+    服务：
+      rowctx_baseline
+      gpu_worker_persistent_materialized
+
+  _finalize_one_copy_read_request()
+    服务：
+      gpu_worker_persistent_one_copy
+
+写端 finalize 阶段拆成两条：
+  _finalize_materialized_pipeline()
+    服务：
+      rowctx_baseline
+      gpu_worker_persistent_materialized
+
+  _finalize_persistent_one_copy_pipeline()
+    服务：
+      gpu_worker_persistent_one_copy
+```
+
+这次收束后的约束是：
+
+```text
+1. one-copy 的 cleanup / verify / dense workspace 准备
+   不再和 materialized pages consume 混在一个大函数里。
+
+2. materialized 路径只负责：
+   consume pages
+   materialized placement
+   不再理解 one-copy 的 runtime attachment 细节。
+
+3. one-copy 路径只负责：
+   cleanup-only finalize
+   optional correctness repair / verify
+   不再回退到 host materialized consume。
+
+4. 外部判断链路时看 pipeline 名称，
+   内部 finalize mode 只作为局部实现细节保留。
+```
+
+这里要特别强调：
+
+```text
+results_materialized 只是内部 finalize mode，
+不是“旧回退路径”的同义词。
+
+它同时承载：
+  rowctx_baseline
+  gpu_worker_persistent_materialized
+
+真正区分三条链路时看 pipeline 名称。
+```
+
+### 1.2 2026-07-15 分支收束结果
+
+这一轮的重点不是继续堆新功能，而是先把 kvcache 主线收束干净。
+
+当前代码组织明确收成三层：
+
+```text
+1. storage / kv fast path
+   负责：
+   - chunk -> page 请求翻译
+   - start / poll / finalize
+   - runtime direct placement 与 results materialized 两条 finalize 主线
+
+2. adapter / rebuild
+   负责：
+   - 何时走 BaM direct retrieve
+   - 根据 ret_mask 重建当前 request 的 model input
+   - 发布 request authoritative ready 语义
+
+3. attention consume
+   负责：
+   - prefix 恢复后的最终消费
+   - 当前 V100 主线统一走 xformers prefix fallback
+```
+
+这轮明确收掉了几类已经没有工程价值的残留：
+
+```text
+1. xformers 里的 zero-alibi prefix kernel 实验线
+   这条路径在当前 V100 主线已确认无效，只会增加入口分叉。
+
+2. adapter 里“看起来像会直接消费 runtime attachment 大 tensor，
+   实际固定回落到本地 rebuild”的布尔分支
+   现在显式写成：authoritative ready 语义保留，
+   slot_mapping / block_table 仍统一走本地薄重建。
+
+3. manager 层对外暴露、但当前主线完全没有调用的 frontier 查询接口
+   当前权威 ready 观察口已经收敛到 poll()；
+   frontier/get_frontier 不再作为上层主线接口继续保留。
+
+4. 启动脚本里会反向覆盖代码主线推导的冗余开关
+   尤其是 runtime metadata attachment，不再由脚本默认硬压成 0，
+   而是交给代码侧按 one-copy 主线自动推导。
+```
+
+因此，当前真正保留下来的“有语义差异的主分支”只剩三组：
+
+```text
+1. retrieve 入口
+   - request-handle direct retrieve
+   - legacy direct retrieve（仅作为兼容回退）
+
+2. finalize 路径
+   - runtime_direct
+   - results_materialized
+
+3. attention consume 路径
+   - 当前主线：xformers prefix fallback
+   - 后续待新增：显式的 dense consume backend
+```
+
+这一步的意义不是“已经完成终局实现”，而是把后续要推进的主线先整理成：
+
+```text
+retrieve / poll / finalize
+  与
+consume backend
+
+明确解耦
+```
+
+后面如果继续推进新的 dense consume backend，或者继续把控制面下沉到 GPU
+persistent service，就不需要再绕过一堆历史实验小分支。
+
+### 1.1 2026-07-14 最新状态更新
+
+这一轮需要单独写清楚，因为它解决的是“卡死/跑不完”的问题，
+但还没有解决“数据完全正确”的问题。
+
+当前最新结论可以概括为：
+
+```text
+1. direct placement + persistent service 这条主线已经能完整跑完 request_2。
+2. 最近一次卡死的根因已经进一步收敛，不是在 poll 本身。
+3. 当前能跑通，靠的是一个兼容性修复；这不是最终架构终点。
+4. 数据正确性仍然没有完全通过，request_2 输出仍然出现明显损坏。
+```
+
+最新成功跑完的日志：
+
+```text
+evaluation/logs/single_gpu_lmcache_no_prefix_reuse_qwen25/20260714_002105/run.log
+```
+
+这轮日志里最关键的判断点有三个：
+
+```text
+1. direct placement 已经完成 submit/read/retrieve 主线，没有再次卡死在 persistent poll。
+2. 日志出现：
+     stage=single_seq_runtime_metadata_fast_path_idle_stop stopped=true
+   说明在进入旧 rebuild 兼容路径前，已经先把空闲 runtime service 停掉。
+3. 日志出现：
+     LMCACHE_REBUILD_SEMANTICS rebuilt_context_tokens=1024 expected_context_tokens=1024
+   说明“重建出来的上下文 token 数”在控制面语义上已经对齐。
+```
+
+这轮卡死根因的最新判断是：
+
+```text
+不是 BaM poll 卡住；
+不是 direct placement read 没完成；
+也不是新的 single-seq metadata fast path 自己死锁。
+
+真正的问题是：
+  当 attachment 还不具备 authoritative 语义时，
+  链路会回退到旧的 rebuild 路径；
+  而旧 rebuild 路径与仍在运行的 persistent service 存在执行冲突，
+  从而表现成“看起来像是卡在 direct retrieve 后半段”。
+```
+
+因此，这一轮实际落地的是一个“窄兼容修复”：
+
+```text
+当 single-seq runtime metadata fast path 发现 attachment 还不能 authoritative 返回时，
+先停止 idle 的 runtime service，再进入旧 rebuild。
+```
+
+这一步的意义是：
+
+```text
+1. 先把“跑不完/卡死”的问题从主线上挪开。
+2. 证明当前 persistent KV 主线与旧 rebuild 的冲突点确实在这里。
+3. 给后续继续把 rebuild / metadata 发布彻底收进 GPU runtime 留出空间。
+```
+
+但是，这一轮不能被误判为“正确性已经完成”。
+
+最新日志中的输出对比是：
+
+```text
+20260714_002105:
+  request_1:
+    Qwen2.5-7B-Instruct 是一款基于大规模预训练模型的指令调优语言模型...
+  request_2:
+    Q22-2BInstruct 是一款基于 7B 亿参数训练的模型...
+
+20260712_204826:
+  request_1 == request_2
+  二者都保持正常的 Qwen2.5-7B-Instruct 描述文本
+```
+
+这说明当前状态是：
+
+```text
+1. 链路已经功能性跑通。
+2. request_2 的恢复结果仍然不正确。
+3. 问题更像是“恢复出的 KV 内容或其消费结果不对”，
+   而不是“高层 block table token 数量统计错了”。
+```
+
+从工程判断上，当前应把这轮结果记成：
+
+```text
+功能状态：
+  跑通
+
+正确性状态：
+  未通过
+
+修复性质：
+  兼容性过渡修复，不是最终 GPU-resident 终局实现
+```
+
+2026-07-11 最新一轮已经再次验证：
+
+```text
+1. 走的是 gpu_worker + kv_persistent_service_v0
+2. poll 已经由 GPU persistent service 推到 IO_DONE
+3. consume 已经出现 READ_CONSUME_DONE，不再卡死
+4. direct placement / rebuild / request_2 整条链路已经跑通
+```
+
+这轮日志里最关键的几个判断点是：
+
+```text
+backend=kv_persistent_service_v0
+service_running=True
+READ_CONSUME_BEGIN
+READ_CONSUME_DONE
+worker_backend=kv_persistent_service_v0
+request_2_elapsed_s 正常输出
+```
+
+因此它不是“路径回退后碰巧能跑”，而是同一条 persistent KV 主线已经被修通到：
+
+```text
+submit
+  -> GPU persistent poll
+  -> consume direct cache load
+  -> fused placement
+  -> xformers prefix fallback 消费
+  -> request_2 正常完成
+```
+
+当前需要把“性能判断”和“功能主线”分开理解：
+
+```text
+1. BaM 读回不是当前主瓶颈。
+2. CPU 轮询当前也不是最大的端到端性能热点。
+3. attention consume 侧仍然存在可继续收缩的结构性开销。
+4. 但“CPU poll 不是性能热点”不等于“控制面不需要下沉”。
+5. 当前功能目标已经明确为：
+   GPU 持续维护 CQ completion、request frontier 和生命周期状态；
+   host 只做轻量 submit、非阻塞 observe，以及消费已经完成的数据。
+```
+
+这里再把最终希望收敛到的接口契约明确写死：
+
+```text
+submit(request):
+  CPU/host 准备 request descriptor
+  调用 GPU 侧 submit 入口
+  立即返回 request_handle
+  不阻塞等待 I/O
+
+poll/get_status(request_handle):
+  可以由 CPU 或 GPU 发起
+  只能读取 request/runtime/frontier 状态
+  只能回答“是否 ready / ready 到哪里”
+  不能在检查过程中再触发新的数据搬运
+
+consume/get_ready_view(request_handle):
+  只能取得已经完成写入的数据句柄、view 或可消费范围
+  不能再承担 page read / refill / placement / cache write
+
+GPU persistent service:
+  负责 CQ 轮询
+  负责 completion -> ctx/page/chunk/request 状态推进
+  负责把数据直接搬到 LMCache cache / 最终可消费布局
+  负责发布 consumable frontier
+```
+
+也就是说，最终主线要避免的是：
+
+```text
+CPU poll 一边检查、一边推进状态
+CPU consume 时再补做数据搬运
+finalize 时再重新组织 pages / refill / placement
+```
+
+当前已经具备的基础：
+
+```text
+1. GPU-visible request_table / completion_table / frontier_table
+2. start / poll / finalize 三段式 request-handle 边界
+3. GPU worker runtime slot
+4. persistent service CTA 骨架
+5. queue-level CQ service 和 (queue, cid) -> ctx lookup
+```
+
+本轮还额外做了一次代码收敛，明确把下列偏线实验从 KV 主线里清理掉：
+
+```text
+1. 延后 frontier launch 的实验控制面
+2. frontier chunk limit / followup wave 这类双波 direct placement 运行时分支
+3. poll 侧顺手推进 placement 的混合语义
+4. 仅服务过渡验证、对后续 GPU-resident 主线无帮助的脚本与测试入口
+```
+
+也就是说，当前保留下来的 direct placement 运行时语义已经进一步收口为：
+
+```text
+一次 request
+  -> 一次连续 prefix 命中收集
+  -> 一次 BaM read submit
+  -> poll 只观察 read frontier
+  -> finalize 做一次 placement consume
+  -> ret_mask 返回完整连续可消费前缀
+```
+
+但整条链路还没有达到“GPU 全权状态管理”。当前更准确的职责边界是：
+
+```text
+CPU / host:
+  仍负责 prefix/chunk lookup
+  仍负责 request table / metadata 准备
+  可以轻量发起 submit
+  仍负责高层调度、错误处理和最终 consume 入口
+  persistent 路径下应只读观察 request 是否 ready
+
+GPU / BaM:
+  负责 page read
+  persistent service 已开始负责 queue-level CQ 推进
+  负责 completion -> ctx/page 状态回填
+  负责刷新 GPU-visible runtime slot / frontier
+
+仍需继续下沉：
+  placement / finalize 状态收口
+  cache_ready / consumable frontier
+  ret_mask 对应的连续 prefix 可见性
+```
+
+把“当前已经做到什么”和“还没做到什么”再用一句话写死：
+
+```text
+当前已经做到：
+  GPU 负责主要的 CQ poll、page completion 状态推进，以及实际的数据搬运 kernel
+
+当前还没完全做到：
+  CPU 仍然负责高层 request 调度、submit 触发、阶段 observe，以及在合适时机 launch
+  consume / placement / 后续计算相关 kernel
+```
+
+也就是说，当前形态更准确的表述是：
+
+```text
+GPU 管 poll
+GPU 管底层数据搬运
+CPU 只做轻量控制和阶段切换
+真正把这些数据用于 attention 计算的是后续另一个计算 kernel
+```
+
+从这条契约回看当前代码，真正还没收干净的核心差距只有两点：
+
+```text
+1. submit 仍然没有完全做到“异步立返”
+2. consume/finalize 还没有直接写到最终 LMCache / paged KV 最终布局
+```
+
+补充一条 2026-07-11 已经完成的关键收口：
+
+```text
+KV consume 主线已经不再回退到旧的 registered rowctx get。
+
+现在的语义是：
+  poll:
+    只观察 request/runtime/frontier 是否到达 IO_DONE
+
+  consume:
+    直接根据 submit 阶段展开好的 row_ids
+    从 BaM cache 读到当前 pages staging buffer
+    然后完成 request 生命周期收尾
+
+  persistent service:
+    不再为了 consume 被强制 stop
+    ctx 释放改成 heartbeat 驱动的延迟回收
+```
+
+这意味着当前 KV 主线已经切掉了一层最重的历史兼容堆叠：
+
+```text
+旧路径：
+  poll -> stop persistent service -> old rowctx get -> free ctx
+
+现路径：
+  poll(只读)
+    -> direct cache load
+    -> unregister runtime slot
+    -> 延迟回收 ctx
+```
+
+---
+
+## 2. 当前真正保留的主线路径
+
+### 2.1 写路径
+
+当前写路径已经稳定：
+
+```text
+vLLM / LMCache 产生一个 KV chunk
+  -> 按当前 KV layout 切成固定 128KB page
+  -> shadow write 到 BaM
+  -> 记录 chunk_hash -> BaM page metadata
+```
+
+关键结论：
+
+```text
+写路径现在不是主要问题。
+当前系统的难点已经从“怎么写进去”转移到“怎么更薄地取出来并直接消费”。
+```
+
+### 2.2 读路径
+
+当前主线读路径已经不再依赖 LMCache 原始 disk fallback：
+
+```text
+LMCache prefer-load 命中
+  -> 收集 prefix 对应 chunk_hash
+  -> 走 BaM KV fast path batch read
+  -> direct placement / fused placement
+  -> ret_mask 返回“当前已真正可消费的连续 prefix”
+  -> 上层 attention 消费
+```
+
+### 2.3 当前返回语义
+
+当前 `ret_mask` 的语义已经收口到：
+
+```text
+当前这轮真正恢复完成、并且可以立刻被 attention 消费的连续 prefix。
+```
+
+它不再表示：
+
+```text
+内部 launch 了哪些 chunk
+```
+
+而是表示：
+
+```text
+当前请求真实可用的连续 prefix frontier 到了哪里
+```
+
+这点非常重要，因为它更贴近真实推理引擎的需要。
+
+---
+
+## 3. 当前真实数据通路
+
+### 3.1 KV chunk 与 BaM page 的组织方式
+
+当前主线已经从早期零散布局收敛成固定 page 布局：
+
+```text
+LMCache KV chunk
+  -> 固定切成 128KB BaM page
+  -> 一个满 chunk 对应固定数量的 page
+  -> page metadata 由 chunk_hash 定位
+```
+
+当前典型 Qwen2.5-7B fp16 口径：
+
+```text
+chunk_size_tokens = 256
+page_bytes = 128KB
+pages_per_chunk = 112
+hidden_dim = 512
+num_layers = 28
+```
+
+### 3.2 direct placement 当前在做什么
+
+当前 direct placement 不是“先把 BaM 数据还原成通用 LMCache tensor，再交回上层”，
+而是更接近下面这条线：
+
+```text
+BaM page read
+  -> GPU page buffer
+  -> 根据 plan 组织 prefix 对应 chunk/page
+  -> 直接放置到 vLLM paged KV cache / fallback 消费路径所需目标布局
+```
+
+### 3.3 一个完整例子
+
+以当前单请求共享前缀场景为例：
+
+```text
+request_1:
+  prompt 长度 1261 tokens
+  chunk_size = 256
+  因此会写出：
+    [0,256)
+    [256,512)
+    [512,768)
+    [768,1024)
+    [1024,1261)   # 最后一段不满 chunk
+
+request_2:
+  与 request_1 共享前 1024 tokens
+```
+
+当前主线执行过程：
+
+```text
+1. LMCache connector 识别出：
+     前 4 个 chunk 可复用
+     第 5 段是 miss
+
+2. storage 收集 4 个 prefix chunk 的 metadata
+
+3. BaM KV fast path 发起 batch read：
+     4 chunks
+     448 pages
+
+4. direct placement 把这 4 个 chunk 恢复到 vLLM 所需 KV 目标位置
+
+5. ret_mask 返回：
+     1024 个 prefix token 已可消费
+
+6. 后续 493 个 query token 继续按正常 prefill 流程执行
+```
+
+最终 attention 看到的是：
+
+```text
+context = 1024 recovered prefix tokens
+query   = 493 current request tokens
+total kv len = 1517
+```
+
+---
+
+## 4. 当前异步/轮询逻辑到底是什么
+
+### 4.1 当前同时保留稳定 v1 和 persistent 推进路径
+
+当前主线的本质是：
+
+```text
+BaM 底层 I/O 接口本身是异步能力；
+稳定 v1 路径仍由 host 调用 poll 推进 queue-level CQ service；
+persistent 路径则由常驻 GPU service CTA 持续推进 CQ，
+host poll 开始收缩为只读 runtime slot / frontier 状态。
+```
+
+两条路径当前共享相同的请求返回语义：
+
+```text
+submit 是异步风格
+poll / ready / consume 也是分阶段的
+但当前请求在返回给上层前，
+仍然会等待自己命中的连续 prefix 真正 consumable
+```
+
+因此当前既不能简单描述成“同步 I/O”，也还不能描述成
+“整条链路已经完全 GPU-initiated”：
+
+```text
+native read / CQ completion:
+  persistent 路径已经开始由 GPU 主导
+
+placement / finalize / ret_mask:
+  仍然保留明显的 host 控制面
+```
+
+### 4.2 为什么当前要这样做
+
+原因不是“不会做异步”，而是当前 runtime 契约还不允许太激进：
+
+```text
+如果请求已经把某一批 live handle / live placement 交给后台继续推进，
+而上层又开始进入下一轮调度，
+就会遇到：
+  同一份 kv_cache 目标区域还在被后台写
+  上层已经准备读/写/复用它
+```
+
+这会引入非常危险的竞态。
+
+所以当前主线选择的是：
+
+```text
+先把“当前要返回给推理引擎的连续 prefix frontier”收口好，
+再返回。
+```
+
+### 4.3 当前最值得保留的轮询语义
+
+当前真正保留下来的不是早期那些 per-row / per-page 轮询实验，
+而是下面这层更接近主线的语义：
+
+```text
+execution.advance_ready()
+execution.wait_until_launched_range_cache_ready()
+execution.wait_until_contiguous_cache_ready(target_chunks)
 ```
 
 一句话理解：
 
 ```text
-当前还不是“完全异步返回”，
-但已经从“整卡同步等待”收成了“只等本 wave 的 completion event”，
-这是继续往 GPU-initiated 推进时一个更安全、也更贴近主线的中间态。
+当前已经从“整卡同步”等待
+收成了“只等本请求需要的 cache-ready frontier”。
 ```
 
-2026-07-06 进一步收敛后的当前主线语义：
+这不是最终 GPU-resident runtime，
+但已经是后续继续往 persistent service kernel 推进时一个更健康的中间态。
+
+### 4.4 最新的 poll / consume 边界
+
+persistent 路径最近已经开始把轮询接口收窄成更清晰的职责：
 
 ```text
-当前请求命中了多少连续 prefix
-  -> 先把这段 prefix 长度显式记成 return target
-  -> direct placement 仍然可以有自己的 launch 范围
-  -> 但 store 主路径优先等待：
-       contiguous cache-ready frontier >= return target
-  -> 再生成 ret_mask 返回给 LMCache / vLLM
+poll:
+  只观察 runtime slot / frontier / request status
+  不再负责推进 CQ
+  不再顺手修改 placement front-ready 状态
+
+consume:
+  只消费已经完成的 BaM pages
+  在旧 rowctx 语义仍需要时，
+  保留 consume 前的最小兼容桥接
 ```
 
-这意味着当前主线已经不再优先按“本 wave launch 了多少 chunk”来决定返回时机，
-而是优先按“当前请求准备返回给正常推理引擎多少 prefix”来收口。
-
-对接现成推理框架时，应该把它理解成：
+对应到当前实现方向：
 
 ```text
-ret_mask 语义
-  == 当前这轮真实恢复完成、并且可以立刻被 attention 消费的连续 prefix
+kv_worker_poll_request():
+  persistent 打开时逐步收窄成只读 runtime slot 状态
+
+kv_get_batch_status():
+  优先读取 GPU worker runtime slot 的 request 状态
+
+mark_front_ready():
+  从 poll 热路径移到 consume 前的最小兼容位置
 ```
 
-而不是：
+这一收敛的意义是把原来混在一起的三件事拆开：
 
 ```text
-ret_mask 语义
-  == 这次内部 launch 了哪些 chunk
+旧语义:
+  poll = observe + 推进底层 + 修改可消费状态
+
+目标语义:
+  GPU service = 推进底层和维护状态
+  host poll    = observe
+  consume      = 使用已经完成的数据
 ```
 
-2026-06-28 最新判断：
+### 4.5 当前 consume 的真实语义
+
+当前 `consume` 已经不是“再去等待 IO 完成”，而是：
 
 ```text
-BaM KV I/O 已经不是当前主要瓶颈。
+request 已经到 IO_DONE
+  -> 直接根据 submit 阶段展开好的 row_ids + rowctx
+  -> 从 BaM cache 做一次 direct cache load
+  -> 把数据放到当前 pages staging / placement 输入 buffer
+  -> 然后做 request 生命周期收尾
+```
 
-最新 replay 中：
-  gpu_worker + kv_cq_service_v1:
-    batch_size=8
-    read_ms=1.015
-    total_ms=3.327
-    amortized_ms=0.438/chunk
-    mean_bw_gib_s=31.243
+对应到当前代码，关键位置是：
 
-  rowctx:
-    batch_size=8
-    read_ms=1.321
-    total_ms=4.925
-    amortized_ms=0.653/chunk
-    mean_bw_gib_s=20.938
+```text
+kv_consume_chunk_batch():
+  BaM_IOStack/gids_module/gids_nvme.cu
 
-真实 vLLM 中：
-  batch_size=7
-  read_ms=1.324
-  refill_ms=427.900
-  request_2_elapsed_s=2.0261
+kv_direct_copy_pages_from_cache():
+  BaM_IOStack/gids_module/gids_nvme.cu
+
+read_feature_kernel_get_feature_light_rowctx():
+  BaM_IOStack/gids_module/gids_kernel.cu
+```
+
+它和更早版本的最大区别是：
+
+```text
+旧版本：
+  consume 里还会绕回旧 registered rowctx get 兼容尾巴
+
+当前版本：
+  consume 直接走 post-poll light rowctx load
+  不再重新发 IO
+  不再重新做 page wait
+```
+
+### 4.6 为什么前一版会报错，而最新一版能跑通
+
+前一版报错时，日志表现是：
+
+```text
+poll 已经到 IO_DONE
+但 READ_CONSUME_BEGIN 之后卡住
+最终报 KV_DIRECT_CACHE_LOAD timeout
+```
+
+这说明问题不在：
+
+```text
+submit
+poll
+persistent service 是否启动
+```
+
+而在：
+
+```text
+consume 阶段的 direct cache load 语义
+```
+
+后面之所以能跑通，核心不是“回退到旧路径”，而是 consume 这条线被重新收口成了更干净的语义：
+
+```text
+1. 改成 post-poll light rowctx load
+   不再用会重入 acquire_page()/wait 的通用 read()
+
+2. consume 前先把 request 从 runtime service 观察面摘掉
+   避免后台 persistent service 和前台 consume 同时碰同一批 ctx/page
+
+3. direct cache load、placement、rebuild、request_2 最终都成功收尾
+```
+
+因此当前更准确的判断是：
+
+```text
+不是路径回退
+而是同一条 persistent KV 主线下，
+consume 阶段的语义冲突被收敛后，链路已经跑通
+```
+
+这里还要明确一个容易误解的点：
+
+```text
+xformers prefix fallback 仍然会出现
+```
+
+这不代表：
+
+```text
+退回到了 LMCache disk fallback
+退回到了旧 rowctx blocking 主线
+```
+
+它只是说明：
+
+```text
+BaM direct placement 已经把 prefix KV 恢复好了
+后续 attention 消费当前仍由 xformers fallback 路径执行
+```
+
+---
+
+## 5. 最近一轮 xformers fallback 收缩
+
+这一节是 2026-07-08 最新进展的核心。
+
+### 5.1 为什么现在重点转到 xformers fallback
+
+因为最近几轮 profile 已经反复说明：
+
+```text
+BaM direct placement steady-state:
+  read_ms       ≈ 4~6 ms
+  prepare_ms    ≈ 0.3 ms
+  direct_total  ≈ 6~7 ms
+```
+
+而 request_2 端到端仍然在 1.5s 左右，
+所以当前大头显然不在 BaM 读回。
+
+### 5.2 第一阶段：packed prefix + query direct scatter
+
+这一步已经实现并验证过：
+
+```text
+prefix:
+  packed paged cache -> full workspace
+
+query:
+  contiguous query KV -> direct scatter -> full workspace
+```
+
+对应热路径日志：
+
+```text
+prefix_mode=packed_direct_to_workspace
+query_mode=direct_scatter
+```
+
+这一步的意义：
+
+```text
+1. prefix 不再走老的 cache_view + gather + copy 组合
+2. query 不再走 Python segment copy
+3. 证明“更薄的数据面组织”方向是对的
+```
+
+### 5.3 第二阶段：single-request packed compose
+
+为了继续验证“不要先拆成 prefix gather + query scatter，而是直接按最终消费布局 compose”这条思路，
+又补了一条更专门化的快路径：
+
+```text
+single_request_packed_compose
+  + in_kernel_compose
+```
+
+对应热路径日志：
+
+```text
+prefix_mode=single_request_packed_compose
+query_mode=in_kernel_compose
+```
+
+这条路径当前只在下面口径打开：
+
+```text
+1. 单个 prefill request
+2. prefix 存在
+3. query 存在
+4. packed prefix gather 条件满足
+5. query direct scatter 条件满足
+```
+
+它做的事情是：
+
+```text
+不再分成：
+  prefix kernel
+  query kernel
+
+而是把：
+  prefix KV from packed cache
+  query KV from contiguous tensor
+
+一次性 compose 到最终 full KV buffer
+```
+
+### 5.4 这一步的意义与边界
+
+它的意义是：
+
+```text
+1. 证明“直接按最终消费布局 compose”是可行的
+2. 再把 fallback 数据面收薄一层
+3. 给多请求通用版提供最小可工作的语义骨架
+```
+
+它的边界也很明确：
+
+```text
+1. 目前只覆盖单请求主场景
+2. 不能作为最终面向真实推理引擎 batch prefill 的正式答案
+3. 它的价值主要是验证“按最终消费布局 compose”这条方向成立，
+   并提前把消费侧数据面收紧，为后续 GPU-resident frontier /
+   persistent service kernel 做准备
+```
+
+---
+
+## 6. 最近性能结论
+
+### 6.1 当前主线 steady-state 结论
+
+2026-07-08 最新几轮结论可以概括为：
+
+```text
+1. BaM direct placement 已经很轻。
+2. xformers fallback 已经不是老的 Python copy-heavy 版本。
+3. 单层 fallback 已经被收缩到亚毫秒级。
+4. 端到端 request_2 仍然没有出现数量级改善，
+   说明后续需要继续削减 attention consume 侧的结构性开销。
+```
+
+### 6.2 开启 fallback profile 时的解释方式
+
+最近很多对比都开了：
+
+```text
+VLLM_BAM_XFORMERS_PREFIX_FALLBACK_PROFILE=1
+```
+
+因此要注意：
+
+```text
+profile 会引入 CUDA event + synchronize 开销；
+这类日志更适合看“结构”和“占比”，
+不适合直接作为最终吞吐口径。
+```
+
+### 6.3 2026-07-08 最新结构性判断
+
+最新两阶段 profile 的含义如下：
+
+第一阶段：
+
+```text
+prefix_mode=packed_direct_to_workspace
+query_mode=direct_scatter
+```
 
 结论：
-  kv_cq_service_v1/gpu_worker 已经优于 rowctx。
-  后续不应继续死扣 SQ/CQ 的小优化。
-  主线应转向减少 refill/rebuild：让 BaM 读出的 KV 直接落到 vLLM paged KV cache。
-```
-
-### 1.1 当前 baseline 固化
-
-2026-06-28 当前应固化的 replay baseline：
 
 ```text
-backend=bam_kv_fast_path_batch
-VLLM_BAM_KV_EXECUTOR=gpu_worker
-worker_backend=rowctx_compat  # 该 baseline 跑于 kv_cq_service_v1 接入前
-NUM_CHUNKS=8
-shape=[2, 28, 256, 512]
-page_bytes=128KB
-pages_per_chunk=112
+query scatter 已经跑到真实热路径；
+但它不是最终最大头。
 ```
 
-最新稳定结果：
+第二阶段：
 
 ```text
-batch_size=8
-submit_ms=0.217
-poll_ms=0.238
-get_ms=0.571
-read_ms=1.117
-refill_ms=1.011
-total_ms=2.901
-bw_gib_s=37.702
-
-amortized read:
-  0.382 ms/chunk
-  35.772 GiB/s
-```
-
-这组结果对应日志：
-
-```text
-evaluation/logs/bam_vs_gds_trace_replay/20260628_042744/run.log
-```
-
-2026-06-28 `kv_cq_service_v1` replay 验证结果：
-
-```text
-backend=bam_kv_fast_path_batch
-VLLM_BAM_KV_EXECUTOR=gpu_worker
-worker_backend=kv_cq_service_v1
-NUM_CHUNKS=8
-shape=[2, 28, 256, 512]
-
-batch_size=8
-submit_ms=0.211
-poll_ms=0.081
-get_ms=0.555
-read_ms=0.856
-refill_ms=0.953
-total_ms=2.459
-bw_gib_s=44.483
-
-amortized read:
-  0.324 ms/chunk
-  42.259 GiB/s
-```
-
-对应日志：
-
-```text
-evaluation/logs/bam_vs_gds_trace_replay/20260628_044913/run.log
+prefix_mode=single_request_packed_compose
+query_mode=in_kernel_compose
 ```
 
 结论：
 
 ```text
-kv_cq_service_v1 已接通 replay。
-worker_backend 已从 rowctx_compat 变成 kv_cq_service_v1。
-默认性能路径不读回 GPU debug table，因此 chunk_gpu_status/completion_status 为 none。
-正确性无报错，性能未回退。
+单层 fallback 又薄了一点；
+但收益是“继续收缩”，不是“根本改观”。
 ```
 
-2026-06-28 真实 vLLM + LMCache prefer-load 验证结果：
+因此当前最重要的性能结论是：
 
 ```text
-日志:
-  evaluation/logs/single_gpu_lmcache_no_prefix_reuse_qwen25/20260628_045413/run.log
-
-配置:
-  VLLM_BAM_LMCACHE_SHADOW_ENABLE=1
-  VLLM_BAM_LMCACHE_PREFER_LOAD_ENABLE=1
-  VLLM_BAM_KV_FAST_PATH=1
-  VLLM_BAM_KV_EXECUTOR=gpu_worker
-
-关键路径:
-  [LMCACHE_BAM_KV_FAST_PATH_PREFETCH_ENQUEUE]
-  [LMCACHE_BAM_KV_FAST_PATH_BATCH_READ]
-  executor=gpu_worker worker_backend=kv_cq_service_v1
-  [LMCACHE_BAM_KV_FAST_PATH_BATCH_CONSUME] hit=True
-  [LMCACHE_BAM_VERIFY] exact_equal=True
-  [LMCACHE_BAM] prefer-load hit
-  [LMCACHE_REBUILD]
-  [XFORMERS_PREFIX]
-
-batch read:
-  batch_size=4
-  submit_ms=0.702
-  poll_ms=0.126
-  get_ms=0.412
-  read_ms=1.250
-  refill_ms=462.512
-  total_ms=464.142
-
-端到端:
-  request_1_elapsed_s=1.8031
-  request_2_elapsed_s=2.0717
+当前不该回头再抠 BaM poll，
+也不该继续长时间停留在单请求 / 多请求 compose 这种
+“CPU 仍主导整体运行时契约”的局部收缩上；
+主线应转向 GPU-resident frontier / persistent service kernel。
 ```
+
+### 6.4 性能热点与控制面下沉并不矛盾
+
+当前 profile 说明 BaM I/O 和 host poll 不是最大的耗时项，
+这个结论仍然保留；但它只回答“时间主要花在哪里”，
+不回答“异步生命周期应该由谁管理”。
+
+```text
+性能优化视角:
+  attention consume / fallback 仍有继续收薄空间
+
+系统实现视角:
+  completion / frontier / request state 仍需要迁到 GPU 常驻服务
+```
+
+因此后续不应继续堆叠 host 侧 tracker、wave、mirror 等过渡桥接，
+而应在保留现有可跑数据面的基础上，直接收敛控制面所有权。
+
+---
+
+## 7. 已明确归档、不再作为主线推进的路线
+
+下面这些路线已经有明确结论，不应再回头作为主线：
+
+### 7.1 per-row / per-page 自己 poll completion
 
 结论：
 
 ```text
-真实 vLLM 正式路径已经走到 kv_cq_service_v1。
-BaM KV fast path 的数据正确性通过 exact_equal=True。
-request_2 已经通过 LMCache rebuild / XFormers prefix 路径使用 retrieve 到的 KV。
-当前正式路径里的 462ms refill 仍主要是首次 batch refill/JIT/初始化口径，不代表稳态 BaM IO。
+不是当前主线。
+复杂、脆弱，而且与真实 CQ 使用语义不匹配。
 ```
 
-对比曾经尝试的“CPU poll 默认读取 GPU status / completion table”版本：
-
-```text
-total_ms=4.075
-bw_gib_s=26.839
-```
+### 7.2 CPU 热路径直接频繁读 GPU status/completion table
 
 结论：
 
 ```text
-CPU/Python poll 如果需要立即返回 bool/status，默认不能从 CUDA memory 读
-gpu_status 或 completion_table。
-
-即使只 D2H 读取 4 字节 status，也会同步 GPU 队列，破坏 1ms 级 replay 的
-性能口径。
-
-当前 baseline 固化为：
-  CPU poll hot path 读取 C++ host-side record.status
-  GPU status / chunk status / completion table 继续写入
-  但只作为 debug、日志验证和未来 persistent GPU worker ABI
+会引入额外 D2H / 同步代价，
+破坏毫秒级 replay 与 steady-state 口径。
 ```
 
-当前调试开关：
+### 7.3 回头死抠 V100 上的 PagedAttention.forward_prefix()
+
+结论：
 
 ```text
-VLLM_BAM_KV_DEBUG_STATUS=1
+这条路前面已经尝试过，
+在当前 V100 环境下不稳定，
+不应再作为主线优先项。
 ```
 
-开启后 Python 会读回：
+### 7.4 继续把 KVCache 当成通用 feature row/object 来复用
+
+结论：
 
 ```text
-gpu_status:        [1] int32 CUDA
-gpu_chunk_status:  [batch] int32 CUDA
-completion_table:  [batch, 4] int64 CUDA
+会把 KVCache 路径越做越重；
+当前必须坚持 KV fast path / direct placement 这条专用线。
 ```
 
-该开关只用于定位问题，不应作为默认性能测试口径。
+---
 
-## 2. 三篇论文给出的约束
+## 8. 下一步主线
 
-这次路线调整参考了 AGIO、Tutti、TARDIS 三类思路。它们共同强调：GPU-initiated 不只是“GPU 能发 I/O”，更重要的是 I/O 的异步化和控制面/数据面分离。
+### 8.1 当前为什么要优先转向 GPU-resident frontier
 
-### 2.1 AGIO
-
-AGIO 的核心启发：
+当前更合理的下一步不是先补多请求通用 compose，
+而是优先推进：
 
 ```text
-GPU I/O 要分离 initiation 和 completion。
-GPU 发起 I/O 后不应该原地同步等待。
-如果有计算可以 overlap，就让计算继续跑。
-如果没有足够计算，也可以继续发更多 I/O 来提高并行度。
+GPU-resident frontier
+  + persistent service kernel
 ```
 
-映射到 BaM KVCache：
+原因：
 
 ```text
-错误方向:
-  GPU submit 一个 chunk
-  GPU 原地等这个 chunk 完成
-  完成后再 submit 下一个 chunk
-
-正确方向:
-  GPU 批量 submit 多个 chunk
-  GPU 或 GPU worker 写 completion/status
-  refill 消费 ready chunk
-  submit / complete / refill 尽量流水化
+1. 当前真正限制系统继续往前的，不是 compose helper 还不够通用，
+   而是 runtime 仍然是“CPU 负责收口、CPU 决定何时返回”的形态。
+2. 只要这个契约不改，即使先做出 multi-request compose，
+   整体仍然停留在 CPU 主导 frontier 的中间态。
+3. 当前已经有 enough evidence 说明：
+   BaM I/O 已经通
+   direct placement 已经轻
+   xformers fallback 已经被收薄
+   所以主矛盾已经转向“谁来维护 frontier / consumable state”。
 ```
 
-### 2.2 Tutti
+### 8.2 当前要下沉到 GPU 的到底是什么
 
-Tutti 的核心启发：
+这里所说的 GPU-resident frontier，不是简单指“某个 kernel 在 GPU 上跑”，
+而是指下面这组状态的拥有权开始从 CPU 迁到 GPU 侧：
 
 ```text
-CPU-prepared, GPU-executed。
-CPU 负责 metadata、mapping、request preparation。
-GPU 负责 I/O execution、completion queue、数据搬运。
-SQ/CQ/request table 应该尽量 GPU-visible。
+1. 哪些 chunk/page 已经 launch
+2. 哪些 chunk/page 已经 read-ready
+3. 哪些 chunk 已经 cache-ready
+4. 当前连续 consumable frontier 到了哪里
+5. 是否可以继续触发下一波 launch / placement / consume
 ```
 
-映射到 BaM KVCache：
+也就是说，后续真正要做的不是“把更多 copy kernel 写漂亮”，
+而是把下面这条控制链收进 GPU：
+
+```text
+submit
+  -> completion observe
+  -> ready frontier advance
+  -> cache-ready / consumable frontier advance
+  -> 触发后续 placement / consume
+```
+
+### 8.3 persistent service kernel 的目标语义
+
+当前更贴近主线的理解方式是：
 
 ```text
 CPU:
-  做 prefix/chunk lookup
-  决定本轮要读哪些 chunk
-  生成 request table
-  做粗粒度调度和错误处理
+  仍然准备 request metadata / request table
+  可以轻量发起 submit
+  仍然负责高层调度和错误处理
+  只做非阻塞 observe
+  只消费已经完成的数据
 
-GPU/BaM:
-  consume request table
-  submit BaM/NVMe I/O
-  poll completion
-  写 status/completion
-  refill pages
+GPU persistent service side:
+  持有 outstanding request frontier state
+  持续服务 logical queue 对应的 CQ
+  通过 (queue, cid) 找回 completion 对应的 ctx
+  更新 page / chunk / request 状态
+  推进 chunk_ready -> chunk_consumable
+  维护连续 prefix frontier
 ```
 
-### 2.3 TARDIS
-
-TARDIS 的核心启发：
+一句话说：
 
 ```text
-KVCache 不应该被当成普通文件或任意 feature row。
-KVCache 更像 GPU-centric mapped object。
-读写接口应该围绕 KV chunk / KV block / KV cache layout 设计。
+submit 可以由 GPU 发起，也可以先由 CPU 轻量发起；
+但 completion 轮询、frontier 推进和 request 状态管理，
+应尽量由 GPU persistent service 全权负责。
 ```
 
-映射到 BaM KVCache：
+这里的“全权负责”不要求 CPU 从系统中完全消失。
+CPU 仍可准备 metadata、创建请求和处理异常；
+关键是它不再靠反复调用 poll 来驱动 I/O 生命周期前进。
+
+### 8.4 为什么当前这些 compose 收缩仍然有价值
+
+虽然下一步主线改成了 GPU-resident frontier / persistent service kernel，
+但前面已经做完的这些 `packed gather / direct scatter / single-request compose`
+并没有白做，它们的价值在于：
 
 ```text
-不要把 KVCache 长期硬塞进 read_feature_* 语义。
-保留 GNN/CNN 通用 feature path。
-新增 KVCache 专用 fast path。
-后续直接面向 vLLM paged KV cache 做回填。
+1. 它们把消费侧数据面提前收薄了
+2. 让后续 persistent service kernel 不必一边接 frontier state machine，
+   一边还背着一堆 Python copy / 中间 buffer 组织
+3. 它们证明：
+   “按最终消费布局直接生成/放置 KV”这条方向是成立的
 ```
 
-### 2.4 对当前路线的综合约束
-
-三篇论文合并后，对我们当前工程的要求是：
+所以这些工作现在应该被理解成：
 
 ```text
-1. request table 可以由 CPU 准备，但必须 GPU-visible。
-2. submit 和 completion 必须解耦，不能同步发起后原地等待。
-3. CPU 不应逐 chunk/逐 completion 参与热路径。
-4. KVCache 要走专用 object/chunk path，不继续套通用 feature path。
-5. 最终目标是 GPU worker + completion/status table + fused refill。
+不是下一步主线本身；
+而是 GPU-resident frontier 主线的前置铺路工作。
 ```
 
-### 2.5 对 refill/rebuild 的结论
+### 8.5 这条路线与 AGIO / Tutti / TARDIS 的对应关系
 
-Tutti / TARDIS / AGIO 给出的共同启发不是“把现有 refill kernel 优化一点”，
-而是尽量避免读回后再走通用 rebuild/refill。
-
-```text
-当前 vLLM-BaM 正式路径:
-  SSD
-    -> BaM 128KB pages
-    -> 中间 tensor [2, layers, tokens, hidden]
-    -> Triton refill
-    -> vLLM paged KV cache
-    -> LMCache rebuild / XFormers prefix
-
-目标路径:
-  SSD
-    -> BaM KV pages
-    -> vLLM paged KV cache 目标 block
-    -> attention 直接使用
-```
-
-论文思路映射：
+当前主线与三篇论文给出的约束是一致的：
 
 ```text
-TARDIS:
-  KVCache 更像 GPU-centric mapped object。
-  关键是让存储对象和 GPU 侧 KV 对象直接对应，减少 CPU/框架级 rebuild。
+AGIO:
+  initiation / completion 解耦
+  不再把 I/O 当同步函数用到底
 
 Tutti:
-  GPU-native KV object store + layer-wise I/O pipeline。
-  关键不是 SSD 带宽本身，而是减少 CPU-centric I/O 发起、细粒度同步、
-  以及恢复后重新接回框架的开销。
+  CPU 准备 metadata
+  GPU 消费 GPU-visible request/state
 
-AGIO:
-  initiation 和 completion 解耦。
-  I/O 完成后应被后续 GPU 数据路径消费，而不是让 CPU 在每个阶段同步推进。
+TARDIS:
+  KVCache 走专用对象路径
+  不再长期复用通用 feature 语义
 ```
 
-因此，下一阶段主线是：
+一句话总结接下来的工程方向：
 
 ```text
-不要继续把 BaM 读出的 pages 还原成 LMCache 通用 tensor 后再 rebuild。
-先做 direct placement：
-  BaM pages -> GPU scatter/direct placement -> vLLM paged KV cache blocks。
-
-再做 layer-wise pipeline：
-  layer i 计算时预取 / 放置 layer i+1 或后续 layer 的 KV。
-
-最后再做 persistent GPU worker：
-  GPU 侧 submit / poll / completion / placement 形成闭环。
+先利用现有已收薄的数据面，
+把 frontier / completion / consumable state machine 下沉到 GPU；
+再在 persistent service kernel 稳定后，
+根据需要补多请求通用 compose / 更通用的消费组织方式。
 ```
 
-## 3. KVCache 数据组织
+### 8.6 2026-07-08 当前已落地的最小 frontier ABI
 
-当前 vLLM-BaM 路径把 LMCache 的一个 KV chunk 组织成固定 128KB BaM page。
-
-典型 Qwen2.5-7B fp16 chunk 形状：
+在真正写 persistent service kernel 之前，已经先把一层更稳的 request 级 ABI
+接到了现有 KV 路径上：
 
 ```text
-[2, 28, actual_tokens, 512]
+request_table
+  + gpu_status
+  + gpu_chunk_status
+  + gpu_completion_table
+  + gpu_frontier_table   <- 新增
 ```
 
-含义：
+其中 `gpu_frontier_table` 当前先固定为 7 列：
 
 ```text
-2              -> K/V
-28             -> layer 数
-actual_tokens  -> 当前 chunk 实际 token 数
-512            -> hidden dim
-dtype          -> float16
+[status,
+ launch_frontier_chunks,
+ read_ready_frontier_chunks,
+ cache_ready_frontier_chunks,
+ consumable_frontier_chunks,
+ total_chunks,
+ error_code]
 ```
 
-写入 BaM 前按固定 slot token 容量组织：
+当前 rowctx_compat 版本还不能稳定提供“逐 chunk completion 到达”的 frontier，
+所以这一版先用保守语义：
 
 ```text
-[2, 28, 256, 512]
+SUBMITTED:
+  launched = total_chunks
+  read_ready/cache_ready/consumable = 0
+
+IO_DONE:
+  launched = total_chunks
+  read_ready = total_chunks
+  cache_ready/consumable = 0
+
+CONSUMED:
+  launched = total_chunks
+  read_ready/cache_ready/consumable = total_chunks
 ```
 
-固定 slot 的原因：
+这样做的价值不是“现在就拿它直接替代上层 direct-placement frontier”，
+而是先把下面这件事固定下来：
 
 ```text
-BaM 侧需要稳定的 chunk -> page 映射。
-真实 token 不足 256 时只在逻辑上 pad。
-metadata 仍记录 actual_tokens。
-读回 refill 时只还原有效 token。
+KV request 有一张稳定的、GPU-visible 的 frontier 状态表
+后续 persistent service kernel 只需要把这张表的更新粒度细化
+而不需要再重新改 Python / pybind / request handle 结构
 ```
 
-128KB page 映射：
+同时，2026-07-08 这一轮又往前推了一步：
 
 ```text
-每个 token 向量大小 = 512 * 2B = 1024B
-每个 128KB page 可容纳 = 128KB / 1024B = 128 tokens
-每层 K 需要 2 个 page
-每层 V 需要 2 个 page
-一个完整 chunk = 2(K/V) * 28(layer) * 2(page/layer) = 112 pages
+frontier_table 不再只是“host 跟着 batch status 手工写”
+而是开始优先由 completion_table 归约得到
 ```
 
-一个满 chunk 的物理组织：
+当前由于 rowctx_compat 仍然是“整批同态 completion”，
+所以表面上看 frontier 结果和之前一致；
+但语义已经更接近后续 persistent service kernel：
 
 ```text
-[112, 128KB]
+future:
+  service kernel 持续更新 completion row
+  frontier reducer 从 completion row 推出 launch/read_ready/cache_ready/consumable
 ```
 
-page id 映射公式：
+也就是说，这一步的价值不在于立刻改变性能，
+而在于把 frontier 的“真数据源”从 host status 继续往 GPU completion 表上收。
+
+### 8.7 最新的主线收敛与代码简化原则
+
+当前复杂度主要来自历史过渡阶段叠加，并不是最终目标本身复杂：
 
 ```text
-bam_page_id =
-    chunk_base_page
-  + kv_id * num_layers * pages_per_kv_layer
-  + layer_id * pages_per_kv_layer
-  + token_page_id
+1. tracker + frontier_table + runtime mirror 多套状态源并存
+2. request / wave / execution 多层对象都承担部分状态推进
+3. native read frontier 与 placement frontier 尚未完全统一
+4. finalize 仍然承担较重的状态收口职责
 ```
 
-例子：
+后续整理应坚持下面的优先级：
 
 ```text
-chunk_base_page = 784
-kv_id = 0                 # K
-layer_id = 3
-token_offset = 150
-page_token_capacity = 128
-token_page_id = 150 // 128 = 1
-
-bam_page_id = 784 + 0 * 28 * 2 + 3 * 2 + 1 = 791
+1. 冻结 completion_table / frontier_table / runtime slot 为主事实源
+2. host tracker 只保留派生视图或兼容用途，不再成为主状态机
+3. persistent GPU service 持续维护 request 生命周期
+4. host 只保留 submit + observe + consume
+5. placement / consumable frontier 再沿同一事实源继续下沉
 ```
 
-当前 K 和 V 没有混在同一个 page 里，而是按如下顺序组织：
+这意味着后续不再优先新增新的 host bridge、mirror 或轮询分支。
+如果旧逻辑只服务已经否掉的 per-row/page poll，或者与 persistent 主线重复，
+应在确认不影响稳定 v1、KVCache 可跑路径以及原有 CNN/GNN 路径后清理。
+
+### 8.8 2026-07-14 当前代码收束判断：哪些必须保留，哪些必须硬切，哪些可以清理
+
+这一节不是泛泛地说“后面再优化”，而是把当前代码里真正影响主线推进的结构问题直接列出来。
+
+先给一句总判断：
 
 ```text
-K all layers/pages
-V all layers/pages
+当前最大的阻碍，不是 BaM CQ 轮询能力不够，也不是 SSD I/O 还没打通，
+而是“一次搬运主线”和“旧的 materialize / host placement / fallback 主线”
+仍然共存在同一套函数内，导致：
+  状态语义混杂
+  回退语义混杂
+  校验语义混杂
+  性能口径混杂
 ```
 
-这套组织简单、稳定，也贴合当前 LMCache chunk layout。后续如果直接回填 vLLM paged KV cache，再评估 K/V interleave 或 layer-wise layout 是否更适合 attention locality。
+因此下一步不应继续在原结构上叠加小补丁，
+而应先做一次明确的“主线收束”。
 
-## 4. 当前调用流程
+#### 8.8.1 必须保留的部分
 
-正式在线路径入口：
+下面这些部分已经是当前主线的稳定地基，不应再回退或重写成旧语义。
+
+1. `request-handle` 三段式边界
+   位置：
+   `vllm/bam/lmcache_bam_storage.py`
+   `start_direct_placement_request()`
+   `poll_direct_placement_request()`
+   `finalize_direct_placement_request()`
+
+   保留原因：
+
+   ```text
+   这是当前把“一站式 blocking retrieve”拆成可继续下沉 runtime 的最小边界。
+   后续不管是 host 同步 finalize，还是 GPU-resident runtime 周期性推进，
+   都应该复用这套 start / poll / finalize 契约。
+   ```
+
+2. `BaMKVRequestTable` 这套 GPU-visible request ABI
+   位置：
+   `BaM_IOStack/gids_module/bam_kv_store.py`
+   `class BaMKVRequestTable`
+
+   保留原因：
+
+   ```text
+   request_table / gpu_status / gpu_chunk_status / gpu_completion_table /
+   gpu_frontier_table / pages
+   已经是当前 KV 主线最清晰的一套共享事实源。
+   后续 persistent service 继续下沉，也应继续围绕这组表推进，
+   不应再重新发明另一套 Python 侧 request 描述结构。
+   ```
+
+3. `gpu_worker + persistent service` 设备侧主循环
+   位置：
+   `BaM_IOStack/gids_module/gids_nvme.cu`
+   `kv_worker_runtime_persistent_service_kernel`
+
+   保留原因：
+
+   ```text
+   当前真正有工程价值的 GPU-resident 主线就在这里：
+     queue-level CQ service
+       -> runtime slot refresh
+       -> direct placement
+       -> metadata fill
+       -> request consume/retire
+   这条路径虽然还不够收干净，但方向本身已经是对的。
+   ```
+
+4. `cleanup-only finalize` 语义
+   位置：
+   `BaM_IOStack/gids_module/bam_kv_store.py`
+   `finalize_runtime_attached_native_batch()`
+
+   保留原因：
+
+   ```text
+   这是“GPU 后台已经搬完数据，host 只做 request 生命周期收尾”的关键契约。
+   后续只应继续把它收薄，不应再回退到 host consume 重新承担数据搬运。
+   ```
+
+5. `poll` 只读化方向
+   位置：
+   `BaM_IOStack/gids_module/bam_row_store.py`
+   `kv_worker_poll()`
+
+   保留原因：
+
+   ```text
+   persistent 打开时，host poll 已经开始收窄成：
+     只看 request status / frontier
+   不再顺手推进旧状态机。
+   这是后续“CPU 只 observe，不再驱动生命周期”的必要方向。
+   ```
+
+6. `slot_mapping + block_table` 的大控制面优先收敛思路
+   位置：
+   `LMCache-v0-torch26/lmcache/integration/vllm/vllm_adapter.py`
+   `_build_single_seq_runtime_metadata_fast_path_*`
+
+   保留原因：
+
+   ```text
+   当前已经验证：
+   真正值得继续往 persistent service / runtime attachment 下沉的是
+     slot_mapping
+     block_table
+   而不是 context_lens/query_start_loc 这类很小的标量控制面。
+   这个优先级判断是对的，应明确保留。
+   ```
+
+#### 8.8.2 必须硬切的部分
+
+这里的“硬切”意思不是立刻删代码，
+而是要在运行模式和控制流上明确切开，避免同一次 request 混用两条主线。
+
+1. `runtime one-copy` 主线与 `host materialize placement` 主线必须分模式
+   位置：
+   `vllm/bam/lmcache_bam_storage.py`
+   `_start_direct_placement_request()`
+   `_finalize_direct_placement_request()`
+
+   当前问题：
+
+   ```text
+   同一个 direct retrieve request 里，
+   可能先按 runtime-direct 的语义 attach/submit，
+   然后又因为某个条件掉回：
+     blocking batch read
+     results materialized
+     host-side placement
+   ```
+
+   需要硬切成：
+
+   ```text
+   模式 A: runtime_one_copy
+     submit -> persistent poll -> cleanup-only finalize
+     不允许再局部回退到 host placement
+
+   模式 B: legacy_materialized
+     submit/read -> materialize pages/results -> host placement
+     不假装自己在跑 one-copy
+   ```
+
+   只有这样，日志、正确性和性能口径才会一致。
+
+2. `attach runtime direct placement 失败` 的处理必须从“局部回退”改成“整条回退”
+   位置：
+   `vllm/bam/lmcache_bam_storage.py`
+   `_try_attach_runtime_direct_placement()`
+   `_finalize_direct_placement_request()`
+
+   当前问题：
+
+   ```text
+   attach 失败后，当前 request 仍可能继续沿同一函数走 host placement 分支。
+   这会让“当前到底是不是 one-copy request”变得不再明确。
+   ```
+
+   需要改成：
+
+   ```text
+   one-copy 模式下：
+     attach 失败 -> 当前 request 整体退出 one-copy
+     由更外层统一决定是否回退到 legacy direct retrieve
+   ```
+
+3. `submit 失败 -> blocking batch read` 只能存在于 legacy 模式
+   位置：
+   `vllm/bam/lmcache_bam_storage.py`
+   `_start_direct_placement_request()`
+
+   当前问题：
+
+   ```text
+   现在 async/native submit 一旦失败，会局部改走 blocking batch read。
+   这在排障期有价值，但在 one-copy 主线中会污染语义：
+   用户以为自己在测 persistent request runtime，
+   实际上中途已经改成 blocking 读。
+   ```
+
+   因此应硬切：
+
+   ```text
+   runtime_one_copy:
+     submit 失败 -> 整体失败/整体回退
+
+   legacy_materialized:
+     才允许 blocking batch read 兜底
+   ```
+
+4. 校验路径必须与主链完全解耦
+   位置：
+   `vllm/bam/lmcache_bam_storage.py`
+   `_verify_runtime_direct_placement_write_against_materialized_chunks()`
+   `BaM_IOStack/gids_module/gids_nvme.cu`
+   `output_pages_mirror_enable`
+
+   当前要求已经明确：
+
+   ```text
+   校验只能复用当前 live request 已有的 pages mirror；
+   不允许再次触发任何额外 BaM 读。
+   ```
+
+   后续还应继续硬切：
+
+   ```text
+   默认性能主线：
+     verify off
+     mirror off
+
+   调试校验主线：
+     verify on
+     mirror on
+     但不改变主 request 的控制流分支
+   ```
+
+5. runtime metadata attachment 必须从“总开关摇摆”变成“只下沉大控制面”
+   位置：
+   `LMCache-v0-torch26/lmcache/integration/vllm/vllm_adapter.py`
+   `_runtime_metadata_attachment_enabled()`
+   `single_seq_runtime_metadata_fast_path`
+
+   当前判断已经很明确：
+
+   ```text
+   全量 metadata attachment 收益不大，风险很高。
+   当前真正值得 authoritative 化的是：
+     slot_mapping
+     block_table
+   ```
+
+   所以后续需要硬切掉“全量 metadata 一起信任”的思路，
+   收成：
+
+   ```text
+   大控制面:
+     继续下沉到 runtime attachment
+
+   小标量控制面:
+     host 侧按最终语义直接构造
+   ```
+
+#### 8.8.3 确认可删除或归档的部分
+
+下面这些部分不是说此刻必须立刻从仓库抹掉，
+而是已经确认不应继续参与 KV 主线判断，后续应尽量隔离或清理。
+
+1. 只服务 `per-row / per-page 自己 poll completion` 的实验逻辑
+   结论：
+
+   ```text
+   已在第 7 节归档，不应再进入当前 KV one-copy 主线。
+   ```
+
+2. `poll` 内顺手推进 placement / tracker 的混合语义
+   位置：
+   `vllm/bam/lmcache_bam_storage.py`
+   `wave/execution.advance_ready()` 一类 host bridge
+
+   结论：
+
+   ```text
+   当前真正的目标是：
+     GPU service 维护状态
+     host poll 只观察状态
+   因此 host poll 不应继续承担 placement frontier 推进职责。
+   ```
+
+3. 只为旧测试桩存在的 `_build_stats()` / 旧签名兼容桥
+   位置：
+   `vllm/bam/lmcache_bam_storage.py`
+   `_wait_direct_placement_wave()` 周围
+
+   结论：
+
+   ```text
+   如果后续不再依赖这些旧测试桩，
+   应逐步收掉 `_build_stats()` fallback 和旧 execution 签名兼容桥，
+   避免 direct placement 主线继续背历史接口。
+   ```
+
+4. 只为旧同步 direct retrieve 保留的一站式 helper 主入口
+   位置：
+   `LMCache-v0-torch26/lmcache/integration/vllm/vllm_adapter.py`
+   `_try_bam_direct_retrieve()`
+   `vllm/bam/lmcache_bam_storage.py`
+   `direct_place_chunks_to_vllm_kvcache()`
+
+   结论：
+
+   ```text
+   当前 request-handle API 已经成熟到足以作为主线。
+   后续应继续把同步 one-shot helper 收缩成薄封装，
+   不再让它重新承担主控制面组织。
+   ```
+
+5. `output_pages_ptr` 作为主数据面 staging 的旧语义
+   位置：
+   `BaM_IOStack/gids_module/include/bam_nvme.h`
+   `BaM_IOStack/gids_module/gids_nvme.cu`
+
+   结论：
+
+   ```text
+   当前 one-copy 主线下，
+   output_pages 只应保留两种用途：
+     非 direct-placement fallback
+     verify-only mirror
+   不应再让它回到“主数据面必经 staging buffer”的地位。
+   ```
+
+#### 8.8.4 代码层面的实际收束顺序
+
+后续真正动代码时，建议按下面顺序收，不要反过来。
+
+第一步，先切模式，不要再混：
 
 ```text
-vllm/distributed/kv_transfer/kv_connector/lmcache_connector.py
+runtime_one_copy
+legacy_materialized
 ```
 
-整体流程：
+具体动作：
 
 ```text
-vLLM scheduler
-  -> LMCacheConnector 查询本次请求可 retrieve 的 prefix/chunk
-  -> LMCache engine retrieve / prefetch
-  -> LMCache storage backend get/put
-  -> vllm/bam/lmcache_bam_storage.py wrapper
-  -> BaM sync / prefetch / KV fast path
+1. `lmcache_bam_storage.py`
+   把 `_finalize_direct_placement_request()` 里的 runtime-direct 分支和
+   host materialize 分支彻底拆成两个 helper
+
+2. `lmcache_bam_storage.py`
+   把 submit-fail blocking fallback 挪出 one-copy 主线
+
+3. adapter 层
+   让 request-handle API 成为默认主入口；
+   legacy direct retrieve 只作为显式回退
 ```
 
-KV fast path 路径：
+第二步，再统一 completion 语义：
 
 ```text
-LMCacheBaMStorageManager.get()
-  -> LMCacheBaMStore.consume_kv_fast_path_tensor()
-  -> LMCacheBaMStore.load_chunk_tensors_kv_fast_path_batch()
-  -> vllm/bam/lmcache_bam_kv_fast_path.py
-  -> BaM_IOStack/gids_module/bam_kv_store.py
-  -> BaM_IOStack/gids_module/bam_row_store.py
-  -> BaM_IOStack/gids_module/gids_nvme.cu
+GPU runtime 发布 authoritative request completion row
+host finalize 只读这一条
 ```
 
-真实 vLLM 中 batch 收集流程：
+具体目标：
 
 ```text
-LMCache engine.prefetch(tokens, mask)
-  -> storage_manager.prefetch(key)
-  -> enqueue_kv_fast_path_prefetch_key()
-  -> 收集本轮可能 retrieve 的 chunk keys
-
-第一次 get(key)
-  -> consume_kv_fast_path_tensor()
-  -> 一次性 batch read pending keys
-  -> 当前 key 命中后回填 LMCache memory_obj
-```
-
-当前仍然由 CPU 做调度决策。GPU-initiated 优化的是 I/O 读取链路本身，不是替代 vLLM scheduler 或 LMCache metadata lookup。
-
-## 5. 已实现路径
-
-### 5.1 BaM sync baseline
-
-用途：
-
-```text
-验证 BaM 作为 SSD KV 后端的最小正确性。
-作为后续 prefetch / KV fast path 的对照。
-```
-
-特点：
-
-```text
-CPU 调用 load_rows()
-一次读取完整 chunk pages
-读后 decode/refill 回 LMCache tensor
-```
-
-### 5.2 Page-level prefetch/refill
-
-核心文件：
-
-```text
-vllm/bam/lmcache_bam_prefetch.py
-vllm/bam/lmcache_bam_refill.py
-vllm/bam/lmcache_bam_storage.py
-```
-
-数据流：
-
-```text
-LMCache chunk_hash
-  -> BaMChunkMetadata
-  -> BaMPageReadPlan(page_ids on GPU)
-  -> BaMPageReadHandle(rowctx request + output pages)
-  -> submit / poll / complete
-  -> [page_count, 128KB] pages
-  -> GPU refill
-  -> [2, num_layers, actual_tokens, hidden]
-```
-
-定位：
-
-```text
-适合作为 correctness scaffold 和对照实验。
-不再作为主线继续增加 Python early-prefetch 复杂度。
-```
-
-### 5.3 KV fast path batch
-
-核心文件：
-
-```text
-BaM_IOStack/gids_module/bam_kv_store.py
-BaM_IOStack/gids_module/bam_row_store.py
-BaM_IOStack/gids_module/gids_nvme.cu
-BaM_IOStack/gids_module/include/bam_nvme.h
-vllm-bam/vllm/bam/lmcache_bam_kv_fast_path.py
-vllm-bam/vllm/bam/lmcache_bam_storage.py
-```
-
-数据流：
-
-```text
-[(chunk_hash, metadata), ...]
-  -> [BaMKVRequest(page_offset, page_count, actual_tokens), ...]
-  -> BaMKVRequestTable [batch, 4] CUDA
-  -> BaMRowCtxKVExecutor
-  -> BaM rowctx batch read
-  -> pages: [batch * 112, 128KB]
-  -> GPU refill
-  -> {chunk_hash: [2, 28, actual_tokens, 512]}
-```
-
-当前 request table：
-
-```text
-request_table: [batch, 4] int64 CUDA
-
-每行:
-  [chunk_id, page_offset, page_count, actual_tokens]
-```
-
-当前 status table：
-
-```text
-gpu_status:       [1] int32 CUDA
-gpu_chunk_status: [batch] int32 CUDA
-
-状态:
-  INIT
-  SUBMITTED
-  IO_DONE
-  CONSUMED
-  ERROR
-```
-
-最新验证中已经出现：
-
-```text
-status=SUBMITTED->IO_DONE->CONSUMED
-gpu_status=SUBMITTED->IO_DONE->CONSUMED
-chunk_gpu_status=8xSUBMITTED->8xIO_DONE->8xCONSUMED
-request_table=gpu
-```
-
-### 5.4 真实 vLLM + KV fast path
-
-启用开关：
-
-```text
-VLLM_BAM_LMCACHE_SHADOW_ENABLE=1
-VLLM_BAM_LMCACHE_PREFER_LOAD_ENABLE=1
-VLLM_BAM_KV_FAST_PATH=1
-```
-
-当前行为：
-
-```text
-prefetch 阶段收集 keys
-get 阶段触发 batch read
-命中后 populate LMCache memory_obj
-开启 verify 时可对比 LMCache 原始数据
-```
-
-已观察到的关键信号：
-
-```text
-[LMCACHE_BAM_KV_FAST_PATH_PREFETCH_ENQUEUE]
-[LMCACHE_BAM_KV_FAST_PATH_BATCH_READ]
-[LMCACHE_BAM_KV_FAST_PATH_BATCH_CONSUME] hit=True
-[LMCACHE_BAM] prefer-load hit
-[LMCACHE_BAM_VERIFY] exact_equal=True
-[LMCACHE_REBUILD]
-[XFORMERS_PREFIX]
-```
-
-结论：
-
-```text
-真实 vLLM 正式路径已经接通。
-当前端到端收益还不稳定，主要因为 CPU 串行控制和首次 Triton JIT 仍在。
-下一步应该推进 GPU worker，而不是继续堆 Python early-prefetch。
-```
-
-## 6. 当前 executor 分层
-
-当前 `bam_kv_store.py` 中已经有两个 executor：
-
-```text
-BaMRowCtxKVExecutor
-  当前默认执行层
-  复用 BaM rowctx submit / poll / consume
-  已验证稳定可跑
-
-BaMGPUWorkerKVExecutor
-  未来 GPU worker 的接口骨架
-  当前安全 fallback 到 BaMRowCtxKVExecutor
-  通过 VLLM_BAM_KV_EXECUTOR=gpu_worker 显式启用
-```
-
-这一步暂时不会带来性能变化。它解决的是代码组织问题：上层 `BaMKVStore` 只依赖统一 executor 接口，后续把 `gpu_worker` 从 fallback 改成真实 GPU worker 时，不需要再改 LMCache/vLLM 调用链。
-
-当前验证口径：
-
-```text
-py_compile 通过
-BaMKVStore / BaMRowCtxKVExecutor / BaMGPUWorkerKVExecutor import 通过
-submit_native_batch / poll_native_batch / wait_native_batch / consume_native_batch 存在
-VLLM_BAM_KV_EXECUTOR=rowctx 可以选择 rowctx executor
-VLLM_BAM_KV_EXECUTOR=gpu_worker 可以选择 gpu_worker executor
-```
-
-## 7. BaM 底层可复用能力
-
-BaM 底层已经有 GPU-side page cache / I/O primitive，不是纯 CPU read。
-
-代表性 device-side 接口在：
-
-```text
-BaM_IOStack/bam/include/page_cache.h
-```
-
-已有能力：
-
-```text
-read()
-read_submit_async()
-read_wait_async()
-read_single_thread_poll()
-read_post_poll_light()
-```
-
-当前 rowctx kernel 位于：
-
-```text
-BaM_IOStack/gids_module/gids_kernel.cu
-```
-
-已有三段式思想：
-
-```text
-submit:
-  read_feature_kernel_submit_async_rowctx()
-  -> ptr.read_submit_async(...)
-
-poll:
-  read_feature_kernel_single_page_single_thread_poll_rowctx()
-
-get:
-  read_feature_kernel_get_feature_light_rowctx()
-  -> ptr.update_page_post_poll_light(...)
-```
-
-这些能力可以继续复用，但 KVCache fast path 不应继续完全套用 `read_feature_*` 的通用 feature 语义。
-
-## 8. GPU worker 设计与实现状态
-
-下一步目标不是“再包装一层 Python”，而是让 `VLLM_BAM_KV_EXECUTOR=gpu_worker` 进入真正的 KV worker 路线。
-
-### 8.1 GPU worker v0
-
-目标：
-
-```text
-让 gpu_worker 不再只是 Python fallback。
-新增独立 KV worker 底层入口。
-第一版内部仍可复用 rowctx primitive。
-外部语义必须是 KV worker。
-```
-
-建议接口：
-
-```text
-kv_worker_submit(request_table, gpu_status, gpu_chunk_status, completion_table)
-kv_worker_poll(handle_or_status)
-kv_worker_consume(handle, pages)
-```
-
-验收标准：
-
-```text
-VLLM_BAM_KV_EXECUTOR=rowctx
-VLLM_BAM_KV_EXECUTOR=gpu_worker
-
-两条路径都能跑通同一个 replay。
-结果一致。
-日志明确显示 executor=rowctx 或 executor=gpu_worker。
-request_table=gpu。
-默认性能路径不读回 GPU status table。
-开启 VLLM_BAM_KV_DEBUG_STATUS=1 时，chunk_gpu_status / completion_table 正常推进。
-```
-
-当前实现状态：
-
-```text
-已完成 C++ KV worker façade：
-  kv_worker_submit_from_table()
-  kv_worker_poll_batch()
-  kv_worker_poll_request(request_id)
-  kv_worker_consume_batch()
-  kv_worker_backend_name()
-
-2026-06-28 已推进到 worker_backend=kv_cq_service_v1。
-
-含义：
-  submit 阶段仍复用稳定的 rowctx request submit。
-  poll 阶段进入 KV worker 专用 CQ service façade。
-  host-side record.status / GPU-visible status / completion_table 由统一 helper 更新。
-  Python/vLLM 接口不变。
-
-这还不是 persistent GPU worker。
-它是把后续要替换的 CQ service 点从通用 rowctx 语义中拆出来。
-```
-
-当前 GPU-visible 表：
-
-```text
-request_table:     [batch, 4] int64 CUDA
-gpu_status:        [1] int32 CUDA
-gpu_chunk_status:  [batch] int32 CUDA
-completion_table:  [batch, 4] int64 CUDA
-
-completion_table 每行:
-  [chunk_id, status, bytes_done, error_code]
-```
-
-2026-06-28 清理：
-
-```text
-BaMKVStore 中 executor 化之前的旧 native helper 已清理。
-当前主线统一为：
-
-BaMKVStore
-  -> BaMRowCtxKVExecutor 或 BaMGPUWorkerKVExecutor
-  -> BaMRowStore.kv_worker_* / kv_submit_*
-  -> C++ kv_cq_service_v1 或未来 persistent GPU worker
-
-新增 request-level poll façade：
-  Python 调 kv_worker_poll_request(request_id)
-  C++ 内部通过 KV worker CQ service 推进一次 request
-  返回 host-side record.status，避免 D2H 同步
-
-2026-06-28 继续推进后的结论：
-  kv_worker_poll_request() 已成为 request-level poll façade。
-  Python 不再依赖 rowctx 返回 ready_id 的细节。
-  默认性能路径返回 C++ host-side record.status。
-  GPU-visible status/completion table 继续写入，但不参与默认 CPU poll。
-
-为什么不在默认 poll 中读取 GPU status/completion table：
-  当前 CPU/Python poll 必须立即返回 bool/status。
-  读取 CUDA memory 中的 gpu_status 或 completion_table 会触发 D2H 同步。
-  即使只有 4 字节，也会让 1ms 级 replay 明显变慢。
-  因此 GPU table 只作为 debug、日志校验和未来 persistent worker ABI。
-
-相关调试开关：
-  Python 层:
-    VLLM_BAM_KV_DEBUG_STATUS=1
-  C++ 层:
-    GIDS_KV_POLL_FROM_GPU_STATUS=1
-    GIDS_KV_REDUCE_COMPLETION_STATUS=1
-
-上述开关只用于验证 GPU table，不应作为默认性能口径。
-```
-
-### 8.2 GPU-visible SQ/CQ
-
-参考 Tutti，下一步要从单纯 status tensor 演进到更明确的 queue/table：
-
-```text
-KV request table / submission queue:
-  chunk_id
-  page_offset
-  page_count
-  actual_tokens
-  output_page_offset
-  flags
-
-KV completion queue:
-  request_id
-  chunk_id
+host 不再自己拼：
   status
-  bytes_done
-  error_code
+  frontier
+  authoritative flag
+  cleanup_only_done
+  metadata_ready_flag
 ```
 
-CPU 只做：
+第三步，再收 metadata 主线：
 
 ```text
-prepare request table
-launch worker / ring doorbell
-粗粒度 query batch status
-error handling
+只继续 authoritative 化：
+  slot_mapping
+  block_table
 ```
 
-GPU worker 做：
+小控制面继续保持：
 
 ```text
-read request table
-submit BaM/NVMe IO
-poll completion
-write CQ/status
+context_lens
+seq_lens
+query_start_loc
+selected_token_indices
 ```
 
-### 8.3 异步化
+由 host 按最终语义轻量构造。
 
-参考 AGIO，关键不是“GPU poll”本身，而是 submit 和 completion 解耦。
-
-目标流水：
+第四步，最后再删兼容桥：
 
 ```text
-batch N:
-  GPU worker submit IO
-
-batch N-1:
-  GPU worker / refill kernel consume ready pages
-
-vLLM 当前计算:
-  尽量与上一批 IO overlap
+1. 删除 one-copy 主线不再触达的 blocking batch fallback
+2. 删除仅服务旧测试桩的 wait/stats 兼容桥
+3. 删除 poll 中仍残留的 host-side ready 推进桥接
+4. 让 output_pages staging 退出 one-copy 正常热路径
 ```
 
-避免的错误形态：
+#### 8.8.5 当前最应该避免的错误推进方式
+
+就当前代码状态来说，真正还差的补齐点其实已经很少，核心只剩下面几项：
 
 ```text
-submit chunk
-wait chunk
-refill chunk
-submit next chunk
+1. runtime_one_copy 和 legacy_materialized 必须继续硬切
+   - runtime mode 不再允许同一次 request 内部偷偷回退到 blocking read
+   - finalize 失败要么显式报错，要么由外层统一决定是否重试/回退
+
+2. GPU persistent service 负责 poll / completion / 数据搬运的主语义要保持单一
+   - host 侧只做轻量 submit、观察 frontier、构造 ret_mask
+   - 不再继续把 host-side placement / ready 推进混进 poll 里
+
+3. return 语义必须继续绑定到连续 consumable prefix
+   - 命中了多少连续 prefix chunk，就只返回这多少连续 prefix chunk
+   - 不能为了图省事把“已命中但尚未 consumable”的 chunk 也暴露出去
+
+4. 旧的 per-row / per-page poll 试验桥、host-side bridge、额外 BaM 读校验
+   都只应保留为归档或 debug，不应继续参与主线判断
 ```
 
-### 8.4 直接回填 vLLM paged KV cache
-
-长期目标：
+后续推进时，应明确避免下面这些“看起来在修 bug，实际上在继续堆叠”的做法：
 
 ```text
-BaM pages
-  -> vLLM paged KV cache blocks
+1. 在同一个 finalize 里继续多加 if/else，把 runtime-direct 和 legacy 分支缝在一起
+2. 在 poll 阶段继续顺手更新更多 host tracker 状态
+3. 为了 debug 再引入新的额外 BaM 读路径
+4. 为了修 metadata 个别字段，再把全量 metadata attachment 打开
+5. 为了暂时跑通，再让 one-copy request 局部掉回 host placement
 ```
 
-当前仍是：
+一句话说：
 
 ```text
-BaM pages
-  -> LMCache tensor
-  -> vLLM 使用
+后续主线不是“继续补桥”，而是“把桥拆掉，让模式和所有权清楚起来”。
 ```
 
-这一步收益大，但会碰 vLLM KV layout 和 attention 路径。建议在 GPU worker + status/completion 稳定后再做。
+---
 
-## 9. 分阶段实施计划（已完成与进行中）
+## 9. 当前一句话总结
 
-阶段 1：KV 专用 batch read microbench。
+如果只记一段话，可以记下面这段：
 
 ```text
-状态：已完成
+当前 vllm-bam 的 BaM KV 路径已经不是“能不能读出来”的问题，
+而是“怎么让 prefix 命中后的 KV 以更薄、更贴近最终 attention 消费的形态被使用”的问题。
 
-输入:
-  N 个 chunk 的 page_offset / page_count / actual_tokens
+最近已经完成：
+  packed prefix direct gather
+  query direct scatter
+  single-request packed compose
 
-输出:
-  [N, 112, 128KB] pages
+这些都证明方向是对的。
+
+但下一步主线不应先停留在“补多请求通用 compose”这种局部收缩上，
+而应直接转向：
+  GPU-resident frontier state machine
+  persistent service kernel
+
+也就是说：
+先把运行时控制平面下沉，
+再根据 persistent 路径的实际需要补更通用的 compose/consume 语义。
 ```
 
-阶段 2：接 Triton refill。
+---
 
-```text
-状态：已完成
+## 10. 当前轮询契约
 
-[N, 112, 128KB] pages
-  -> refill_pages_to_lmcache_tensor()
-  -> [N, 2, layers, tokens, hidden]
-```
+这一章开始不再按时间线堆实验过程，而是只保留当前代码主线真正还在用的契约。
 
-阶段 3：接 LMCache/vLLM。
-
-```text
-状态：已完成第一版
-
-LMCache prefer-load hit
-  -> KV fast path batch read
-  -> consume ready KV
-  -> populate memory_obj
-```
-
-阶段 4：GPU-visible request/status table。
-
-```text
-状态：第一版已完成
-
-request_table: [batch, 4] CUDA
-gpu_status: [1] CUDA
-gpu_chunk_status: [batch] CUDA
-```
-
-阶段 5：executor 分层。
-
-```text
-状态：已完成
-
-BaMRowCtxKVExecutor
-BaMGPUWorkerKVExecutor
-VLLM_BAM_KV_EXECUTOR=rowctx/gpu_worker
-```
-
-阶段 6：真实 GPU worker v0。
-
-```text
-状态：已完成第二版，当前 backend=kv_cq_service_v1
-
-gpu_worker 已走独立 KV worker façade：
-  kv_worker_submit()
-  kv_worker_poll()
-  kv_worker_consume()
-
-kv_cq_service_v1 仍复用稳定的 rowctx 底层 primitive。
-但 poll/service 语义已经从“通用 rowctx ready_id”拆成“KV request lifecycle”。
-
-下一次 replay 验收日志应出现：
-  executor=gpu_worker worker_backend=kv_cq_service_v1
-```
-
-阶段 7：GPU-side completion/poll。
-
-```text
-状态：已完成第一步，待继续下沉
-
-已经替换 C++ kv_worker_poll_batch() 的内部入口：
-  旧: kv_worker_poll_batch() -> kv_try_poll_batch() -> rowctx_compat poll
-  新: kv_worker_poll_batch() -> kv_worker_service_cq_once()
-
-kv_worker_service_cq_once() 当前仍复用：
-  service_registered_completions_burst()
-  registered_request_ready_at()
-  iostack.mark_front_ready()
-
-但状态推进已经统一到：
-  kv_mark_record_status_and_tables()
-
-当前已经新增 kv_worker_poll_request(request_id)，把 Python 对 ready_id/host map
-细节的依赖下沉到 C++。默认 request-level poll 返回 C++ host-side
-record.status，避免 D2H 同步；GPU-visible status/completion table 保留为
-可选验证路径和未来 worker ABI。
-
-下一步继续推进：
-  当前: CPU 调 kv_worker_poll_request()，C++ 内部 KV CQ service 复用 rowctx primitive
-  目标: GPU worker 自己 service CQ 并写 completion_table，CPU 只低频 query
-  再下一步: persistent worker 常驻 GPU，进一步减少 CPU poll 调用频率
-
-短期仍允许 CPU 粗粒度调用 poll。
-目标是让高频 CQ service 和 per-chunk completion 写入在 GPU/底层 worker 内完成。
-```
-
-阶段 8：persistent worker + fused refill。
-
-```text
-状态：后续目标
-
-GPU worker:
-  submit -> poll/CQ -> IO_DONE -> refill -> REFILL_DONE
-```
-
-阶段 9：直接回填 vLLM paged KV cache。
-
-```text
-状态：当前下一阶段主线
-
-减少 LMCache tensor 中转。
-更贴近 TARDIS/Tutti 的 GPU-centric KV cache。
-```
-
-## 9.1 长期路线细化
-
-长期目标不是继续给 Python wrapper 增加逻辑，而是逐步让 GPU worker 接管 I/O
-热路径。当前和目标的区别如下：
-
-```text
-当前：
-  CPU 决定要读哪些 chunk
-  CPU 调 submit / poll / consume
-  C++ rowctx_compat 推进 SQ/CQ
-  GPU 写 pages buffer
-  CPU launch refill
-
-目标：
-  CPU 只做 vLLM/LMCache 控制面和粗粒度错误处理
-  CPU 填 GPU-visible request table
-  GPU worker 读取 request table
-  GPU worker 发起 BaM/NVMe IO
-  GPU worker poll CQ 并写 completion table
-  GPU worker 或 refill kernel 把 ready pages 写入目标 KV buffer
-```
-
-推荐路线已经从“继续优化 CQ service”调整为“direct placement 优先”：
-
-```text
-第一步：Direct Placement v0
-  CPU 仍做 prefix/chunk lookup 和 vLLM block 分配。
-  新增 KVPlacementPlan，描述 chunk pages 应该落到哪些 vLLM KV blocks。
-  BaM 仍批量读 128KB pages。
-  GPU kernel 直接把 pages scatter 到 vLLM paged KV cache 目标 block。
-  保留当前 LMCache tensor refill 作为 fallback。
-
-第二步：BaM KV 专用底层 read interface
-  不再只暴露“读 row 到中间 buffer”。
-  新增 KV request table:
-    request_id
-    ssd_page_offset / page_count
-    dst_ptr 或 placement plan id
-    layer_id / kv_id / token range
-    status
-  第一版仍允许 CPU submit/poll，但 table 必须 GPU-visible。
-
-第三步：Layer-wise pipeline
-  不再以完整 chunk 为唯一恢复单位。
-  layer i attention 计算时，预取或放置 layer i+1 / 后续 layer 的 KV。
-  目标是用 attention compute slack 隐藏 SSD I/O 和 placement 开销。
-
-第四步：Persistent GPU worker
-  GPU 读取 request queue。
-  GPU 发起 BaM/NVMe I/O。
-  GPU poll CQ 并写 completion table。
-  GPU 或后续 kernel 消费 ready pages。
-  CPU 只做 request 级调度、metadata 生成和低频错误处理。
-```
-
-这条路线和 AGIO/Tutti/TARDIS 的对应关系：
-
-```text
-AGIO:
-  submit 和 completion 解耦，避免 GPU/CPU 原地同步等待。
-
-Tutti:
-  CPU-prepared, GPU-executed；CPU 准备 request table，GPU 执行 I/O。
-
-TARDIS:
-  KVCache 作为 GPU-centric object，不继续长期套通用 feature path。
-```
-
-## 10. 当前可跑分支
-
-LMCache 原生 SSD baseline：
-
-```text
-用于确认当前 vLLM + LMCache V0 + SSD baseline。
-```
-
-LMCache-style GDS replay：
-
-```text
-用于与 BaM replay 进行 GDS 风格对比。
-```
-
-BaM sync：
-
-```text
-稳定 baseline，CPU 同步读完整 chunk。
-```
-
-BaM page-level prefetch：
-
-```text
-验证 submit/poll/get/refill 拆分，作为 KV fast path 前置 scaffold。
-```
-
-BaM KV fast path：
-
-```text
-当前主线，已接 replay 和真实 vLLM。
-```
-
-BaM KV fast path batch：
-
-```text
-当前最重要的 microbench 和真实 vLLM batch read 路径。
-```
-
-BaM gpu_worker v0：
-
-```text
-已从 fallback 骨架推进到独立 façade。
-当前底层 worker_backend=kv_cq_service_v1。
-replay 和真实 vLLM 已验证通过。
-当前应作为 direct placement 的底层 I/O 基座。
-```
-
-BaM direct placement：
-
-```text
-下一阶段主线。
-目标是减少 LMCache tensor 中转和 vLLM rebuild/refill 开销。
-第一版先做 GPU scatter 到 vLLM paged KV cache blocks。
-```
-
-## 11. 保留与归档边界
-
-继续保留并推进：
-
-```text
-BaMRowCtxKVExecutor
-BaMGPUWorkerKVExecutor
-BaMKVRequest / BaMKVRequestTable / BaMKVNativeBatchHandle
-vllm/bam/lmcache_bam_kv_fast_path.py
-vllm/bam/lmcache_bam_refill.py
-LMCache-style GDS replay baseline
-```
-
-不再作为主线继续扩展：
-
-```text
-raw slab GDS backend
-bam_cold_write 相关 two-process 临时逻辑
-继续在 Python 层堆复杂 early-prefetch
-vllm-bam 中和 Mooncake 强耦合的引用
-把 GNN/CNN 通用 feature 状态机直接改成 KV 专用状态机
-```
-
-注意：
-
-```text
-BaM_IOStack 中服务 vllm-mooncake 的 Mooncake 适配代码不属于本主线清理范围。
-这里说的是 vllm-bam 主线不要主动依赖 Mooncake。
-```
-
-## 12. 2026-06-30 排障收敛与当前主线
-
-这一轮联调最重要的收敛，不是“某个 timeout 被绕过去了”，而是：
-
-```text
-KV direct placement / KV fast path 的轮询模型已经收敛，
-可跑主线已经明确，
-当前主要瓶颈也已经从 I/O 侧转移到了 placement/refill 侧。
-```
-
-这一节先回答三个问题：
-
-```text
-1. 之前为什么会卡住
-2. 现在真正保留下来的轮询逻辑是什么
-3. 当前跑通后，性能瓶颈到底在哪里
-```
-
-### 12.1 为什么 per-row/page 自己 poll completion 这条路不成立
-
-这轮排障已经确认：
-
-```text
-当前 BaM registered rowctx / KV 路径里，
-CQ completion 的消费职责不能下沉成：
-  每个 row/page 一个线程，
-  自己拿着自己的 (queue, cid) 去 poll / dequeue completion。
-```
-
-更合理、也和现有 BaM SQ/CQ 设计一致的模型是：
-
-```text
-一个 logical queue 对应一个 CQ consumer
-一个线程只服务自己那条 CQ
-completion 先按 queue 维度出队
-再通过 (logical_queue_idx, cid) 找回对应 ctx
-最后把 page/chunk/request 状态向上推进
-```
-
-也就是说，当前系统的正确分层仍然是：
-
-```text
-page 级发起 submit
-queue 级消费 completion
-ctx/page 级回填状态
-request 级聚合 ready
-```
-
-而不是：
-
-```text
-page 级 submit
-page 级 poll
-page 级 dequeue
-```
-
-### 12.2 根本原因是什么
-
-根本原因不是 Python 层 while 死循环，也不是 LMCache fallback 逻辑本身，
-而是 CQ 消费职责放错了层级。
-
-当前稳定逻辑里，completion 的服务方式本质上是：
-
-```text
-service_registered_completions_burst()
-  -> service_registered_cq_window_kernel()
-  -> 1 thread : 1 logical queue
-```
-
-在这条路径中，每条 logical queue 上的线程会串行推进：
-
-```text
-1. 从该 CQ 头部读取 completion
-2. 取出 cid
-3. 用 (logical_queue_idx, cid) 查 ctx_lookup
-4. 找到对应 s_ctx
-5. finalize 这个 page 对应的完成状态
-6. 再由 ready-check 聚合整个 request 是否完成
-```
-
-它的隐含前提是：
-
-```text
-同一条 CQ 的 head/head_mark/doorbell，
-当前实现默认由单个 queue-level consumer 串行推进。
-```
-
-所以之前那条实验路径会卡住，不是因为 GPU 不能并发轮询，而是因为：
-
-```text
-可以 many threads 并发轮询 many queues
-但不应该 many threads 并发消费 one queue
-```
-
-更准确地说：
-
-```text
-允许：
-  1 thread : 1 logical queue
-
-不应做：
-  many threads : 1 logical queue
-```
-
-### 12.3 当前真正保留下来的轮询逻辑
-
-经过这轮清理后，KV 主线里真正保留下来的轮询逻辑已经收敛成：
+当前 KV 主线的轮询模型已经明确收敛成：
 
 ```text
 submit
   -> queue-level CQ service
   -> request-ready 聚合
-  -> consume
+  -> consume / finalize
 ```
 
-执行过程可以按下面四步理解。
-
-第一步，submit：
+它不是早期那种：
 
 ```text
-request_table[num_chunks, 4]
-  -> expand 成 d_row_ids[total_pages]
-  -> rowctx submit
-  -> 每个 page 生成一个 s_ctx
-     其中至少包含：
-       ctx.queue
-       ctx.cid
-       ctx.page_trans
-       ctx.isHit
-```
-
-同时建立 lookup：
-
-```text
-(logical_queue_idx, cid) -> s_ctx*
-```
-
-第二步，poll：
-
-```text
-service_registered_completions_burst()
-  -> service_registered_cq_window_kernel()
-```
-
-这个 kernel 的执行模型固定为：
-
-```text
-1 thread : 1 logical queue
-```
-
-每个线程只负责自己那条 CQ，不会有多个线程同时消费同一条 CQ。
-
-在每条 queue 上，核心动作是：
-
-```text
-cq_try_peek_head()
-  -> 读取当前 CQ head completion
-
-cq_dequeue_head_serial()
-  -> 串行推进 CQ/SQ head/tail/doorbell
-
-put_cid()
-  -> 归还 cid 到 SQ 可复用池
-
-ctx = ctx_lookup[(logical_queue_idx, cid)]
-  -> 找回原来的 page ctx
-
-finalize_registered_ctx_completion()
-  -> finalize 这个 page 对应的完成状态
-```
-
-第三步，ready-check：
-
-```text
-registered_request_ready_at()
-  -> check_registered_request_ready_kernel()
-```
-
-这里已经不再直接碰 CQ，而只是做纯状态聚合：
-
-```text
-如果 ctx 还没 ready
-  -> refresh_registered_ctx_from_valid_page()
-  -> 看底层 page 状态是否已完成
-
-如果还有任意 ctx 没完成
-  -> pending_count += 1
-```
-
-host 侧只看：
-
-```text
-pending_count == 0 -> request ready
-pending_count > 0  -> request not ready
-```
-
-第四步，consume：
-
-```text
-request_status == IO_DONE
-  -> kv_worker_consume_batch()
-  -> 从 BaM page cache 取回 batch pages
-  -> direct placement / refill 回上层 KV cache
-```
-
-所以当前主线已经不是：
-
-```text
-page 自己拿着 ctx.cid 去 poll 自己的 completion
+page 自己轮询自己的 completion
 ```
 
 而是：
 
 ```text
 queue 统一消费 completion
-ctx/page 只是被 completion 回填
+ctx/page/chunk/request 只是被 completion 回填
 ```
 
-### 12.4 blocking poll 和 try-poll 的关系
-
-接口层虽然还保留了两个名字：
+当前真正应该记住的执行边界只有四步：
 
 ```text
-service_registered_poll_compatible()
-service_registered_try_poll()
+1. submit
+   request_table -> row/page request -> ctx 建立
+
+2. service CQ
+   1 thread : 1 logical queue
+   queue 独占消费自己的 CQ
+
+3. ready 聚合
+   只看 request / frontier 是否已经达到当前返回目标
+
+4. finalize / consume
+   把已经 ready 的结果真正收口成上层可见语义
 ```
 
-但底层已经共享同一套轮询模型：
-
-```text
-service_registered_completions_burst()
-+ registered_request_ready_at()
-```
-
-区别只在外层控制语义：
-
-```text
-poll_compatible:
-  while not ready:
-    service CQ
-    check ready
-
-try_poll:
-  只做一轮
-  如果没 ready 就先返回
-```
-
-所以当前“轮询机制”本身已经统一，差别只是：
-
-```text
-阻塞 façade
-vs
-单步 try façade
-```
-
-### 12.5 这条思路会不会引入 CPU 参与
-
-会，但要区分 “CPU 参与控制面” 和 “CPU 参与 CQ completion 消费”。
-
-当前可跑版本里：
-
-```text
-CPU 仍然参与：
-  1. LMCache/vLLM 命中判断和 request_table 生成
-  2. 调 pybind 触发 submit
-  3. 调 pybind 触发 poll
-  4. 低频读取 request_status / host status
-  5. 调 pybind 触发 consume
-```
-
-但 CPU 不再参与：
-
-```text
-1. 不逐 page 等 completion
-2. 不自己消费 CQ
-3. 不做 completion -> ctx 的分发
-4. 不逐 chunk 维护完成状态
-```
-
-所以更准确的说法是：
-
-```text
-这条 per-logical-queue CQ worker 路线不会引入 CPU 参与 CQ 消费本身；
-但在当前 v1 形态里，CPU 仍然是粗粒度控制面。
-```
-
-如果以后推进到 persistent GPU worker，则还可以进一步变成：
+当前 CPU 与 GPU 的职责边界是：
 
 ```text
 CPU:
-  只负责更粗粒度调度和 request 提交
+  prefix/chunk lookup
+  request table / metadata 构造
+  submit
+  poll 返回值观察
+  最终调度
 
 GPU:
-  常驻 worker 自己 service CQ
-  自己写 completion/status table
-  CPU 只在必要时 query 结果
+  queue-level CQ service
+  completion -> ctx/page/chunk/request 状态推进
+  frontier 刷新
+  direct placement / prefix consume backend
 ```
 
-### 12.6 当前可跑主线已经是什么
-
-最新单卡联调日志已经表明，direct placement / KV fast path 的“新主线”已经能完整跑通。
-
-这里的“跑通”具体指：
+稳定 v1 与 persistent 路径的区别，不再是“是否使用不同数据路径”，
+而只是：
 
 ```text
-1. request_2 的 prefix 命中被正确识别
-2. BaM direct placement 真的进入了 batch read
-3. submit / poll / ready / consume 全链路完成
-4. 没有再出现：
-   - REGISTERED_SUBMIT_ROWCTX_SUBMIT_KERNEL timed out
-   - submit_error_code=1
-   - DIRECT_RETRIEVE failed; fall back
+稳定 v1:
+  host poll 仍会间接推进底层 ready 状态
+
+persistent:
+  GPU service CTA 持续推进底层状态
+  host poll 只读 runtime slot / frontier
 ```
 
-当前可跑主线可以概括为：
+---
+
+## 11. 当前 backend 拆分
+
+当前代码已经明确拆成三层 backend 选择。
+
+### 11.1 storage / direct placement finalize backend
+
+在 [lmcache_bam_storage.py](/home/xhk/llm-inference/vllm-bam/vllm/bam/lmcache_bam_storage.py)
+里，`finalize` 不再自己夹杂一串路径判断，而是先确定 `read_finalize_mode`，
+再分发到显式 backend handler：
 
 ```text
-LMCache/vLLM
-  -> direct placement prefix hit
-  -> BaM KV request-table batch submit
-  -> rowctx_compat_blocking
-       （内部已收敛为 queue-level CQ service + ready 聚合）
-  -> 从 BaM page cache 取回 batch pages
-  -> placement / refill 到 vLLM paged KV cache
+runtime_direct
+  -> runtime_direct_cleanup
+
+results_materialized
+  -> materialized_host_finalize
 ```
 
-也就是说：
+两条 backend 的职责很清楚：
 
 ```text
-当前可跑通的不是“旧的 per-row poll 实验路径”，
-而是“保留 rowctx submit primitive，但 poll/ready 已收敛到 queue-level CQ service”
-这条主线。
+runtime_direct_cleanup:
+  GPU 后台已经完成 one-copy
+  前台只做 cleanup、发布 consumable frontier 和返回语义
+
+materialized_host_finalize:
+  前台先 consume 出 materialized 结果
+  再执行 host prepare + placement frontier wave
 ```
 
-本轮推荐保留的成功日志是：
+这样后面如果继续加新的 finalize consume backend，
+只需要补：
 
 ```text
-evaluation/logs/single_gpu_lmcache_no_prefix_reuse_qwen25/20260630_041745/run.log
+1. backend 名字
+2. selector
+3. handler
 ```
 
-### 12.7 当前性能结论：I/O 已通，瓶颈转移到 placement/refill
+而不需要继续把逻辑塞进 `_finalize_direct_placement_request()`。
 
-当前这段排障可以压缩成一条清晰时间线：
+### 11.2 xformers prefix consume backend
+
+在 [xformers.py](/home/xhk/llm-inference/vllm-bam/vllm/attention/backends/xformers.py)
+里，`_run_prefix_attention_fallback()` 现在也已经拆成显式 backend 选择。
+
+当前只保留两层非常窄的 backend：
 
 ```text
-阶段 A：direct placement 跑通，但 placement 很重
-  20260630_041745
-  read_ms   = 11.956
-  refill_ms = 502.319
-  place_ms  = 503.945
-  request_2 = 2.0826
+prefix backend:
+  packed_direct_to_workspace
+  gather_then_copy
 
-阶段 B：引入 merged refill 后，性能明显回退
-  20260630_050817
-  read_ms   = 17.218
-  refill_ms = 820.919
-  place_ms  = 821.662
-  request_2 = 2.4064
-
-阶段 C：逐 step 计时后确认，
-  慢点集中在首个 merged refill step，
-  后续 3 个 step 已是亚毫秒级
-  20260630_165157
-  step0 = 437.792 ms
-  step1 = 0.225 ms
-  step2 = 0.152 ms
-  step3 = 0.125 ms
-  refill_ms = 438.707
-  request_2 = 2.0264
-
-阶段 D：补 merged refill warmup 后，
-  首个 step 的一次性开销被移出热路径
-  20260630_warmup_check
-  step0 = 0.214 ms
-  step1 = 0.152 ms
-  step2 = 0.127 ms
-  step3 = 0.126 ms
-  read_ms   = 12.603
-  refill_ms = 1.021
-  place_ms  = 1.790
-  request_2 = 2.0111
+query backend:
+  direct_scatter
+  segment_copy
 ```
 
-这条时间线对应的结论是：
+对应语义是：
 
 ```text
-1. 当前 direct placement v0 已经真实跑通，不是 fallback 幻觉。
-2. BaM I/O 早就不是主要瓶颈，read_ms 已经稳定在 ~12ms。
-3. merged refill 的 steady-state 本身并不慢。
-4. 之前的性能回退，主因是首个 merged refill step 的一次性 Triton/JIT 初始化成本。
-5. 给 merged refill 补 warmup 后，placement/refill 已经下降到 1~2ms 量级。
+prefix backend:
+  决定 prefix 命中的 paged KV 怎么进入 full workspace
+
+query backend:
+  决定本轮 query KV 怎么进入 full workspace
 ```
 
-对应的工程动作也可以压缩成两步：
+当前主线里不再把 compose 当成 active backend。
+`single_request_packed_compose` 仍保留函数壳和测试口径，
+但主线 selector 不会再把它当成当前 consume 主线的一部分。
+
+### 11.3 adapter 层保留的主分支
+
+在 [vllm_adapter.py](/home/xhk/llm-inference/LMCache-v0-torch26/lmcache/integration/vllm/vllm_adapter.py)
+里，目前只保留两类真正有语义差异的入口：
 
 ```text
-第一步：
-  把 _bam_pages_to_lmcache_kernel_with_token_offset(...)
-  里随 chunk 变化的量：
-    total_elements
-    num_layers
-    actual_tokens
-    total_output_tokens
-    token_offset
-  从 tl.constexpr 改成运行时参数，
-  避免同一批 token_offset=0/256/512/768 触发多份 specialization。
-
-第二步：
-  在 BaMDirectKVPlacer 里新增：
-    _maybe_warmup_merged_refill(plan)
-  用真实 pages / 真实 layout / 真实 token 参数做一次安全预热，
-  把首个 step 的一次性 Triton 初始化成本前移。
+1. request-handle direct retrieve
+2. legacy direct retrieve（兼容回退）
 ```
 
-因此截至当前版本，性能判断应更新为：
+request-handle 主线下，上层已经只把 `poll()` 当成权威 ready 观察口，
+不再继续保留 `get_frontier()` 作为上层对外主接口。
+
+---
+
+## 12. 当前进度与仍未完成的问题
+
+当前已经完成的部分：
 
 ```text
-1. placement/refill 这段已经基本打通。
-2. 当前 direct placement v0 的 steady-state placement 成本已很低。
-3. 后续优化重点不应继续放在 merged refill，
-   而应更多转向：
-     - read_ms ~12ms 是否还能继续压缩
-     - LMCache rebuild / XFORMERS_PREFIX_FALLBACK
-     - 从 merged LMCache tensor 进一步收缩到 final vLLM KV cache
+1. request-handle 生命周期已经拉起：
+   start / poll / finalize
+
+2. direct placement finalize 已拆成显式 backend
+
+3. xformers prefix fallback consume 已拆成显式 backend
+
+4. runtime metadata fast path 当前只承担：
+   request authoritative ready 语义
+   + 本地薄重建入口
+
+5. manager / adapter 中已经清掉一批无效观察接口与实验分支
+
+6. dense_prefix_workspace_consume 已经正式落地：
+   storage/finalize
+     -> 复用 live request pages
+     -> 还原旧两次搬运语义下的 dense chunk tensor
+     -> 挂到单请求 rebuilt attn metadata
+     -> xformers fallback 显式切到 dense consume backend
 ```
 
-这轮结果说明：
+当前仍未完成、但已经被收缩清楚的问题：
 
 ```text
-1. warmup 已经真正生效。
-2. 首个 merged refill step 的一次性开销已被成功移出热路径。
-3. 当前 direct placement v0 的 steady-state placement/refill
-   已经下降到 1~2ms 量级。
-4. 因此当前性能瓶颈已经不再主要在 merged refill，
-   后续应更多关注：
-     - read_ms ~12ms 还能否继续压缩
-     - LMCache rebuild / XFORMERS_PREFIX_FALLBACK
-     - 从 merged LMCache tensor 进一步收缩到 final vLLM KV cache
+1. request-handle / persistent service / consumable 发布主线已经能跑完
+2. BaM read、最终 paged KV 写入、xformers gather、xformers attention
+   都已经通过抽样校验
+3. 当前输出仍然错误，剩余嫌疑已经转到 rebuild 控制面语义
+4. GPU persistent service 后续仍要继续接管更多控制面，
+   但当前 correctness 阻塞点不再优先指向 paged-KV 写端 ABI
 ```
 
-### 12.7.1 当前 direct placement 的实际数据通路
-
-当前版本虽然已经叫 direct placement，但它仍然是一个过渡形态：
+因此当前真正的主线判断应该是：
 
 ```text
-BaM pages
-  -> merged LMCache KV tensor
-  -> one LMCache connector transfer
+retrieve / poll / finalize 主线已经足够清楚；
+真正剩下的问题不再是“poll 会不会卡死”，
+也不再优先是“paged-KV 最后一跳是否写错”；
+下一步重点不该再是补更多小开关，
+而是核对 prefix 命中之后交回 vLLM 的
+input token / position / slot_mapping / sampling metadata 是否仍保持原生语义。
+```
+
+### 12.1 最新正确性收敛结论：paged-KV 写端 ABI 已被抽样校验排除
+
+2026-07-16 这一轮 verify 比前一版更进一步，已经把之前怀疑的
+“flat token-row scatter / paged-KV ABI 写错”从当前主嫌里移开。
+最新日志里同时出现了下面几类证据：
+
+```text
+1. request-handle 主线已正常走到：
+   submit
+   -> persistent poll
+   -> consumable=4/4
+   -> cleanup_only_runtime_direct
+
+2. BaM 写入/读回/live pages 解码正确：
+   LMCACHE_BAM_WRITE_READ_VERIFY_OK
+
+3. runtime direct 最终写入 vLLM paged KV cache 后，
+   按 packed key/value ABI 抽样回读正确：
+   LMCACHE_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_OK
+
+4. xformers fallback 从 paged KV cache gather 出来的 prefix
+   与 dense chunk reference 完全一致：
+   XFORMERS_PREFIX_GATHER_VERIFY_OK
+
+5. xformers attention 输出与同一份 query/full_key/full_value
+   上的 PyTorch reference 一致：
+   XFORMERS_ATTENTION_REF_VERIFY_OK
+```
+
+这说明当前问题已经从：
+
+```text
+“后台轮询有没有跑起来”
+“BaM 数据有没有读错”
+“最终 paged KV 写端 ABI 有没有错”
+“xformers gather / attention 有没有错”
+```
+
+收敛成：
+
+```text
+“prefix 命中后，adapter 重建给 vLLM 的控制面语义是否正确”
+```
+
+更具体地说，当前日志里仍然能看到：
+
+```text
+single_seq_runtime_metadata_fast_path_skip
+reason=runtime_direct_temporarily_bypassed_for_correctness
+```
+
+也就是说，数据面已经走了 `gpu_runtime_direct`，但模型真正继续执行时，
+metadata 仍回到旧的：
+
+```text
+build_partial_prefill_input()
+```
+
+这条路径会重新构造：
+
+```text
+input_tokens
+input_positions
+slot_mapping
+block_tables
+query_start_loc
+context_lens_tensor
+selected_token_indices
+```
+
+现在的下一步应该优先验证：
+
+```text
+1. 已恢复 1024 prefix token 后，
+   suffix query tokens 是否正好是原请求的 [1024, 1517)
+
+2. suffix input_positions 是否仍是 [1024, 1517)
+
+3. slot_mapping 是否对应这些 suffix token 的真实 vLLM slot
+
+4. selected_token_indices 是否指向 rebuild 后最后一个 query token，
+   而不是仍然保留原 full-prefill 的 token index
+
+5. sampling metadata / seq_group 的 query_len 是否与 rebuilt query_len 一致
+```
+
+### 12.2 为什么旧的 paged-KV 写端判断需要修正
+
+前一版判断认为：
+
+```text
+用 flat token-row scatter 的方式
+去写一个真实读侧会按 packed-key ABI 解码的缓存
+```
+
+这个判断在当时是合理的，因为那时只看到输出错误，还没有同时完成：
+
+```text
+最终 paged KV 回读 verify
+xformers gather verify
+xformers attention reference verify
+```
+
+但现在这三层都已经通过抽样校验，所以这个结论要降级为：
+
+```text
+它曾经是一个合理怀疑；
+但按最新证据，它不再是当前乱码输出的第一嫌疑。
+```
+
+### 12.3 当前最可能的问题：rebuild 语义与 vLLM 原生语义错位
+
+当前请求 2 的典型语义是：
+
+```text
+full request tokens: 1517
+prefix hit tokens: 1024
+需要继续 prefill 的 suffix query tokens: 493
+```
+
+因此正确的 rebuild 结果应该是：
+
+```text
+input_tokens:
+  原始 request token[1024:1517]
+
+input_positions:
+  1024, 1025, ..., 1516
+
+context_lens:
+  1024
+
+query_lens:
+  493
+
+seq_lens:
+  1517
+
+selected_token_indices:
+  对单请求采样来说，应落在 rebuilt query 的最后一个 token，
+  即 492，而不是原始 full prefill 的 1516
+```
+
+如果这里任意一项错位，就会出现一种很典型的现象：
+
+```text
+KV 数据本身是对的；
+attention 读到的 prefix 也是对的；
+attention 对当前 query 的计算也是自洽的；
+但模型整体输出仍然乱码。
+```
+
+这说明错误更可能发生在：
+
+```text
+attention 输入之前的 token/position 构造
+或 attention 输出之后的 sampling/index 语义
+```
+
+### 12.4 下一步诊断
+
+下一步不再继续扩大 paged-KV verify，而是在
+`build_partial_prefill_input()` 内补轻量语义日志：
+
+```text
+1. 打印 boundary tokens：
+   full token[1018:1030]
+   rebuilt suffix token 前几个/后几个
+
+2. 比较：
+   full_tokens[num_computed:]
+   与 model_input.input_tokens[start:end]
+
+3. 打印/校验 positions：
+   expected [num_computed, num_token)
+   actual rebuilt input_positions
+
+4. 打印 slot_mapping 前后样本和 block table 形状
+
+5. 打印原始 selected_token_indices 与 rebuilt selected_token_indices
+```
+
+---
+
+## 13. 下一步主线
+
+后面建议只沿下面这条主线继续推进：
+
+### 13.1 当前已经有两条显式 consume backend
+
+当前 consume 侧已经正式拆成：
+
+```text
+paged_kv_consume
+dense_prefix_workspace_consume
+```
+
+当前含义是：
+
+```text
+1. paged_kv_consume
+   继续服务当前真实 vLLM paged-KV 主线
+
+2. dense_prefix_workspace_consume
+   直接消费 live request pages materialize 出来的 dense chunk tensor
+   语义对齐之前已经验证过的两次搬运路径
+
+3. 一旦两者结果不同
+   问题就会被压缩到 paged-KV 写入/解释/消费语义
+
+4. 最新 verify 已经表明：
+   现在真正错的不是 poll / BaM read / paged-KV write / xformers gather，
+   而更像是 prefix hit 后重建给 vLLM 的控制面语义
+```
+
+### 13.2 下一步先把 rebuild 语义核准，再继续下沉 GPU ownership
+
+最终目标仍然是：
+
+```text
+BaM 负责存
+GPU service 负责取 + 放 + 更新状态
+CPU 只负责 submit / observe / 调度
+```
+
+在当前阶段，更具体地说是：
+
+```text
+1. 先核准 build_partial_prefill_input() 的语义：
+   input_tokens / positions / slot_mapping / selected_token_indices
+
+2. 如果 rebuild 语义错：
+   直接修正这条控制面路径，不再继续误查数据面
+
+3. 如果 rebuild 语义也正确：
+   再把比较点前移到每层 attention 输入/输出之后，
+   查当前 query K/V 写入或后续 sampling 语义
+
+4. correctness 稳定后，再继续把 dense consume / metadata workspace
+   往 GPU persistent service 内收
+
+5. 最终让 CPU 只保留 submit / observe / 调度
+```
+
+### 13.3 这条主线上应继续避免的方向
+
+```text
+1. 再回头长时间抠 CPU poll 小优化
+2. 继续在主流程里叠更多布尔实验开关
+3. 在没有明确 backend 边界的情况下继续把 paged-KV / dense / compose 混写
+4. 在没有 staging / commit 语义前直接做跨轮次 live handle 可见性扩展
+```
+
+一句话总结当前第 10 章之后真正需要保留的信息：
+
+```text
+当前主线已经从“路径能不能跑通”转到“backend 怎么拆干净”；
+后续实现应该继续沿显式 backend 和 GPU-resident runtime 契约推进，
+而不是继续在单一路径里堆实验分支。
+```
+
+### 13.4 后续 GPU-initiated submit 主线
+
+这里需要先明确一个边界：
+
+```text
+GPU-initiated 的价值，不只是“第一下 submit 是否由 CPU 发起”
+而是整条 I/O 控制面是否继续依赖 CPU 高频介入
+```
+
+也就是说，即便当前第一波 seed submit 仍由 CPU 发起，只要后续已经逐步变成：
+
+```text
+GPU 负责 poll CQ
+GPU 负责更新 frontier
+GPU 负责数据放置
+GPU 负责发布 consumable 状态
+CPU 不再为每个 chunk/page 高频介入
+```
+
+它就已经和“只有 GDS 数据直达、但控制面仍由 CPU 高频驱动”的形态有本质区别。
+
+当前更值得推进的，不是立刻执着于“第一下 submit 也必须 GPU 发”，
+而是把“同一条请求内部的 follow-up submit”收给 GPU persistent service。
+
+推荐主线：
+
+```text
+CPU：
+  1. 新请求准入
+  2. 第一波 seed submit
+
+GPU persistent service：
+  1. 轮询 CQ
+  2. 更新 request / chunk frontier
+  3. 负责 place / dense consume / 状态发布
+  4. 根据 frontier 自己决定下一波要读哪些 chunk/page
+  5. 直接发起 follow-up submit
+```
+
+#### 13.4.1 什么叫由 frontier 驱动 follow-up submit
+
+所谓：
+
+```text
+GPU 根据当前 active sequence frontier 直接发起下一批需要的读
+```
+
+意思不是 GPU 被动等待 CPU 再下命令，而是：
+
+```text
+1. GPU 已经知道这条 sequence 当前推进到哪里
+   例如：
+     launch_frontier=4
+     read_ready_frontier=4
+     consumable_frontier=4
+
+2. GPU 也知道这条 sequence 后面还需要哪些 chunk
+
+3. 当 frontier 到达某个阈值后
+   GPU 后台 service 自己决定：
+     现在继续提交 chunk 5,6
+     或继续提交 chunk 5,6,7,8
+```
+
+这样 follow-up submit 的触发条件就来自 GPU 自己维护的 frontier，
+而不是 CPU 重新 poll 一次、再回到 host 侧做 descriptor 组装和 submit。
+
+#### 13.4.2 推理里哪些流程最适合继续下沉成 GPU submit
+
+最值得做的是下面几类：
+
+```text
+1. 同一条请求内部的后续 chunk / wave submit
+   这是最直接、也最值钱的 GPU-submit 主线
+
+2. 局部预取 / follow-up prefetch
+   当前请求已经命中前缀后，GPU 可继续为后续 chunk 提前发起读
+
+3. decode 阶段的小步迭代 I/O
+   这类场景轮次多、步长小，CPU 若每轮都重新介入 submit，控制面会很重
+
+4. dense consume / workspace 继续下沉后的 follow-up read
+   一旦 dense consume 进一步并入 GPU service，自然就应由同一个 service
+   继续决定后续还需要提交哪些 chunk
+```
+
+#### 13.4.3 哪些部分短期仍可能保留 CPU 参与
+
+短期内不必强求全部搬空：
+
+```text
+1. 新外部请求的准入与 batch 调度
+   这仍更接近推理引擎自己的 CPU 调度逻辑
+
+2. 第一波 seed submit
+   只要 chunk metadata / key lookup 仍主要在 host 侧，这一步保留 CPU 更自然
+
+3. 粗粒度策略决策
+   例如这一轮是否先返回部分 prefix，是否让位给其它请求
+```
+
+因此更现实、也更贴合当前代码结构的中间目标是：
+
+```text
+CPU 只介入一次 seed submit
+GPU 接管同一请求内部的后续 follow-up submit / poll / place / publish
+```
+
+#### 13.4.4 当前代码离这一步还差什么
+
+按现在这套 request/frontier/runtime 组织，后续真正要补的是：
+
+```text
+1. 让 persistent service 持有“下一波 chunk descriptor 从哪里开始”的权威状态
+
+2. 把 follow-up submit 需要的 metadata
+   例如：
+     chunk_id -> page_offset / page_count / actual_tokens
+   组织成 GPU 可直接消费的 descriptor 表
+
+3. 把当前 request-level frontier
+   真正变成 follow-up submit 的触发条件，而不只是 ready/return 观察口
+
+4. 把 dense consume 进一步往 persistent service 一侧内收
+   避免 cleanup 后再由前台组织过多后处理
+```
+
+一句话总结这部分后续工作：
+
+```text
+后续不是简单追求“把第一下 submit 也搬到 GPU”
+而是要把“同一请求内部的后续 I/O 决策权”真正从 CPU 挪到 GPU runtime。
+```
+
+### 13.5 one-copy 下一步：先校验 repair 前的 GPU 原始写入
+
+当前三条 KV 链路已经收束为：
+
+```text
+1. rowctx_baseline
+   稳定基线，保留用于回归对照。
+
+2. gpu_worker_persistent_materialized
+   当前输出正确的 fast path。
+   GPU persistent service 负责 poll/read/stage；
+   最终 paged KV cache 写入仍走已验证正确的 materialized placement。
+
+3. gpu_worker_persistent_one_copy
+   最激进实验线。
+   目标是 GPU persistent service 直接完成：
+     BaM cache -> vLLM paged KV cache
+```
+
+one-copy 当前的问题不是 submit/poll 主线是否能推进，而是：
+
+```text
+GPU service 原始 scatter 到 vLLM paged KV cache 的结果
+是否完全符合 vLLM 官方 packed KV cache ABI
+```
+
+此前 one-copy 为了保证端到端输出正确，会在 finalize 末尾调用：
+
+```text
+_rewrite_runtime_direct_prefix_into_paged_kv_cache_with_official_write()
+```
+
+这一步会用 vLLM 官方 `PagedAttention.write_to_paged_cache()` 覆盖最终
+paged KV cache。它能保证 correctness，但也会把 GPU 原始 one-copy scatter
+的错误盖掉，导致后续 verify 看到的是 repair 后结果，而不是 raw runtime write。
+
+因此新的排查顺序必须改成：
+
+```text
+1. cleanup-only runtime direct finalize 完成
+2. 在 official-write repair 之前，校验 GPU 原始 one-copy 写入
+3. 若 raw verify 失败，直接根据 mismatch 定位 CUDA scatter
+4. 若 raw verify 通过，再考虑移除 official-write repair
+5. 只有 raw 写端确认正确后，one-copy 才能作为真正热路径推进
+```
+
+代码上已经补了两个边界清晰的 helper：
+
+```text
+_resolve_one_copy_runtime_verify_expected_tensors()
+  优先复用 live request pages 生成的 expected dict；
+  如果不存在，就把 repair 已经准备好的 dense prefix tuple
+  按 chunk_hash 轻量组回 dict，避免为了校验再读一次 BaM。
+
+_verify_one_copy_raw_runtime_write_before_repair()
+  只在 VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE=1 时启用；
+  在 official repair 前调用已有 packed verifier；
+  日志使用 RAW_RUNTIME_WRITE_VERIFY_BEGIN/DONE 明确标记。
+```
+
+下一步运行 one-copy 时，应先打开 raw runtime write verify：
+
+```text
+VLLM_BAM_DIRECT_PLACEMENT_RUNTIME_ONE_COPY=1
+VLLM_BAM_DIRECT_PLACEMENT_REQUIRE_RUNTIME_ONE_COPY=1
+VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE=1
+VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_ALLOW_LIVE_REFILL=1
+```
+
+若日志出现 mismatch，优先看：
+
+```text
+chunk_hash / layer / token_idx / slot_id / head / dim
+host_reference
+official_oracle
+```
+
+判断顺序是：
+
+```text
+host_reference=match 且 official_oracle=match
+  说明 expected tensor、slot_mapping 和官方 packed 写入都正确，
+  根因基本收敛到 gids_nvme.cu 的 one-copy scatter。
+
+host_reference 或 official_oracle 自己 mismatch
+  说明 verifier 输入或 slot/packed 解释仍有问题，不能直接怪 CUDA scatter。
+```
+
+这一步的目的不是新增长期分支，而是把 one-copy 的问题从“端到端乱码”
+收敛成一个具体的底层写端公式问题。修对之后，应删除或默认关闭
+official-write repair，让 one-copy 真正变成：
+
+```text
+BaM cache -> vLLM paged KV cache
+```
+
+的一次搬运主线。
+
+### 13.6 2026-07-17 最新收敛：错误已从数据面转移到 metadata 交接面
+
+最新 one-copy 强校验日志显示，下面这些环节已经可以从主要嫌疑里排除：
+
+```text
+1. BaM 写入 store / 从 store 读回 chunk
+2. persistent service 的 submit / poll / cleanup
+3. one-copy 后最终 paged KV cache 内容
+   官方 write verify 已覆盖 28 层抽样通过
+4. slot_mapping 与 block_table 对齐
+5. xformers 从 paged KV cache gather prefix
+6. xformers 每层 attention 输出抽样 reference
+```
+
+也就是说，当前乱码不应继续优先怀疑：
+
+```text
+BaM page read
+BaM cache -> output pages buffer
+最终 paged KV cache 写入内容
+xformers prefix gather / attention 本身
+```
+
+真正暴露出来的问题是两条路径的上层控制面不一致：
+
+```text
+正确 materialized 路径：
+  direct retrieve finalize
+  -> single_seq_runtime_metadata_fast_path
+  -> dense_prefix_attached=false
+  -> xformers 从 paged KV cache 消费 prefix
+
+错误 one-copy 路径：
+  direct retrieve finalize
+  -> 历史 correctness bypass
+  -> build_partial_prefill_input()
+  -> dense_prefix_attached=true
+  -> 控制面与正确 fast path 分叉
+```
+
+因此当前重构方向已经调整为：
+
+```text
+1. one-copy 不再回退到旧 build_partial_prefill_input()
+2. one-copy 和 materialized 统一走 single_seq_runtime_metadata_fast_path
+3. dense prefix tensor 只保留为 storage 内部 repair / verify 材料
+4. 最终 attention 消费统一回到 vLLM paged KV cache
+5. 先把 correctness 跑通，再继续移除 official-write repair
+```
+
+这一步不是放弃 one-copy，而是把 one-copy 的错误面收窄：
+
+```text
+数据面：
+  GPU persistent service 仍负责读、写、发布 consumable
+
+控制面：
+  adapter 只构造与正确 materialized 路径一致的 model_input / metadata
+
+调试/repair：
+  dense prefix 不再参与最终 xformers 输入，只服务校验和官方写端覆盖
+```
+
+后续验证时重点看日志是否出现：
+
+```text
+pipeline=gpu_worker_persistent_one_copy
+stage=single_seq_runtime_metadata_fast_path
+dense_prefix_attached=false
+```
+
+并确认不再出现：
+
+```text
+reason=runtime_direct_temporarily_bypassed_for_correctness
+stage=build_partial_prefill_input_begin
+dense_prefix_attached=true
+```
+
+### 13.7 2026-07-17 晚间更新：三条 KV 链路最新定版
+
+截至 `20260717_231209` 这轮日志，KV 路径已经进一步收束为三条边界清楚的链路。这里不覆盖前面历史排查记录，只更新当前应以哪套语义判断代码是否跑在主线。
+
+#### 13.7.1 当前保留的三条链路
+
+```text
+1. rowctx_baseline
+   作用：
+     稳定正确性基线、回归对照、排错参照。
+
+   数据流：
+     CPU / Python 层组织 chunk/page request
+       -> BaM rowctx batch read
+       -> 读回 materialized pages / chunk tensor
+       -> 已验证正确的 materialized placement
+       -> vLLM paged KV cache
+       -> xFormers prefix fallback 从 paged KV cache 消费 prefix
+
+   当前定位：
+     这是“正确但不激进”的基线，不再作为 GPU-resident 主线继续加新逻辑。
+     后续 one-copy 或 persistent 出问题时，仍用它判断写入布局和输出语义。
+
+2. gpu_worker_persistent_materialized
+   作用：
+     当前稳定 fast 路径之一，用于验证 GPU persistent service 的 poll/read/stage 主线。
+
+   数据流：
+     CPU 轻量 submit request table / metadata
+       -> GPU worker submit BaM row/page 请求
+       -> GPU persistent service 维护 completion / frontier / staged 状态
+       -> service 发布 cache_ready / consumable
+       -> 前台 cleanup / finalize
+       -> 使用已验证正确的 materialized placement 写入 vLLM paged KV cache
+       -> xFormers prefix fallback 从 paged KV cache 消费 prefix
+
+   当前定位：
+     GPU 已经接管 BaM I/O 的轮询和状态推进；
+     但最后写入 paged KV cache 仍走 materialized placement，
+     所以它不是 one-copy 数据面，只是 persistent service 的稳定过渡路径。
+
+3. gpu_worker_persistent_one_copy
+   作用：
+     当前最接近目标的数据面主线。
+
+   数据流：
+     CPU 轻量 submit request table / metadata
+       -> GPU worker submit BaM row/page 请求
+       -> GPU persistent service 维护 completion / frontier / staged 状态
+       -> GPU persistent service 按 vLLM 官方 paged KV ABI 直接 scatter
+          BaM cache page 到最终 vLLM paged KV cache
+       -> GPU 发布 cache_ready / consumable
+       -> CPU / adapter 只观察 poll 返回值与 consumable frontier
+       -> cleanup-only runtime direct finalize
+       -> xFormers prefix fallback 从 paged KV cache 消费 prefix
+
+   当前定位：
+     `BaM cache -> vLLM paged KV cache` 这段已经是真 one-copy，
+     最新日志显示输出正确，并且没有回退到 output pages staging 或 live pages decode。
+```
+
+#### 13.7.2 最新 one-copy 跑通的判断依据
+
+最新可用日志：
+
+```text
+evaluation/logs/single_gpu_lmcache_no_prefix_reuse_qwen25/20260717_231209/run.log
+```
+
+关键判断点如下：
+
+```text
+[LMCACHE_BAM_DIRECT_PLACEMENT_PIPELINE]
+  pipeline=gpu_worker_persistent_one_copy
+  runtime_one_copy=true
+  runtime_attach=true
+
+[KV_RUNTIME_DIRECT_PLACE_PROBE]
+  official_flat=1
+  use_output_pages=0
+
+[LMCACHE_BAM_DIRECT_PLACEMENT_READ_FRONTIER]
+  cache_ready_chunks=4/4
+  consumable_chunks=4/4
+  host_status=3
+
+[LMCACHE_BAM_DIRECT_PLACEMENT_READ_CONSUME_DONE]
+  mode=runtime_direct
+
+[LMCACHE_BAM_DIRECT_PLACEMENT_READ]
+  executor=runtime_direct_cleanup
+  worker_backend=kv_persistent_service_v0
+  pipeline=gpu_worker_persistent_one_copy
+  finalize_mode=runtime_direct
+
+[LMCACHE_BAM_DIRECT_PLACEMENT]
+  impl=gpu_runtime_direct
+  refill_ms=0.000
+  transfer_ms=0.000
+  fused_ms=0.000
+  place_ms=0.000
+```
+
+这些日志合在一起说明：
+
+```text
+1. 没有走 LMCache 原始 fallback。
+2. 没有走 output_pages staging mirror。
+3. 没有走 BaM cache -> output pages buffer -> vLLM paged KV cache 的两次搬运。
+4. 没有进入 LIVE_PAGES_DECODE / materialized_refill 调试校验路径。
+5. 最终返回给 vLLM 的 prefix 命中长度是 4 个 chunk / 1024 tokens。
+6. request 2 输出语义正常。
+```
+
+因此当前可以把 one-copy 数据面定为：
+
+```text
+BaM cache page
+  -> GPU persistent service direct scatter
   -> vLLM paged KV cache
 ```
 
-它还不是最终目标里的：
+而不是：
 
 ```text
-BaM pages
-  -> 直接写 vLLM paged KV cache
-```
-
-更具体地说，当前一轮真实 request 的数据流如下。
-
-#### 例子：1261 token，请求前缀命中 1024 token
-
-当前脚本里：
-
-```text
-chunk_size = 256
-prefix hit = 1024 tokens
-因此命中 4 个 chunk
-```
-
-也就是：
-
-```text
-chunk0 -> tokens [0,256)
-chunk1 -> tokens [256,512)
-chunk2 -> tokens [512,768)
-chunk3 -> tokens [768,1024)
-剩余 [1024,1261) 走正常 prefill
-```
-
-#### 第 1 步：LMCache connector 识别 prefix hit
-
-控制面流程：
-
-```text
-vLLM scheduler
-  -> LMCacheConnector
-  -> LMCache token_database / chunk lookup
-  -> 找到 4 个可恢复 chunk hash
-```
-
-日志上对应：
-
-```text
-LMCACHE_BAM_DIRECT_RETRIEVE_BEGIN
-LMCACHE_BAM_DIRECT_PLACEMENT_PREFIX_HIT
-```
-
-这一步 CPU 已经知道：
-
-```text
-1. 要恢复哪 4 个 chunk
-2. 每个 chunk 在本轮 request 的 token 区间
-3. 当前 request 对应的 slot_mapping
-```
-
-#### 第 2 步：把 chunk 转成 batch read 请求
-
-当前每个 chunk 在 BaM 中固定存成：
-
-```text
-[112, 128KB]
-```
-
-因为当前 layout 是：
-
-```text
-[2, 28, 256, 512]
-page_token_capacity = 128
-pages_per_kv_layer  = 2
-pages_per_chunk     = 2 * 28 * 2 = 112
-```
-
-所以本轮 4 个 chunk 一次性提交给 BaM 的真实读请求是：
-
-```text
-batch_size     = 4
-pages_per_chunk= 112
-total_pages    = 448
-```
-
-#### 第 3 步：BaM 返回 pages，而不是返回 KV tensor
-
-当前 `read_pages_batch()` 的结果不是 LMCache tensor，而是：
-
-```text
-每个 chunk:
-  [112, 128KB] uint8 CUDA tensor
-```
-
-这说明当前 direct placement 的真正输入对象是：
-
-```text
-BaM page batch
-```
-
-而不是已经 decode 好的 KV。
-
-#### 第 4 步：build placement plan
-
-`BaMDirectKVPlacer._build_plan()` 会把：
-
-```text
-result + chunk_start + slot_mapping
-```
-
-整理成 plan entry。
-
-对上面的 4 个 chunk，plan 大致是：
-
-```text
-entry0:
-  chunk_start = 0
-  actual_tokens = 256
-  slot_mapping = slot_mapping[0:256]
-
-entry1:
-  chunk_start = 256
-  actual_tokens = 256
-  slot_mapping = slot_mapping[256:512]
-
-entry2:
-  chunk_start = 512
-  actual_tokens = 256
-  slot_mapping = slot_mapping[512:768]
-
-entry3:
-  chunk_start = 768
-  actual_tokens = 256
-  slot_mapping = slot_mapping[768:1024]
-```
-
-总 token 数：
-
-```text
-total_tokens = 1024
-```
-
-#### 第 5 步：merged refill
-
-当前不会为每个 chunk 单独创建一个 KV tensor 再 cat，而是直接创建：
-
-```text
-merged tensor:
-  [2, 28, 1024, 512]
-```
-
-然后 4 个 chunk 依次写入：
-
-```text
-chunk0 pages -> merged[:, :,   0:256, :]
-chunk1 pages -> merged[:, :, 256:512, :]
-chunk2 pages -> merged[:, :, 512:768, :]
-chunk3 pages -> merged[:, :, 768:1024, :]
-```
-
-日志中的：
-
-```text
-token_offset=0
-token_offset=256
-token_offset=512
-token_offset=768
-```
-
-说的就是这个过程。
-
-也就是说，当前 `refill_pages_to_lmcache_tensor_into()` 做的是：
-
-```text
-[112, 128KB] pages
-  -> 按 kv_id/layer/token_page/token_in_page 解码
-  -> 写到 merged KV tensor 的目标 token 区间
-```
-
-#### 第 6 步：one transfer 到 vLLM paged KV cache
-
-merged refill 完成后，再做一次：
-
-```text
-multi_layer_kv_transfer(
-  merged_kv_tensor,
-  merged_slot_mapping,
-  kv_caches
-)
-```
-
-这里：
-
-```text
-merged_kv_tensor   = [2, 28, 1024, 512]
-merged_slot_mapping= [1024]
-```
-
-`slot_mapping` 的作用是告诉 LMCache connector kernel：
-
-```text
-merged 第 i 个 token
-最终应该写到 vLLM paged KV cache 的哪个 physical slot
-```
-
-#### 第 7 步：vLLM 后续消费
-
-回填结束后：
-
-```text
-前 1024 token 直接复用恢复出的 KV
-剩余 237 token 继续正常 prefill / attention
-```
-
-因此当前 direct placement v0 的完整数据流可以概括成：
-
-```text
-LMCache prefix hit
-  -> 4 个 chunk hash
-  -> BaM batch read 448 pages
-  -> build placement plan
-  -> merged refill [2, 28, 1024, 512]
-  -> one connector transfer
-  -> vLLM paged KV cache
-  -> 剩余未命中 token 正常 prefill
-```
-
-当前版本的定位可以一句话总结为：
-
-```text
-控制面已经 plan 化，
-I/O 已经 batch 化，
-placement 仍处于“BaM pages -> merged LMCache tensor -> one transfer”
-这个过渡阶段。
-```
-
-补充一条 2026-06-30 当天代码侧的最新推进：
-
-```text
-direct placement 的 fused 实验路径已经从：
-
-  单个 chunk
-    -> 每个 layer
-       -> 每个 K/V
-          -> 多次 kernel launch
-
-收缩成：
-
-  单个 chunk
-    -> 一次 fused kernel launch
-       -> 同时覆盖全部 layer + K/V
-```
-
-这一步的意义不是“已经替代当前 lmcache 主线”，而是先把 direct placement v1
-需要的最内层数据搬运收紧：
-
-```text
-旧 fused:
-  Python for chunk
-    Python for layer
-      Python for K/V
-        Triton launch
-
-新 fused:
-  Python for chunk
-    Triton launch
-```
-
-当前仍保留逐 chunk 的 Python 层，原因是：
-
-```text
-1. 这样可以继续复用现有 placement plan / chunk 边界；
-2. 便于和当前稳定的 lmcache 实现做 A/B；
-3. 后续如果继续往 batch-level fused placement 收缩，
-   只需要替换“逐 chunk 执行器”这一层，而不用改上层 direct placement 入口。
-```
-
-因此可以把这一步理解成：
-
-```text
-先把 chunk 内部的数据面收紧，
-再考虑把多个 chunk 合并成更大的 batch placement kernel。
-```
-
-### 12.8 和 baseline 的对比应该怎么理解
-
-当前更适合拿来做工程对照的 baseline 有两组：
-
-```text
-1. 原生 vLLM V0 no-prefix-reuse baseline
-2. LMCache SSD-only no-prefix-reuse baseline
-```
-
-归档文档：
-
-```text
-evaluation/SINGLE_GPU_LMCACHE_SSD_BASELINE_QWEN25.md
-```
-
-较早归档的数值是：
-
-```text
-原生 vLLM V0:
-  request_1_elapsed_s = 2.1716
-  request_2_elapsed_s = 2.2151
-
-LMCache SSD-only:
-  request_1_elapsed_s = 2.0224
-  request_2_elapsed_s = 1.6895
-```
-
-和当前脚本口径更接近、也更适合直接对照的一轮是：
-
-```text
-2026-06-30 04:12
-  request_1_elapsed_s = 1.8076
-  request_2_elapsed_s = 1.5966
-```
-
-但这轮实际上是：
-
-```text
-prefix 命中识别成功
-direct placement submit 失败
-最终 fallback 到 LMCache/原 prefer-load 路径
-```
-
-而最新真正“新主线跑通”的结果是：
-
-```text
-2026-06-30 04:18
-  request_1_elapsed_s = 1.8180
-  request_2_elapsed_s = 2.0826
-```
-
-所以当前对比结论应该明确写成：
-
-```text
-1. 和原生 vLLM baseline 相比：
-   当前 direct placement 新主线在功能上已经更完整，
-   但端到端还没有形成稳定性能优势。
-
-2. 和 LMCache SSD-only baseline 相比：
-   当前 BaM direct placement 也还没有体现出端到端收益，
-   request_2 甚至可能更慢。
-
-3. 根因并不在 BaM I/O：
-   11.956ms 的 read_ms 说明底层 batch read 已经很快。
-
-4. 当前真正拖慢 request_2 的主因是 placement/refill：
-   大约 500ms 量级，
-   远大于底层 submit/poll/get 的开销。
-```
-
-换句话说，当前系统已经从：
-
-```text
-能不能跑通 BaM direct placement
-```
-
-进入到了：
-
-```text
-能不能把 direct placement 后半段做轻
-```
-
-这个阶段。
-
-## 13. 下一阶段改进路线图（2026-06-30）
-
-基于前面的收敛结论，当前推荐下一步已经不是继续验证 `kv_cq_service_v1`
-或者继续深挖 `submit/poll`，而是把系统从：
-
-```text
-CPU 组织 request
-  -> GPU/BaM 读回 pages
-  -> 再做一大段 placement/refill/rebuild
-```
-
-推进到：
-
-```text
-GPU-visible request queue
-  -> GPU 异步发起 I/O
-  -> GPU 统一消费 completion
-  -> GPU 直接把 KV 放到最终可用布局
-  -> 尽量与 layer 计算 overlap
-```
-
-这是 AGIO、Tutti、TARDIS 三篇工作在当前工程里的共同落点。
-
-### 13.1 为什么现在不该再优先优化 submit/poll
-
-最新日志已经说明：
-
-```text
-底层 BaM batch read:
-  read_ms = 11.956
-
-direct placement 后半段:
-  refill_ms = 502.319
-  place_ms  = 503.945
-```
-
-所以当前瓶颈已经不是：
-
-```text
-submit timeout
-per-row poll
-CQ dequeue 组织
-```
-
-而是：
-
-```text
-pages 读出来之后，
-怎么更便宜地进入 vLLM 真正要消费的 paged KV cache 布局
-```
-
-这正好和三篇论文的关注点一致：
-
-```text
-AGIO:
-  initiation / completion 解耦，GPU 不应原地同步等待 I/O
-
-Tutti:
-  CPU-prepared, GPU-executed，减少 CPU-centric I/O orchestration
-
-TARDIS:
-  KV 是 GPU-centric object，不该先恢复成通用 tensor 再 rebuild
-```
-
-### 13.2 推荐路线图
-
-#### 13.2.1 Direct Placement v1：先打掉中间态
-
-当前最值得优先做的是把：
-
-```text
-BaM pages
-  -> 中间 tensor
-  -> refill
-  -> rebuild
+BaM cache page
+  -> output pages buffer
+  -> host / Triton / official write repair
   -> vLLM paged KV cache
 ```
 
-改得更接近：
+#### 13.7.3 哪些 `fallback` 不是 KV 数据路径回退
+
+当前日志里仍会出现几个 `fallback` 字样，容易误判。这里统一口径：
 
 ```text
-BaM pages
-  -> placement kernel
-  -> vLLM paged KV cache target blocks
+1. defer to later BaM read instead of LMCache fallback
+   含义：prefetch 阶段不走 LMCache fallback，而是把读取延后交给 BaM direct placement。
+   结论：不是回退。
+
+2. XFORMERS_PREFIX_FALLBACK
+   含义：V100 上 `PagedAttention.forward_prefix()` 不可用，
+        attention 消费侧仍使用 xFormers fallback 从 paged KV cache 读取 prefix。
+   结论：这是 attention backend fallback，不是 BaM / KV 数据搬运路径回退。
+
+3. fallback_local_slice_validation / fallback_local_rebuild_validation
+   含义：adapter 在构造 slot_mapping / block_table 时保留的本地校验或兼容命名。
+   结论：只影响 metadata rebuild / validation，不代表 KV 数据重新 materialize。
 ```
 
-核心目标：
+真正判断是否跑回旧 KV 数据路径，应优先看：
 
 ```text
-减少 LMCache 通用 tensor 中转
-减少 Python 侧组织
-减少 rebuild/refill 的额外恢复成本
+pipeline=...
+finalize_mode=...
+impl=...
+use_output_pages=...
+refill_ms / transfer_ms / fused_ms / place_ms
+LIVE_PAGES_DECODE 是否出现
+results_materialized 是否出现
 ```
 
-这一步最贴近 TARDIS 的启发：
+#### 13.7.4 当前 CPU / GPU 职责边界
+
+当前已经实现的职责划分如下：
 
 ```text
-KVCache 应按最终消费布局组织，
-而不是按临时恢复格式组织。
+CPU / adapter:
+  1. 根据 LMCache chunk metadata 和 vLLM 当前 request metadata，组织第一波 request table。
+  2. 把 slot_mapping、block_table、chunk_start、kv_cache_ptrs 等 runtime metadata attach 给 BaM runtime。
+  3. 非阻塞地通过 poll 观察 consumable frontier。
+  4. 当 consumable_chunks 达到 return_target_chunks 后，返回 ret_mask 给 vLLM。
+  5. 做 cleanup-only finalize，不再承担 one-copy 数据搬运。
+
+GPU persistent service:
+  1. 维护 BaM CQ / completion 的推进。
+  2. 更新 request / chunk / frontier 状态。
+  3. 在 one-copy 路径中，直接把 BaM cache page scatter 到 vLLM paged KV cache。
+  4. 发布 cache_ready / consumable，作为 CPU adapter 的权威 ready 语义。
 ```
 
-#### 13.2.2 GPU-visible KVPlacementPlan
-
-下一步建议把当前 placement plan 收敛成 GPU 可直接消费的 descriptor：
+所以当前已经不是“CPU 负责数据搬运，只是用了 BaM 异步接口”的形态。更准确地说：
 
 ```text
-src_page
-page_count
-layer_id
-kv_id
-token_start / token_end
-dst_block_id
-dst_block_offset
-dst_ptr / stride
+CPU 仍负责第一波 submit 和 metadata attach；
+GPU persistent service 已经负责 BaM I/O completion、数据写入和 consumable 状态发布；
+CPU 后续只观察是否可以让当前 request 继续计算。
 ```
 
-这样做的好处是：
+#### 13.7.5 xFormers 消费侧的当前位置
+
+one-copy 已经解决的是数据进入 paged KV cache 的路径；后续 attention 消费仍是：
 
 ```text
-CPU:
-  仍负责 metadata lookup / block 分配 / request preparation
-
-GPU:
-  直接按 plan 做 scatter / placement
+vLLM paged KV cache
+  -> xFormers prefix fallback gather / packed_direct_to_workspace
+  -> xFormers attention
 ```
 
-这一步最贴近 Tutti 的 `CPU-prepared, GPU-executed`。
-
-#### 13.2.3 Layer-wise / Segment-wise placement
-
-当前还是：
+最新日志中：
 
 ```text
-prefix hit 若干 chunk
-  -> 全 batch read
-  -> 全 batch place
+selected_prefix=packed_direct_to_workspace
+selected_query=direct_scatter
+prefix_copy_ms=0.000
 ```
 
-下一步更合理的是：
+这说明 xFormers 消费侧已经比早期 gather-then-copy 更薄，但它仍不是最终 GPU-resident frontier / persistent service 的终局。当前阶段先把 one-copy 数据面定住，下一步再考虑继续减少 xFormers fallback 和 metadata rebuild 的结构性开销。
+
+#### 13.7.6 当前仍未完成的问题
+
+当前 one-copy 数据面已经跑通，但还没到最终 GPU-initiated 目标。剩余问题按优先级是：
 
 ```text
-layer 0 ready -> 先 place layer 0
-layer 1 ready -> 再 place layer 1
-...
+1. 进程退出 / cleanup 尾部仍可能残留 root Python 进程占用 GPU。
+   这不是数据通路 correctness 问题，但会影响连续测试。
+
+2. 第一波 seed submit 仍由 CPU 发起。
+   当前 GPU 接管的是 poll / place / consumable 发布，
+   还没有把“下一波 I/O 决策权”完全下沉到 GPU。
+
+3. metadata rebuild 仍在 adapter 侧发生。
+   目前它已经不参与 KV 数据搬运，但仍会构造 slot_mapping / block_table。
+
+4. xFormers prefix fallback 仍是 attention 消费侧路径。
+   V100 上 PagedAttention.forward_prefix 不可用，
+   因此短期内继续保留 xFormers fallback，长期再考虑更贴合 paged KV 的消费 kernel。
 ```
 
-更进一步：
+后续推进顺序建议保持：
 
 ```text
-attention 计算 layer i
-同时预取 / 放置 layer i+1 的 KV
+1. 固化 one-copy 正确路径，减少默认调试开关，避免 verify 重新引入 live pages decode。
+2. 处理尾部 cleanup / 进程退出问题，保证 benchmark 可重复。
+3. 将 CPU poll 进一步收缩为只读 consumable 观察口。
+4. 继续推进 GPU-resident frontier / follow-up submit，
+   把同一请求内部下一波 I/O 的决策权从 CPU 挪到 GPU runtime。
 ```
 
-这一点同时对应：
+#### 13.7.7 one-copy 正确修复口径与性能恢复口径
+
+当前 one-copy 之所以能从“输出乱码”收敛到“输出正确”，核心不是靠回退或 repair 覆盖，而是修正了两层语义。
+
+第一层是数据面写入 ABI 修正：
 
 ```text
-AGIO:
-  让 I/O 和 useful computation overlap
+错误旧思路：
+  runtime direct scatter 自己按 key/value packed view 推导目标地址。
 
-TARDIS:
-  layer-wise async swapping
-
-Tutti:
-  用 scheduling/slack-aware pipeline 隐藏 I/O latency
+正确新思路：
+  严格复刻 LMCache 官方 multi_layer_kv_transfer(direction=false)
+  对 vLLM paged KV cache 的物理写入语义。
 ```
 
-#### 13.2.4 Persistent GPU worker
-
-当前虽然已经有 `gpu_worker` façade，但本质上还是：
+当前每层 vLLM KV cache 底层可以视作：
 
 ```text
-CPU 提交
-CPU 调 poll
-CPU 再 consume
+layer_cache: [2, page_buffer_size, hidden_dim]
 ```
 
-下一步应逐渐推进成：
+因此 one-copy scatter 的目标地址必须是：
 
 ```text
-CPU:
-  提交 request table
-  低频看 request status
-
-GPU worker:
-  读 request queue
-  submit I/O
-  service CQ
-  写 completion/status
-  触发 placement
+dst = kv * page_buffer_size * hidden_dim
+    + slot_id * hidden_dim
+    + hidden
 ```
 
-这一步最贴近 AGIO：
+这对应最新日志中的：
 
 ```text
-不是 GPU“也能发 I/O”而已，
-而是 GPU 自己维护异步 I/O 生命周期。
+official_flat=1
+use_output_pages=0
 ```
 
-#### 13.2.5 双队列：I/O queue + placement queue
+`official_flat=1` 说明写入公式已经按官方 flat paged-buffer ABI；
+`use_output_pages=0` 说明没有再走 output pages staging，数据是直接从 BaM cache page 写入最终 vLLM paged KV cache。
 
-建议后续不要只保留一个 request table，而是拆成两个阶段：
+第二层是控制面统一：
 
 ```text
-I/O request queue
-  -> 描述从 SSD/BaM 读取哪些 page
+错误旧思路：
+  one-copy 写了 paged KV cache，
+  但 adapter 后续可能继续走 dense prefix / partial prefill / repair 相关分支，
+  导致 xFormers 看到的 metadata 与真实 paged KV cache 消费路径不一致。
 
-Placement queue
-  -> 描述这些 page 应该写到哪些 vLLM KV blocks
+正确新思路：
+  one-copy 和 materialized 正确路径统一回到
+  single_seq_runtime_metadata_fast_path，
+  dense_prefix_attached=false，
+  xFormers 只从 vLLM paged KV cache 消费 prefix。
 ```
 
-这样做的价值：
+因此当前正确链路是：
 
 ```text
-1. I/O completion 和 placement 解耦
-2. ready pages 不必等整批 chunk 全完成后再统一恢复
-3. placement 可以独立调度，甚至按 layer 优先级推进
+BaM cache page
+  -> GPU persistent service 按官方 flat ABI direct scatter
+  -> vLLM paged KV cache
+  -> adapter 构造一致的 slot_mapping / block_table
+  -> xFormers prefix fallback 从 paged KV cache 消费 prefix
 ```
 
-这是 AGIO 中 initiation/completion decouple 在我们系统里的最自然映射。
-
-#### 13.2.6 最后再做 slack-aware scheduling
-
-这一步现在还不该最先做，但后面一定值得做。
-
-等 direct placement v1 跑稳后，再考虑：
+而不是：
 
 ```text
-哪些 layer/chunk 优先读
-哪些 request 可以后放
-哪些 placement 应该让路给 attention compute
-哪些 I/O 可以藏到 compute slack 后面
+BaM cache page
+  -> output pages / dense prefix / official repair
+  -> 再喂给 xFormers
 ```
 
-这一步主要对应 Tutti。
+性能上，最新正确性日志和之前约 `1.55 iter/s` 左右的口径不能直接比较，因为两者冷启动条件不同。
 
-### 13.3 分优先级的推进顺序
-
-如果只做最有价值的三步，推荐顺序是：
+当前正确性日志 `20260717_231209`：
 
 ```text
-1. Direct Placement v1
-   目标：减少 placement/refill/rebuild 中间态
-
-2. Layer-wise placement
-   目标：不要等整批 chunk 全完成后才一起恢复
-
-3. Persistent GPU worker
-   目标：把 submit/poll/place 真正变成 GPU-side async pipeline
+request_2_elapsed_s=2.4046
+read_ms=364.906
+poll_ms=359.361
+first_xformers_prefix_total_ms=467.662
 ```
 
-一句话版路线图：
+之前更快的 `20260717_024543` 最终 request：
 
 ```text
-先把“读回来后怎么放进去”做轻
-再把“什么时候放进去”做异步
-最后把“谁来推进整个生命周期”彻底下沉到 GPU
+request_2_elapsed_s=1.9983
+read_ms=474.937
+poll_ms=469.423
+first_xformers_prefix_total_ms=0.983
 ```
 
-### 13.4 和当前代码最直接对应的改动点
-
-按当前代码结构，下一步最值得优先动的点是：
+这个对比说明：
 
 ```text
-1. place_bam_results_to_vllm_kvcache()
-   当前 placement/refill 的最大热点
-
-2. direct placement plan 的构造与传递
-   逐步变成 GPU-visible KVPlacementPlan
-
-3. kv_worker_submit / poll / consume 的边界
-   为后续 persistent worker 留出 stage 分界
-
-4. request_table 扩展为：
-   request_table + placement_table
-
-5. consume 粒度
-   从 whole chunk 走向 layer / segment
+1. 最新 one-copy 的 BaM read/poll 反而更短：约 365ms vs 475ms。
+2. 最新端到端更慢，主要不是 one-copy 数据搬运退化。
+3. 差距主要来自 xFormers prefix fallback 冷启动：
+   最新 request 自己承担约 468ms；
+   之前更快版本已经被前面的 hidden prewarm / steady run 预热，
+   最终 request 只剩约 1ms。
 ```
 
-### 13.5 为什么当前 Direct Placement v0 仍然要保留
-
-虽然主线已经应该往 v1 走，但当前 v0 仍然有保留价值：
+所以恢复到约 `1.55 iter/s` 左右，第一步不是重写 one-copy scatter，而是恢复相同的 steady-state 测试口径：
 
 ```text
-1. 它已经证明：
-   BaM batch read + queue-level CQ service + direct retrieve 可以跑通
+1. 打开或保留 hidden prewarm：
+   DIRECT_RETRIEVE_PREWARM_AFTER_REQUEST1=1
 
-2. 它提供了：
-   精确的功能正确性 scaffold
+2. 不用 correctness verify wrapper 做性能口径：
+   VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE=0
+   VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_ALLOW_LIVE_REFILL=0
+   VLLM_BAM_WRITE_READ_VERIFY=0
+   VLLM_BAM_DIRECT_RETRIEVE_CROSS_SOURCE_FULL_COMPARE=0
+   VLLM_BAM_XFORMERS_VERIFY_PREFIX_GATHER=0
+   VLLM_BAM_XFORMERS_VERIFY_ATTENTION_OUTPUT=0
 
-3. 它仍然是：
-   后续 v1 / layer-wise / GPU worker 改造的 fallback 基线
+3. 关闭非必要调试日志：
+   GIDS_KV_DEBUG=0
+   VLLM_BAM_XFORMERS_PREFIX_FALLBACK_PROFILE=0
+
+4. 用 steady-state 或至少第二次 direct retrieve 的结果做性能判断，
+   不把首次 xFormers gather / kernel 初始化算进最终主口径。
 ```
 
-因此当前不应删除 v0，而是应把它当成：
+如果恢复 warmed steady-state 后仍低于历史值，再继续查真正的结构性开销：
 
 ```text
-可运行基线 + 正确性对照组
+1. persistent service poll/read 是否稳定在 350ms 以内，
+   如果回到 450ms 以上，优先查 BaM cache 命中、CQ service loop、debug sync。
+
+2. metadata rebuild 是否仍需要 idle_stop，
+   当前为了避免 V100 上后台 service 与前台 rebuild 争用，
+   `single_seq_runtime_metadata_fast_path_idle_stop` 可能会停止 idle service。
+   这保证正确性，但不是最终 GPU-resident 形态。
+
+3. xFormers fallback 是否还有首次 400ms 级 warmup，
+   若 benchmark 必须比较 steady-state，应在计时前显式预热 prefix fallback。
+
+4. 进一步性能目标不是再加 repair 或 host fallback，
+   而是继续把 metadata rebuild / follow-up submit / frontier 状态推进下沉到
+   GPU runtime，减少 CPU 侧同步与前台 rebuild。
 ```
 
-### 13.6 Direct Placement v0（保留说明）
-
-第一版目标：
+一句话结论：
 
 ```text
-把 BaM 读出的 128KB pages 直接写入 vLLM paged KV cache 的目标 block。
-尽量绕开当前:
-  BaM pages -> LMCache tensor -> Triton refill -> rebuild/prefix
-这条重恢复路径。
-```
-
-新增中间层：
-
-```text
-KVPlacementPlan:
-  chunk_hash
-  actual_tokens
-  source page_offset / page_count
-  layer_id
-  kv_id                       # K 或 V
-  source token range
-  target vLLM block_id
-  target block offset
-  target pointer / stride info
-```
-
-第一版 CPU/GPU 分工：
-
-```text
-CPU:
-  LMCache chunk 命中判断
-  vLLM block table / slot mapping 读取
-  生成 KVPlacementPlan
-  调用 BaM batch read
-
-GPU/BaM:
-  BaM 读取 128KB pages
-  GPU placement kernel 按 plan 写入 vLLM paged KV cache
-
-保留 fallback:
-  当前 load_chunk_tensors_kv_fast_path_batch()
-  当前 lmcache_bam_refill.py
-```
-
-这一步的验证标准：
-
-```text
-1. replay direct placement 能 exact_equal。
-2. 真实 vLLM 日志里仍能 prefer-load hit。
-3. read_ms 不明显回退。
-4. refill_ms 或 rebuild 相关耗时明显下降。
-5. 如果 direct placement 失败，可以通过开关回退到当前 KV fast path batch。
+当前 one-copy 正确性已经修在主线数据面上；
+性能回退主要是 cold-start / profile 口径差异，不是 one-copy 又多了一次搬运。
+先恢复 hidden prewarm + 关闭调试校验，再用 warmed steady-state 重新对比，
+才是和之前 1.55 iter/s 左右结果一致的比较方式。
 ```

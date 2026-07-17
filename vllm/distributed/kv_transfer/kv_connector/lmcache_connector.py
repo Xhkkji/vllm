@@ -7,13 +7,16 @@ The LMCacheConnector can (1) transfer KV caches between prefill vLLM worker
 (2) offload and share KV caches.
 """
 
-from typing import TYPE_CHECKING, List, Tuple, Union
+import dataclasses
+import time
+from typing import TYPE_CHECKING, Dict, List, Union
 
 import torch
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
-from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBase
+from vllm.distributed.kv_transfer.kv_connector.base import (KVConnectorBase,
+                                                            KVReceiveResult)
 from vllm.logger import init_logger
 from vllm.sequence import IntermediateTensors
 
@@ -21,6 +24,25 @@ if TYPE_CHECKING:
     from vllm.worker.model_runner import ModelInputForGPUWithSamplingMetadata
 
 logger = init_logger(__name__)
+
+
+@dataclasses.dataclass
+class _PendingDeferredRetrieveState:
+    """记录一批已经 start、等待后续 poll/finalize 的 direct retrieve。
+
+    这里保存的是 connector/runtime 这一层需要的 request 级状态，而不是底层
+    page/chunk 的 ready 状态。
+
+    额外记录 `poll_attempts` 的原因是：
+    - 默认情况下，如果同一轮 poll 已经 ready，就可以立刻 finalize
+    - 但为了验证“跨 engine iteration 保留 live handle”这条 runtime 主线，
+      我们还需要一个可控的“至少再 defer N 轮”的实验能力
+    """
+
+    batch_key: tuple[tuple[str, ...], tuple[int, ...], tuple[int, ...]]
+    deferred_batch: object
+    created_at_s: float
+    poll_attempts: int = 0
 
 
 def _get_lmcache_retrieve_token_limit(
@@ -165,7 +187,10 @@ class LMCacheConnector(KVConnectorBase):
         from lmcache.integration.vllm.utils import ENGINE_NAME
         from lmcache.integration.vllm.vllm_adapter import (
             RetrieveStatus, StoreStatus, init_lmcache_engine,
-            lmcache_retrieve_kv, lmcache_should_retrieve, lmcache_should_store,
+            lmcache_finalize_deferrable_retrieve_kv,
+            lmcache_poll_deferrable_retrieve_kv,
+            lmcache_retrieve_kv, lmcache_should_retrieve,
+            lmcache_should_store, lmcache_start_deferrable_retrieve_kv,
             lmcache_store_kv)
         logger.info("Initializing LMCacheConfig under kv_transfer_config %s",
                     self.transfer_config)
@@ -181,11 +206,21 @@ class LMCacheConnector(KVConnectorBase):
         self.parallel_config = config.parallel_config
         self.cache_config = config.cache_config
         self.lmcache_retrieve_kv = lmcache_retrieve_kv
+        self.lmcache_finalize_deferrable_retrieve_kv = (
+            lmcache_finalize_deferrable_retrieve_kv)
+        self.lmcache_poll_deferrable_retrieve_kv = (
+            lmcache_poll_deferrable_retrieve_kv)
+        self.lmcache_start_deferrable_retrieve_kv = (
+            lmcache_start_deferrable_retrieve_kv)
         self.lmcache_store_kv = lmcache_store_kv
         self.lmcache_should_retrieve = lmcache_should_retrieve
         self.lmcache_should_store = lmcache_should_store
         self.store_status = StoreStatus
         self.retrieve_status = RetrieveStatus
+        self._pending_deferred_retrieves: Dict[
+            tuple[tuple[str, ...], tuple[int, ...], tuple[int, ...]],
+            _PendingDeferredRetrieveState,
+        ] = {}
 
         if (envs.VLLM_GDS_LMCACHE_SHADOW_ENABLE
                 or envs.VLLM_GDS_LMCACHE_PREFER_LOAD_ENABLE) and \
@@ -226,34 +261,47 @@ class LMCacheConnector(KVConnectorBase):
         self, model_executable: torch.nn.Module,
         model_input: "ModelInputForGPUWithSamplingMetadata",
         kv_caches: List[torch.Tensor]
-    ) -> Tuple[Union[torch.Tensor, IntermediateTensors], bool,
-               "ModelInputForGPUWithSamplingMetadata"]:
-        """按当前 V0 connector 契约同步收口一次 retrieve。
+    ) -> KVReceiveResult:
+        """按当前 V0 connector 契约推进一次 retrieve。
 
-        这里需要明确当前 runtime 边界：
+        当前存在两条主线：
 
-        - `recv_kv_caches_and_hidden_states()` 是 blocking 调用
-        - 返回值只有两种稳定语义：
-          1. `bypass_model_exec=True`：完全跳过当前前向
-          2. `bypass_model_exec=False`：立刻用返回的 `model_input` 继续当前前向
+        1. 默认 blocking 主线
+           仍然在一次 `recv()` 调用内部同步完成 retrieve/finalize。
+        2. 可选 deferred runtime 主线
+           当 direct placement request-handle 与上层 runtime 开关都开启时，
+           connector 可以把当前 batch 显式返回成 `DEFERRED`，让 engine 在
+           下一轮继续对同一批输入做 poll/finalize。
 
-        因此即使下层 BaM direct placement 已经具备 `start/poll/finalize`
-        request-handle 结构，当前 V0 主线里它也只能在这一次 blocking `recv`
-        调用内部完成同步收口。
-
-        如果未来要把 live in-flight request 跨 `recv` 调用保留下来，就必须先
-        扩展 connector / model_runner 的 runtime 契约，引入“延后当前 request、
-        下轮再继续执行”的安全中间态；否则后台 direct placement 可能会和当前
-        正常 model forward 对同一片 paged KV cache 发生写入竞争。
+        新增的 `DEFERRED` 语义就是为了让 live in-flight direct retrieve
+        不必再被硬塞进一次 blocking `recv()` 调用里同步收口。
         """
 
+        self._cleanup_finished_pending_retrieves(model_input)
         retrieve_status = self.lmcache_should_retrieve(model_input)
+        if self._runtime_defer_enabled():
+            deferred_result = self._try_drive_deferred_receive(
+                model_executable=model_executable,
+                model_input=model_input,
+                kv_caches=kv_caches,
+                retrieve_status=retrieve_status,
+            )
+            if deferred_result is not None:
+                return deferred_result
         self._maybe_prefetch_bam_chunks(model_input, retrieve_status)
         model_input, bypass_model_exec, hidden_or_intermediate_states =\
             self.lmcache_retrieve_kv(
                 model_executable, model_input, self.cache_config, kv_caches,
                 retrieve_status)
-        return hidden_or_intermediate_states, bypass_model_exec, model_input
+        if bypass_model_exec:
+            return KVReceiveResult.ready_bypass(
+                model_input=model_input,
+                hidden_or_intermediate_states=hidden_or_intermediate_states,
+            )
+        return KVReceiveResult.ready_forward(
+            model_input=model_input,
+            hidden_or_intermediate_states=hidden_or_intermediate_states,
+        )
 
     def _maybe_prefetch_bam_chunks(
         self,
@@ -274,6 +322,155 @@ class LMCacheConnector(KVConnectorBase):
             logger.exception(
                 "[LMCACHE_BAM_EARLY_PREFETCH] failed before retrieve; "
                 "continue with normal LMCache retrieve")
+
+    def _runtime_defer_enabled(self) -> bool:
+        """是否启用 direct placement 的 runtime-level defer 主线。"""
+        return (bool(envs.VLLM_BAM_DIRECT_PLACEMENT_DEFER_RUNTIME)
+                and bool(envs.VLLM_BAM_DIRECT_PLACEMENT)
+                and bool(envs.VLLM_BAM_KV_FAST_PATH)
+                and self.engine is not None
+                and self.lmcache_start_deferrable_retrieve_kv is not None
+                and self.lmcache_poll_deferrable_retrieve_kv is not None
+                and self.lmcache_finalize_deferrable_retrieve_kv is not None)
+
+    def _get_min_runtime_defer_polls(self) -> int:
+        """返回当前实验要求的最少 defer 轮数。"""
+        return max(int(envs.VLLM_BAM_DIRECT_PLACEMENT_DEFER_MIN_POLLS), 0)
+
+    def _build_receive_batch_key(
+        self,
+        model_input: "ModelInputForGPUWithSamplingMetadata",
+    ) -> tuple[tuple[str, ...], tuple[int, ...], tuple[int, ...]]:
+        """为当前 receive batch 构造一个稳定键。
+
+        这里使用：
+        - request id 顺序
+        - 当前 seq_lens
+        - 当前 query_lens
+
+        这样可以区分“同一个 request id 在不同 prefill/chunk 阶段”的上下文，
+        避免把上一个调度轮次的 live handle 误绑定到新的输入上。
+        """
+        # 这里优先使用 `request_ids_to_seq_ids`，因为它是 model runner 在构造
+        # batch 时显式整理出来的 request 级映射，语义最稳定：
+        #
+        # - key: 真实 request_id
+        # - value: 该 request 当前 batch 中对应的 seq_ids
+        #
+        # 反过来，`sampling_metadata.seq_groups` 在 v0 路径里是
+        # `SequenceGroupToSample`，它并不保证携带 `request_id` 字段，
+        # 直接依赖它会把 batch key 绑定到一个并不稳定的中间表示上。
+        request_ids_to_seq_ids = model_input.request_ids_to_seq_ids
+        request_ids: tuple[str, ...] = tuple()
+        if request_ids_to_seq_ids is not None:
+            request_ids = tuple(request_ids_to_seq_ids.keys())
+
+        seq_lens = tuple(int(x) for x in (model_input.seq_lens or []))
+        query_lens = tuple(int(x) for x in (model_input.query_lens or []))
+        return request_ids, seq_lens, query_lens
+
+    def _cleanup_finished_pending_retrieves(
+        self,
+        model_input: "ModelInputForGPUWithSamplingMetadata",
+    ) -> None:
+        """清理已经结束 request 残留的 pending retrieve 句柄。"""
+        finished_request_ids = set(model_input.finished_requests_ids or [])
+        if not finished_request_ids:
+            return
+
+        stale_keys = [
+            batch_key for batch_key in self._pending_deferred_retrieves
+            if finished_request_ids.intersection(batch_key[0])
+        ]
+        for batch_key in stale_keys:
+            self._pending_deferred_retrieves.pop(batch_key, None)
+
+    def _try_drive_deferred_receive(
+        self,
+        *,
+        model_executable: torch.nn.Module,
+        model_input: "ModelInputForGPUWithSamplingMetadata",
+        kv_caches: List[torch.Tensor],
+        retrieve_status: List[object],
+    ) -> KVReceiveResult | None:
+        """尝试推进当前 batch 的 deferred direct retrieve 主线。
+
+        返回：
+        - `KVReceiveResult`：说明当前 batch 已进入 deferred runtime 主线，
+          这轮要么直接 `DEFERRED`，要么已经成功 finalize。
+        - `None`：说明这轮不适合走 deferred 主线，调用方应继续 blocking 路径。
+        """
+        batch_key = self._build_receive_batch_key(model_input)
+        pending_state = self._pending_deferred_retrieves.get(batch_key)
+
+        if pending_state is None:
+            deferred_batch = self.lmcache_start_deferrable_retrieve_kv(
+                model_executable,
+                model_input,
+                self.cache_config,
+                kv_caches,
+                retrieve_status,
+            )
+            if deferred_batch is None:
+                return None
+            pending_state = _PendingDeferredRetrieveState(
+                batch_key=batch_key,
+                deferred_batch=deferred_batch,
+                created_at_s=time.perf_counter(),
+            )
+            self._pending_deferred_retrieves[batch_key] = pending_state
+            logger.info(
+                "[LMCACHE_BAM_DEFERRED_RETRIEVE_START] request_ids=%s",
+                ",".join(batch_key[0]),
+            )
+
+        pending_state.poll_attempts += 1
+        ready = self.lmcache_poll_deferrable_retrieve_kv(
+            pending_state.deferred_batch)
+        min_defer_polls = self._get_min_runtime_defer_polls()
+        force_extra_defer = (ready and min_defer_polls > 0
+                             and pending_state.poll_attempts <= min_defer_polls)
+        if not ready or force_extra_defer:
+            wait_reason = ("forced_min_defer"
+                           if force_extra_defer else "not_ready")
+            logger.info(
+                "[LMCACHE_BAM_DEFERRED_RETRIEVE_WAIT] request_ids=%s "
+                "wait_ms=%.3f poll_attempts=%d min_defer_polls=%d reason=%s",
+                ",".join(batch_key[0]),
+                (time.perf_counter() - pending_state.created_at_s) * 1000.0,
+                pending_state.poll_attempts,
+                min_defer_polls,
+                wait_reason,
+            )
+            return KVReceiveResult.deferred(model_input=model_input)
+
+        self._pending_deferred_retrieves.pop(batch_key, None)
+        model_input, bypass_model_exec, hidden_or_intermediate_states = (
+            self.lmcache_finalize_deferrable_retrieve_kv(
+                pending_state.deferred_batch,
+                model_executable=model_executable,
+                model_input=model_input,
+                cache_config=self.cache_config,
+                kv_caches=kv_caches,
+            ))
+        logger.info(
+            "[LMCACHE_BAM_DEFERRED_RETRIEVE_DONE] request_ids=%s "
+            "wait_ms=%.3f bypass=%s poll_attempts=%d min_defer_polls=%d",
+            ",".join(batch_key[0]),
+            (time.perf_counter() - pending_state.created_at_s) * 1000.0,
+            bypass_model_exec,
+            pending_state.poll_attempts,
+            min_defer_polls,
+        )
+        if bypass_model_exec:
+            return KVReceiveResult.ready_bypass(
+                model_input=model_input,
+                hidden_or_intermediate_states=hidden_or_intermediate_states,
+            )
+        return KVReceiveResult.ready_forward(
+            model_input=model_input,
+            hidden_or_intermediate_states=hidden_or_intermediate_states,
+        )
 
     def send_kv_caches_and_hidden_states(
         self,
@@ -296,4 +493,5 @@ class LMCacheConnector(KVConnectorBase):
         )
 
     def close(self):
+        self._pending_deferred_retrieves.clear()
         self.lmcache_engine_builder.destroy(self.lmcache_engine_name)

@@ -60,7 +60,8 @@ from vllm.usage.usage_lib import (UsageContext, is_usage_stats_enabled,
 from vllm.utils import (Counter, Device, deprecate_kwargs,
                         resolve_obj_by_qualname, weak_bind)
 from vllm.version import __version__ as VLLM_VERSION
-from vllm.worker.model_runner_base import InputProcessingError
+from vllm.worker.model_runner_base import (DeferredModelExecution,
+                                           InputProcessingError)
 
 logger = init_logger(__name__)
 _LOCAL_LOGGING_INTERVAL_SEC = 5
@@ -1412,6 +1413,24 @@ class LLMEngine:
                 outputs = self.model_executor.execute_model(
                     execute_model_req=execute_model_req)
                 self._skip_scheduling_next_step = False
+            except DeferredModelExecution as e:
+                # 这里不是错误，而是 connector/runtime 显式要求：
+                # 当前这批 request 先不要继续 forward，而是保留原调度结果，
+                # 等下一轮继续对同一批输入做 recv/poll/finalize。
+                self._skip_scheduling_next_step = True
+                self._cache_scheduler_outputs_for_multi_step(
+                    virtual_engine=virtual_engine,
+                    scheduler_outputs=scheduler_outputs,
+                    seq_group_metadata_list=seq_group_metadata_list,
+                    allow_async_output_proc=allow_async_output_proc,
+                )
+                logger.info(
+                    "Deferred current model execution batch and will retry "
+                    "the same schedule on the next engine iteration. "
+                    "request_ids=%s",
+                    e.request_ids,
+                )
+                return ctx.request_outputs
             except InputProcessingError as e:
                 # The input for this request cannot be processed, so we must
                 # abort it. If there are remaining requests in the batch that

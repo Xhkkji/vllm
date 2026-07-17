@@ -8,18 +8,18 @@ MooncakePipe.
 
 But the logic can be extended to support other pipe and lookup buffer.
 """
-from typing import TYPE_CHECKING, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
 from vllm.config import VllmConfig
-from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBase
+from vllm.distributed.kv_transfer.kv_connector.base import (KVConnectorBase,
+                                                            KVReceiveResult)
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     model_aware_kv_ops_helper as kv_helper)
 from vllm.distributed.kv_transfer.kv_lookup_buffer.simple_buffer import (
     SimpleBuffer)
 from vllm.logger import init_logger
-from vllm.sequence import IntermediateTensors
 
 if TYPE_CHECKING:
     from vllm.worker.model_runner import ModelInputForGPUWithSamplingMetadata
@@ -208,8 +208,7 @@ class SimpleConnector(KVConnectorBase):
         self, model_executable: torch.nn.Module,
         model_input: "ModelInputForGPUWithSamplingMetadata",
         kv_caches: List[torch.Tensor]
-    ) -> Tuple[Union[torch.Tensor, IntermediateTensors], bool,
-               "ModelInputForGPUWithSamplingMetadata"]:
+    ) -> KVReceiveResult:
 
         # When bypass_model_exec is set to False, it means that at least for one
         # request its corresponding KV cache or hidden state is missing.
@@ -314,7 +313,15 @@ class SimpleConnector(KVConnectorBase):
             hidden_or_intermediate_states = torch.cat(
                 hidden_or_intermediate_states_for_one_req, dim=0)
 
-        return hidden_or_intermediate_states, bypass_model_exec, model_input
+        if bypass_model_exec:
+            return KVReceiveResult.ready_bypass(
+                model_input=model_input,
+                hidden_or_intermediate_states=hidden_or_intermediate_states,
+            )
+        return KVReceiveResult.ready_forward(
+            model_input=model_input,
+            hidden_or_intermediate_states=hidden_or_intermediate_states,
+        )
 
     def close(self):
         self.producer_data_pipe.close()

@@ -13,6 +13,29 @@ LMCACHE_MAX_LOCAL_CPU_SIZE_VALUE="${LMCACHE_MAX_LOCAL_CPU_SIZE_VALUE:-5.0}"
 PROMPT_REPEAT="${PROMPT_REPEAT:-100}"
 MAX_TOKENS="${MAX_TOKENS:-64}"
 STEADY_REPEAT="${STEADY_REPEAT:-0}"
+# prompt 构造模式：
+# - repeat: 维持原先“按字符串重复次数构造样例”的简单口径
+# - token_budget: 先用 tokenizer 估算 token 数，再自动把 prompt 拉到目标预算附近
+#
+# `token_budget` 模式的目的，是为像“自然 defer 探测”这种场景提供更稳定的样例：
+# 不需要手工猜 `PROMPT_REPEAT=260/300/...`，而是直接按 token 预算构造。
+PROMPT_BUILD_MODE="${PROMPT_BUILD_MODE:-repeat}"
+PROMPT_TARGET_TOKENS="${PROMPT_TARGET_TOKENS:-0}"
+# 是否让 request_2 复用 request_1 的 prompt。
+#
+# 默认留空时维持原先语义：
+# - prefer-load 打开：request_2 复用 request_1，用来观察前缀恢复；
+# - prefer-load 关闭：request_2 使用不同 prompt，用作普通 no-prefix-reuse baseline。
+#
+# 调试 LMCache/BaM retrieve 正确性时，可以显式设成 1：
+#   PROMPT_REUSE_REQUEST1=1
+# 这样即使关闭 BaM prefer-load/direct-placement，也仍然能用“同一 prompt 的
+# request_1/request_2”做严格对照。
+PROMPT_REUSE_REQUEST1="${PROMPT_REUSE_REQUEST1:-}"
+# 当未显式指定 `PROMPT_TARGET_TOKENS` 时，会用：
+#   max_model_len - max_tokens - PROMPT_TARGET_MARGIN
+# 作为自动生成的 prompt token 预算。
+PROMPT_TARGET_MARGIN="${PROMPT_TARGET_MARGIN:-96}"
 # 当前主线默认测 steady-state，因此把 request_1 之后的隐藏 prewarm 默认打开。
 # 这样正式 request_2 更接近我们真正关心的稳态口径，而不会把一次性 warmup
 # 重新算回主结果。
@@ -47,10 +70,78 @@ VLLM_BAM_KV_FAST_PATH_VALUE="${VLLM_BAM_KV_FAST_PATH:-1}"
 VLLM_BAM_KV_EXECUTOR_VALUE="${VLLM_BAM_KV_EXECUTOR:-rowctx}"
 VLLM_BAM_DIRECT_PLACEMENT_VALUE="${VLLM_BAM_DIRECT_PLACEMENT:-1}"
 VLLM_BAM_DIRECT_PLACEMENT_IMPL_VALUE="${VLLM_BAM_DIRECT_PLACEMENT_IMPL:-fused}"
-VLLM_BAM_DIRECT_PLACEMENT_FRONTIER_CHUNKS_VALUE="${VLLM_BAM_DIRECT_PLACEMENT_FRONTIER_CHUNKS:-0}"
-VLLM_BAM_DIRECT_PLACEMENT_FOLLOWUP_CHUNKS_VALUE="${VLLM_BAM_DIRECT_PLACEMENT_FOLLOWUP_CHUNKS:-0}"
+VLLM_BAM_WRITE_READ_VERIFY_VALUE="${VLLM_BAM_WRITE_READ_VERIFY:-0}"
+VLLM_BAM_WRITE_READ_VERIFY_SYNC_COMPARE_VALUE="${VLLM_BAM_WRITE_READ_VERIFY_SYNC_COMPARE:-0}"
+VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_VALUE="${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE:-0}"
+VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_ALLOW_LIVE_REFILL_VALUE="${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_ALLOW_LIVE_REFILL:-0}"
+# runtime write verify 的覆盖范围必须和主开关一起透传。
+#
+# 之前这里只透传了 `VERIFY_RUNTIME_WRITE` 本身，导致外层命令即使显式设置
+# MAX_CHUNKS / MAX_LAYERS / SAMPLE_* / FULL_COMPARE，sudo 后的真实 Python 进程
+# 仍然回到 vllm/envs.py 里的默认小窗口：
+#   1 chunk * 1 layer * 2 tokens * 8 dims * full_compare=false
+#
+# 这会让日志看起来“跑了强校验”，实际仍然只是弱抽样。这里把诊断子参数
+# 统一收口到脚本层，保证后续 correctness 排查的日志口径可信。
+VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_MAX_CHUNKS_VALUE="${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_MAX_CHUNKS:-1}"
+VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_MAX_LAYERS_VALUE="${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_MAX_LAYERS:-1}"
+VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_SAMPLE_TOKENS_VALUE="${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_SAMPLE_TOKENS:-2}"
+VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_SAMPLE_DIMS_VALUE="${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_SAMPLE_DIMS:-8}"
+VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_FULL_COMPARE_VALUE="${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_FULL_COMPARE:-0}"
+VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_VALUE="${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE:-0}"
+# official write verify 用来核对“最终 paged KV cache”里的真实写入值。
+#
+# 这组参数必须和主开关一起透传到 sudo/root 进程。否则外层即使显式指定
+# `MAX_LAYERS=28` 或更大的 sample 窗口，真实 Python 进程仍会回落到
+# vllm/envs.py 的默认小窗口，只检查 layer0 的少量值，容易把 one-copy 路径的
+# 跨层/边界错误误判为“写入正确”。
+VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_MAX_CHUNKS_VALUE="${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_MAX_CHUNKS:-4}"
+VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_MAX_LAYERS_VALUE="${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_MAX_LAYERS:-1}"
+VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_SAMPLE_TOKENS_VALUE="${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_SAMPLE_TOKENS:-8}"
+VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_SAMPLE_HEADS_VALUE="${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_SAMPLE_HEADS:-2}"
+VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_SAMPLE_DIMS_VALUE="${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_SAMPLE_DIMS:-8}"
+VLLM_BAM_DIRECT_RETRIEVE_CROSS_SOURCE_FULL_COMPARE_VALUE="${VLLM_BAM_DIRECT_RETRIEVE_CROSS_SOURCE_FULL_COMPARE:-0}"
+VLLM_BAM_DIRECT_PLACEMENT_RUNTIME_ONE_COPY_VALUE="${VLLM_BAM_DIRECT_PLACEMENT_RUNTIME_ONE_COPY:-0}"
+VLLM_BAM_DIRECT_PLACEMENT_REQUIRE_RUNTIME_ONE_COPY_VALUE="${VLLM_BAM_DIRECT_PLACEMENT_REQUIRE_RUNTIME_ONE_COPY:-0}"
+# 这里不要再默认把 metadata attachment 显式压成 0。
+#
+# 当前 adapter 已经有更合理的主线推导：
+# - 若外部显式设置了 `VLLM_BAM_RUNTIME_METADATA_ATTACHMENT_ENABLE`
+#   就尊重外部值
+# - 否则只要已经进入 runtime one-copy / require-runtime-one-copy 主线，
+#   就自动把 metadata attachment 视为这条主线的一部分
+#
+# 因此脚本层只在“外部真的显式传了值”时才继续透传；未设置时留空，让代码侧
+# 自己按当前主线推导，避免脚本默认值把主线语义反向盖掉。
+VLLM_BAM_RUNTIME_METADATA_ATTACHMENT_ENABLE_VALUE="${VLLM_BAM_RUNTIME_METADATA_ATTACHMENT_ENABLE:-}"
+# 当前主线默认已经切到 request-handle runtime 路径：
+# - 打开 `DEFER_RUNTIME`，让 connector/runtime 能持有 live handle；
+# - 但默认不再强制 `min defer polls`，也就是：
+#   只有真实 `not_ready` 时才返回 `DEFERRED`。
+#
+# 这样日志里如果出现 WAIT，默认就代表真实“当前还没 ready”，而不是为了验证
+# 跨 iteration 人为多插了一轮空转。
+VLLM_BAM_DIRECT_PLACEMENT_DEFER_RUNTIME_VALUE="${VLLM_BAM_DIRECT_PLACEMENT_DEFER_RUNTIME:-1}"
+VLLM_BAM_DIRECT_PLACEMENT_DEFER_MIN_POLLS_VALUE="${VLLM_BAM_DIRECT_PLACEMENT_DEFER_MIN_POLLS:-0}"
 VLLM_BAM_XFORMERS_PREFIX_FALLBACK_PROFILE_VALUE="${VLLM_BAM_XFORMERS_PREFIX_FALLBACK_PROFILE:-0}"
-VLLM_BAM_TRY_PAGED_PREFIX_ZERO_ALIBI_VALUE="${VLLM_BAM_TRY_PAGED_PREFIX_ZERO_ALIBI:-0}"
+VLLM_BAM_XFORMERS_PREFIX_BACKEND_VALUE="${VLLM_BAM_XFORMERS_PREFIX_BACKEND:-auto}"
+# query backend 是 xFormers fallback 的诊断/收束开关：
+# - direct_scatter：当前较快的 Triton scatter 路径
+# - segment_copy：保守逐段 copy 路径，用来排除 scatter kernel / 位置映射问题
+#
+# 这个变量必须在 sudo env 与 root 进程 export 两处都显式透传，否则外层命令
+# 即使设置了 `VLLM_BAM_XFORMERS_QUERY_BACKEND=segment_copy`，进入真正的
+# vLLM 进程后也会丢失，导致日志仍然跑默认 direct_scatter。
+VLLM_BAM_XFORMERS_QUERY_BACKEND_VALUE="${VLLM_BAM_XFORMERS_QUERY_BACKEND:-auto}"
+VLLM_BAM_XFORMERS_VERIFY_PREFIX_GATHER_VALUE="${VLLM_BAM_XFORMERS_VERIFY_PREFIX_GATHER:-0}"
+VLLM_BAM_XFORMERS_VERIFY_ATTENTION_OUTPUT_VALUE="${VLLM_BAM_XFORMERS_VERIFY_ATTENTION_OUTPUT:-0}"
+VLLM_BAM_XFORMERS_VERIFY_ATTENTION_OUTPUT_FULL_VALUE="${VLLM_BAM_XFORMERS_VERIFY_ATTENTION_OUTPUT_FULL:-0}"
+VLLM_BAM_XFORMERS_VERIFY_ATTENTION_OUTPUT_FULL_LAYER_VALUE="${VLLM_BAM_XFORMERS_VERIFY_ATTENTION_OUTPUT_FULL_LAYER:-0}"
+VLLM_BAM_LOGITS_SEMANTIC_DEBUG_VALUE="${VLLM_BAM_LOGITS_SEMANTIC_DEBUG:-0}"
+# partial-prefill rebuild 语义诊断：
+# 只抽样打印 token / position / slot / selected_token_indices，
+# 用来定位 prefix 命中后交回 vLLM 的控制面是否错位。
+LMCACHE_BAM_REBUILD_SEMANTIC_DEBUG_VALUE="${LMCACHE_BAM_REBUILD_SEMANTIC_DEBUG:-0}"
 if [[ -n "${VLLM_BAM_LMCACHE_READ_MODE:-}" ]]; then
   VLLM_BAM_LMCACHE_READ_MODE_VALUE="${VLLM_BAM_LMCACHE_READ_MODE}"
 elif [[ "${VLLM_BAM_KV_FAST_PATH_VALUE}" == "1" ]]; then
@@ -69,6 +160,14 @@ VLLM_BAM_CTRL_IDX_VALUE="${VLLM_BAM_CTRL_IDX:-0}"
 GIDS_FORCE_SYNC_READ_VALUE="${GIDS_FORCE_SYNC_READ:-1}"
 GIDS_KV_DEBUG_VALUE="${GIDS_KV_DEBUG:-0}"
 GIDS_KV_WAIT_TIMEOUT_S_VALUE="${GIDS_KV_WAIT_TIMEOUT_S:-10}"
+# GPU-initiated 第二阶段第一步开关：
+# - `RUNTIME_ENABLE` 控制是否维护 GPU-visible request runtime slot
+# - `PERSISTENT_ENABLE` 控制是否真正拉起后台 persistent service CTA
+#
+# 两者默认都关闭，保证当前脚本默认行为仍然是已经跑通的 v1 主线；
+# 需要联调 persistent 路径时，再显式打开。
+GIDS_KV_GPU_WORKER_RUNTIME_ENABLE_VALUE="${GIDS_KV_GPU_WORKER_RUNTIME_ENABLE:-0}"
+GIDS_KV_GPU_WORKER_PERSISTENT_ENABLE_VALUE="${GIDS_KV_GPU_WORKER_PERSISTENT_ENABLE:-0}"
 BAM_PREFLIGHT_VALUE="${BAM_PREFLIGHT:-0}"
 
 # BaM 读写路径都可能需要更高权限。只有显式打开 BaM 相关路径时才自动提权，
@@ -76,52 +175,98 @@ BAM_PREFLIGHT_VALUE="${BAM_PREFLIGHT:-0}"
 if [[ ( "${VLLM_BAM_LMCACHE_SHADOW_ENABLE_VALUE}" == "1" || \
         "${VLLM_BAM_LMCACHE_PREFER_LOAD_ENABLE_VALUE}" == "1" ) && \
         "${EUID}" -ne 0 ]]; then
-  exec sudo env \
-    "MODEL_PATH=${MODEL_PATH}" \
-    "CUDA_DEVICE=${CUDA_DEVICE}" \
-    "MAX_MODEL_LEN=${MAX_MODEL_LEN}" \
-    "GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION}" \
-    "LMCACHE_CHUNK_SIZE_VALUE=${LMCACHE_CHUNK_SIZE_VALUE}" \
-    "LMCACHE_MAX_LOCAL_CPU_SIZE_VALUE=${LMCACHE_MAX_LOCAL_CPU_SIZE_VALUE}" \
-    "PROMPT_REPEAT=${PROMPT_REPEAT}" \
-    "MAX_TOKENS=${MAX_TOKENS}" \
-    "STEADY_REPEAT=${STEADY_REPEAT}" \
-    "DIRECT_RETRIEVE_PREWARM_AFTER_REQUEST1=${DIRECT_RETRIEVE_PREWARM_AFTER_REQUEST1}" \
-    "LOG_FILE=${LOG_FILE}" \
-    "LMCACHE_REPO_PATH=${LMCACHE_REPO_PATH}" \
-    "PYTHON_BIN=${PYTHON_BIN}" \
-    "DTYPE=${DTYPE}" \
-    "ENFORCE_EAGER=${ENFORCE_EAGER}" \
-    "ENABLE_CHUNKED_PREFILL=${ENABLE_CHUNKED_PREFILL}" \
-    "LMCACHE_USE_EXPERIMENTAL=${LMCACHE_USE_EXPERIMENTAL_VALUE}" \
-    "LMCACHE_LOCAL_CPU=${LMCACHE_LOCAL_CPU_VALUE}" \
-    "LMCACHE_LOCAL_DISK=${LMCACHE_LOCAL_DISK_VALUE}" \
-    "LMCACHE_MAX_LOCAL_DISK_SIZE=${LMCACHE_MAX_LOCAL_DISK_SIZE_VALUE}" \
-    "VLLM_BAM_LMCACHE_SHADOW_ENABLE=${VLLM_BAM_LMCACHE_SHADOW_ENABLE_VALUE}" \
-    "VLLM_BAM_LMCACHE_PREFER_LOAD_ENABLE=${VLLM_BAM_LMCACHE_PREFER_LOAD_ENABLE_VALUE}" \
-    "VLLM_BAM_LMCACHE_SHADOW_CHUNKS=${VLLM_BAM_LMCACHE_SHADOW_CHUNKS_VALUE}" \
-    "VLLM_BAM_LMCACHE_READ_MODE=${VLLM_BAM_LMCACHE_READ_MODE_VALUE}" \
-    "VLLM_BAM_KV_FAST_PATH=${VLLM_BAM_KV_FAST_PATH_VALUE}" \
-    "VLLM_BAM_KV_EXECUTOR=${VLLM_BAM_KV_EXECUTOR_VALUE}" \
-    "VLLM_BAM_DIRECT_PLACEMENT=${VLLM_BAM_DIRECT_PLACEMENT_VALUE}" \
-    "VLLM_BAM_DIRECT_PLACEMENT_IMPL=${VLLM_BAM_DIRECT_PLACEMENT_IMPL_VALUE}" \
-    "VLLM_BAM_DIRECT_PLACEMENT_FRONTIER_CHUNKS=${VLLM_BAM_DIRECT_PLACEMENT_FRONTIER_CHUNKS_VALUE}" \
-    "VLLM_BAM_DIRECT_PLACEMENT_FOLLOWUP_CHUNKS=${VLLM_BAM_DIRECT_PLACEMENT_FOLLOWUP_CHUNKS_VALUE}" \
-    "VLLM_BAM_XFORMERS_PREFIX_FALLBACK_PROFILE=${VLLM_BAM_XFORMERS_PREFIX_FALLBACK_PROFILE_VALUE}" \
-    "VLLM_BAM_TRY_PAGED_PREFIX_ZERO_ALIBI=${VLLM_BAM_TRY_PAGED_PREFIX_ZERO_ALIBI_VALUE}" \
-    "VLLM_BAM_IMPORT_PATH=${VLLM_BAM_IMPORT_PATH_VALUE}" \
-    "VLLM_BAM_CACHE_SIZE_MB=${VLLM_BAM_CACHE_SIZE_MB_VALUE}" \
-    "VLLM_BAM_NUM_SSD=${VLLM_BAM_NUM_SSD_VALUE}" \
-    "VLLM_BAM_SSD_LIST=${VLLM_BAM_SSD_LIST_VALUE}" \
-    "VLLM_BAM_CTRL_IDX=${VLLM_BAM_CTRL_IDX_VALUE}" \
-    "GIDS_FORCE_SYNC_READ=${GIDS_FORCE_SYNC_READ_VALUE}" \
-    "GIDS_KV_DEBUG=${GIDS_KV_DEBUG_VALUE}" \
-    "GIDS_KV_WAIT_TIMEOUT_S=${GIDS_KV_WAIT_TIMEOUT_S_VALUE}" \
-    "BAM_PREFLIGHT=${BAM_PREFLIGHT_VALUE}" \
-    "BAM_LIB_DIR=${BAM_LIB_DIR_VALUE}" \
-    "LD_LIBRARY_PATH=${BAM_LIB_DIR_VALUE}:${LD_LIBRARY_PATH:-}" \
-    "PYTHONPATH=${PYTHONPATH:-}" \
-    bash "$0" "$@"
+  SUDO_ENV_ARGS=(
+    "MODEL_PATH=${MODEL_PATH}"
+    "CUDA_DEVICE=${CUDA_DEVICE}"
+    "MAX_MODEL_LEN=${MAX_MODEL_LEN}"
+    "GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION}"
+    "LMCACHE_CHUNK_SIZE_VALUE=${LMCACHE_CHUNK_SIZE_VALUE}"
+    "LMCACHE_MAX_LOCAL_CPU_SIZE_VALUE=${LMCACHE_MAX_LOCAL_CPU_SIZE_VALUE}"
+    "PROMPT_REPEAT=${PROMPT_REPEAT}"
+    "MAX_TOKENS=${MAX_TOKENS}"
+    "STEADY_REPEAT=${STEADY_REPEAT}"
+    "PROMPT_BUILD_MODE=${PROMPT_BUILD_MODE}"
+    "PROMPT_TARGET_TOKENS=${PROMPT_TARGET_TOKENS}"
+    "PROMPT_REUSE_REQUEST1=${PROMPT_REUSE_REQUEST1}"
+    "PROMPT_TARGET_MARGIN=${PROMPT_TARGET_MARGIN}"
+    "DIRECT_RETRIEVE_PREWARM_AFTER_REQUEST1=${DIRECT_RETRIEVE_PREWARM_AFTER_REQUEST1}"
+    "LOG_ROOT=${LOG_ROOT}"
+    "RUN_DIR=${RUN_DIR}"
+    "LOG_FILE=${LOG_FILE}"
+    "LMCACHE_REPO_PATH=${LMCACHE_REPO_PATH}"
+    "PYTHON_BIN=${PYTHON_BIN}"
+    "DTYPE=${DTYPE}"
+    "ENFORCE_EAGER=${ENFORCE_EAGER}"
+    "ENABLE_CHUNKED_PREFILL=${ENABLE_CHUNKED_PREFILL}"
+    "LMCACHE_USE_EXPERIMENTAL=${LMCACHE_USE_EXPERIMENTAL_VALUE}"
+    "LMCACHE_LOCAL_CPU=${LMCACHE_LOCAL_CPU_VALUE}"
+    "LMCACHE_LOCAL_DISK=${LMCACHE_LOCAL_DISK_VALUE}"
+    "LMCACHE_MAX_LOCAL_DISK_SIZE=${LMCACHE_MAX_LOCAL_DISK_SIZE_VALUE}"
+    "VLLM_BAM_LMCACHE_SHADOW_ENABLE=${VLLM_BAM_LMCACHE_SHADOW_ENABLE_VALUE}"
+    "VLLM_BAM_LMCACHE_PREFER_LOAD_ENABLE=${VLLM_BAM_LMCACHE_PREFER_LOAD_ENABLE_VALUE}"
+    "VLLM_BAM_LMCACHE_SHADOW_CHUNKS=${VLLM_BAM_LMCACHE_SHADOW_CHUNKS_VALUE}"
+    "VLLM_BAM_LMCACHE_READ_MODE=${VLLM_BAM_LMCACHE_READ_MODE_VALUE}"
+    "VLLM_BAM_KV_FAST_PATH=${VLLM_BAM_KV_FAST_PATH_VALUE}"
+    "VLLM_BAM_KV_EXECUTOR=${VLLM_BAM_KV_EXECUTOR_VALUE}"
+    "VLLM_BAM_DIRECT_PLACEMENT=${VLLM_BAM_DIRECT_PLACEMENT_VALUE}"
+    "VLLM_BAM_DIRECT_PLACEMENT_IMPL=${VLLM_BAM_DIRECT_PLACEMENT_IMPL_VALUE}"
+    "VLLM_BAM_WRITE_READ_VERIFY=${VLLM_BAM_WRITE_READ_VERIFY_VALUE}"
+    "VLLM_BAM_WRITE_READ_VERIFY_SYNC_COMPARE=${VLLM_BAM_WRITE_READ_VERIFY_SYNC_COMPARE_VALUE}"
+    "VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE=${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_VALUE}"
+    "VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_ALLOW_LIVE_REFILL=${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_ALLOW_LIVE_REFILL_VALUE}"
+    "VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_MAX_CHUNKS=${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_MAX_CHUNKS_VALUE}"
+    "VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_MAX_LAYERS=${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_MAX_LAYERS_VALUE}"
+    "VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_SAMPLE_TOKENS=${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_SAMPLE_TOKENS_VALUE}"
+    "VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_SAMPLE_DIMS=${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_SAMPLE_DIMS_VALUE}"
+    "VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_FULL_COMPARE=${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_FULL_COMPARE_VALUE}"
+    "VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE=${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_VALUE}"
+    "VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_MAX_CHUNKS=${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_MAX_CHUNKS_VALUE}"
+    "VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_MAX_LAYERS=${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_MAX_LAYERS_VALUE}"
+    "VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_SAMPLE_TOKENS=${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_SAMPLE_TOKENS_VALUE}"
+    "VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_SAMPLE_HEADS=${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_SAMPLE_HEADS_VALUE}"
+    "VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_SAMPLE_DIMS=${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_SAMPLE_DIMS_VALUE}"
+    "VLLM_BAM_DIRECT_RETRIEVE_CROSS_SOURCE_FULL_COMPARE=${VLLM_BAM_DIRECT_RETRIEVE_CROSS_SOURCE_FULL_COMPARE_VALUE}"
+    "VLLM_BAM_DIRECT_PLACEMENT_RUNTIME_ONE_COPY=${VLLM_BAM_DIRECT_PLACEMENT_RUNTIME_ONE_COPY_VALUE}"
+    "VLLM_BAM_DIRECT_PLACEMENT_REQUIRE_RUNTIME_ONE_COPY=${VLLM_BAM_DIRECT_PLACEMENT_REQUIRE_RUNTIME_ONE_COPY_VALUE}"
+    "VLLM_BAM_DIRECT_PLACEMENT_DEFER_RUNTIME=${VLLM_BAM_DIRECT_PLACEMENT_DEFER_RUNTIME_VALUE}"
+    "VLLM_BAM_DIRECT_PLACEMENT_DEFER_MIN_POLLS=${VLLM_BAM_DIRECT_PLACEMENT_DEFER_MIN_POLLS_VALUE}"
+    "VLLM_BAM_XFORMERS_PREFIX_FALLBACK_PROFILE=${VLLM_BAM_XFORMERS_PREFIX_FALLBACK_PROFILE_VALUE}"
+    "VLLM_BAM_XFORMERS_PREFIX_BACKEND=${VLLM_BAM_XFORMERS_PREFIX_BACKEND_VALUE}"
+    "VLLM_BAM_XFORMERS_QUERY_BACKEND=${VLLM_BAM_XFORMERS_QUERY_BACKEND_VALUE}"
+    "VLLM_BAM_XFORMERS_VERIFY_PREFIX_GATHER=${VLLM_BAM_XFORMERS_VERIFY_PREFIX_GATHER_VALUE}"
+    "VLLM_BAM_XFORMERS_VERIFY_ATTENTION_OUTPUT=${VLLM_BAM_XFORMERS_VERIFY_ATTENTION_OUTPUT_VALUE}"
+    "VLLM_BAM_XFORMERS_VERIFY_ATTENTION_OUTPUT_FULL=${VLLM_BAM_XFORMERS_VERIFY_ATTENTION_OUTPUT_FULL_VALUE}"
+    "VLLM_BAM_XFORMERS_VERIFY_ATTENTION_OUTPUT_FULL_LAYER=${VLLM_BAM_XFORMERS_VERIFY_ATTENTION_OUTPUT_FULL_LAYER_VALUE}"
+    "VLLM_BAM_LOGITS_SEMANTIC_DEBUG=${VLLM_BAM_LOGITS_SEMANTIC_DEBUG_VALUE}"
+    "LMCACHE_BAM_REBUILD_SEMANTIC_DEBUG=${LMCACHE_BAM_REBUILD_SEMANTIC_DEBUG_VALUE}"
+    "VLLM_BAM_IMPORT_PATH=${VLLM_BAM_IMPORT_PATH_VALUE}"
+    "VLLM_BAM_CACHE_SIZE_MB=${VLLM_BAM_CACHE_SIZE_MB_VALUE}"
+    "VLLM_BAM_NUM_SSD=${VLLM_BAM_NUM_SSD_VALUE}"
+    "VLLM_BAM_SSD_LIST=${VLLM_BAM_SSD_LIST_VALUE}"
+    "VLLM_BAM_CTRL_IDX=${VLLM_BAM_CTRL_IDX_VALUE}"
+    "GIDS_FORCE_SYNC_READ=${GIDS_FORCE_SYNC_READ_VALUE}"
+    "GIDS_KV_DEBUG=${GIDS_KV_DEBUG_VALUE}"
+    "GIDS_KV_WAIT_TIMEOUT_S=${GIDS_KV_WAIT_TIMEOUT_S_VALUE}"
+    "GIDS_KV_GPU_WORKER_RUNTIME_ENABLE=${GIDS_KV_GPU_WORKER_RUNTIME_ENABLE_VALUE}"
+    "GIDS_KV_GPU_WORKER_PERSISTENT_ENABLE=${GIDS_KV_GPU_WORKER_PERSISTENT_ENABLE_VALUE}"
+    "BAM_PREFLIGHT=${BAM_PREFLIGHT_VALUE}"
+    "BAM_LIB_DIR=${BAM_LIB_DIR_VALUE}"
+    "LD_LIBRARY_PATH=${BAM_LIB_DIR_VALUE}:${LD_LIBRARY_PATH:-}"
+    "PYTHONPATH=${PYTHONPATH:-}"
+  )
+  if [[ -n "${VLLM_BAM_RUNTIME_METADATA_ATTACHMENT_ENABLE_VALUE}" ]]; then
+    SUDO_ENV_ARGS+=(
+      "VLLM_BAM_RUNTIME_METADATA_ATTACHMENT_ENABLE=${VLLM_BAM_RUNTIME_METADATA_ATTACHMENT_ENABLE_VALUE}"
+    )
+  fi
+  # 注意：这里必须把 LOG_ROOT / RUN_DIR / LOG_FILE 一起透传给 sudo 后的
+  # root 进程，避免出现“外层脚本先算出一个时间戳目录，内层脚本又重新按
+  # 新时间戳计算 RUN_DIR，但 LOG_FILE 仍指向旧目录”的分裂状态。
+  #
+  # 否则会出现两个现象：
+  # 1. evaluation/logs 下多出一个空目录；
+  # 2. run_dir 与 log_file 指向不同目录，后续排查日志时容易误判。
+  exec sudo env "${SUDO_ENV_ARGS[@]}" bash "$0" "$@"
 fi
 
 if [[ "${LMCACHE_LOCAL_DISK_VALUE}" == file://* ]]; then
@@ -145,10 +290,35 @@ export VLLM_BAM_KV_FAST_PATH="${VLLM_BAM_KV_FAST_PATH_VALUE}"
 export VLLM_BAM_KV_EXECUTOR="${VLLM_BAM_KV_EXECUTOR_VALUE}"
 export VLLM_BAM_DIRECT_PLACEMENT="${VLLM_BAM_DIRECT_PLACEMENT_VALUE}"
 export VLLM_BAM_DIRECT_PLACEMENT_IMPL="${VLLM_BAM_DIRECT_PLACEMENT_IMPL_VALUE}"
-export VLLM_BAM_DIRECT_PLACEMENT_FRONTIER_CHUNKS="${VLLM_BAM_DIRECT_PLACEMENT_FRONTIER_CHUNKS_VALUE}"
-export VLLM_BAM_DIRECT_PLACEMENT_FOLLOWUP_CHUNKS="${VLLM_BAM_DIRECT_PLACEMENT_FOLLOWUP_CHUNKS_VALUE}"
+export VLLM_BAM_WRITE_READ_VERIFY="${VLLM_BAM_WRITE_READ_VERIFY_VALUE}"
+export VLLM_BAM_WRITE_READ_VERIFY_SYNC_COMPARE="${VLLM_BAM_WRITE_READ_VERIFY_SYNC_COMPARE_VALUE}"
+export VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE="${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_VALUE}"
+export VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_ALLOW_LIVE_REFILL="${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_ALLOW_LIVE_REFILL_VALUE}"
+export VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_MAX_CHUNKS="${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_MAX_CHUNKS_VALUE}"
+export VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_MAX_LAYERS="${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_MAX_LAYERS_VALUE}"
+export VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_SAMPLE_TOKENS="${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_SAMPLE_TOKENS_VALUE}"
+export VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_SAMPLE_DIMS="${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_SAMPLE_DIMS_VALUE}"
+export VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_FULL_COMPARE="${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_FULL_COMPARE_VALUE}"
+export VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE="${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_VALUE}"
+export VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_MAX_CHUNKS="${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_MAX_CHUNKS_VALUE}"
+export VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_MAX_LAYERS="${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_MAX_LAYERS_VALUE}"
+export VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_SAMPLE_TOKENS="${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_SAMPLE_TOKENS_VALUE}"
+export VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_SAMPLE_HEADS="${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_SAMPLE_HEADS_VALUE}"
+export VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_SAMPLE_DIMS="${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_SAMPLE_DIMS_VALUE}"
+export VLLM_BAM_DIRECT_RETRIEVE_CROSS_SOURCE_FULL_COMPARE="${VLLM_BAM_DIRECT_RETRIEVE_CROSS_SOURCE_FULL_COMPARE_VALUE}"
+export VLLM_BAM_DIRECT_PLACEMENT_RUNTIME_ONE_COPY="${VLLM_BAM_DIRECT_PLACEMENT_RUNTIME_ONE_COPY_VALUE}"
+export VLLM_BAM_DIRECT_PLACEMENT_REQUIRE_RUNTIME_ONE_COPY="${VLLM_BAM_DIRECT_PLACEMENT_REQUIRE_RUNTIME_ONE_COPY_VALUE}"
+export VLLM_BAM_DIRECT_PLACEMENT_DEFER_RUNTIME="${VLLM_BAM_DIRECT_PLACEMENT_DEFER_RUNTIME_VALUE}"
+export VLLM_BAM_DIRECT_PLACEMENT_DEFER_MIN_POLLS="${VLLM_BAM_DIRECT_PLACEMENT_DEFER_MIN_POLLS_VALUE}"
 export VLLM_BAM_XFORMERS_PREFIX_FALLBACK_PROFILE="${VLLM_BAM_XFORMERS_PREFIX_FALLBACK_PROFILE_VALUE}"
-export VLLM_BAM_TRY_PAGED_PREFIX_ZERO_ALIBI="${VLLM_BAM_TRY_PAGED_PREFIX_ZERO_ALIBI_VALUE}"
+export VLLM_BAM_XFORMERS_PREFIX_BACKEND="${VLLM_BAM_XFORMERS_PREFIX_BACKEND_VALUE}"
+export VLLM_BAM_XFORMERS_QUERY_BACKEND="${VLLM_BAM_XFORMERS_QUERY_BACKEND_VALUE}"
+export VLLM_BAM_XFORMERS_VERIFY_PREFIX_GATHER="${VLLM_BAM_XFORMERS_VERIFY_PREFIX_GATHER_VALUE}"
+export VLLM_BAM_XFORMERS_VERIFY_ATTENTION_OUTPUT="${VLLM_BAM_XFORMERS_VERIFY_ATTENTION_OUTPUT_VALUE}"
+export VLLM_BAM_XFORMERS_VERIFY_ATTENTION_OUTPUT_FULL="${VLLM_BAM_XFORMERS_VERIFY_ATTENTION_OUTPUT_FULL_VALUE}"
+export VLLM_BAM_XFORMERS_VERIFY_ATTENTION_OUTPUT_FULL_LAYER="${VLLM_BAM_XFORMERS_VERIFY_ATTENTION_OUTPUT_FULL_LAYER_VALUE}"
+export VLLM_BAM_LOGITS_SEMANTIC_DEBUG="${VLLM_BAM_LOGITS_SEMANTIC_DEBUG_VALUE}"
+export LMCACHE_BAM_REBUILD_SEMANTIC_DEBUG="${LMCACHE_BAM_REBUILD_SEMANTIC_DEBUG_VALUE}"
 export VLLM_BAM_IMPORT_PATH="${VLLM_BAM_IMPORT_PATH_VALUE}"
 export VLLM_BAM_CACHE_SIZE_MB="${VLLM_BAM_CACHE_SIZE_MB_VALUE}"
 export VLLM_BAM_NUM_SSD="${VLLM_BAM_NUM_SSD_VALUE}"
@@ -157,8 +327,16 @@ export VLLM_BAM_CTRL_IDX="${VLLM_BAM_CTRL_IDX_VALUE}"
 export GIDS_FORCE_SYNC_READ="${GIDS_FORCE_SYNC_READ_VALUE}"
 export GIDS_KV_DEBUG="${GIDS_KV_DEBUG_VALUE}"
 export GIDS_KV_WAIT_TIMEOUT_S="${GIDS_KV_WAIT_TIMEOUT_S_VALUE}"
+export GIDS_KV_GPU_WORKER_RUNTIME_ENABLE="${GIDS_KV_GPU_WORKER_RUNTIME_ENABLE_VALUE}"
+export GIDS_KV_GPU_WORKER_PERSISTENT_ENABLE="${GIDS_KV_GPU_WORKER_PERSISTENT_ENABLE_VALUE}"
 export DIRECT_RETRIEVE_PREWARM_AFTER_REQUEST1="${DIRECT_RETRIEVE_PREWARM_AFTER_REQUEST1}"
+export PROMPT_REUSE_REQUEST1="${PROMPT_REUSE_REQUEST1}"
 export LD_LIBRARY_PATH="${BAM_LIB_DIR_VALUE}:${LD_LIBRARY_PATH:-}"
+if [[ -n "${VLLM_BAM_RUNTIME_METADATA_ATTACHMENT_ENABLE_VALUE}" ]]; then
+  export VLLM_BAM_RUNTIME_METADATA_ATTACHMENT_ENABLE="${VLLM_BAM_RUNTIME_METADATA_ATTACHMENT_ENABLE_VALUE}"
+else
+  unset VLLM_BAM_RUNTIME_METADATA_ATTACHMENT_ENABLE || true
+fi
 
 if [[ -n "${LMCACHE_LOCAL_DISK_VALUE}" ]]; then
   export LMCACHE_LOCAL_DISK="${LMCACHE_LOCAL_DISK_VALUE}"
@@ -229,10 +407,34 @@ echo "[single-gpu-lmcache-no-prefix-reuse] vllm_bam_kv_fast_path=${VLLM_BAM_KV_F
 echo "[single-gpu-lmcache-no-prefix-reuse] vllm_bam_kv_executor=${VLLM_BAM_KV_EXECUTOR_VALUE}"
 echo "[single-gpu-lmcache-no-prefix-reuse] vllm_bam_direct_placement=${VLLM_BAM_DIRECT_PLACEMENT_VALUE}"
 echo "[single-gpu-lmcache-no-prefix-reuse] vllm_bam_direct_placement_impl=${VLLM_BAM_DIRECT_PLACEMENT_IMPL_VALUE}"
-echo "[single-gpu-lmcache-no-prefix-reuse] vllm_bam_direct_placement_frontier_chunks=${VLLM_BAM_DIRECT_PLACEMENT_FRONTIER_CHUNKS_VALUE}"
-echo "[single-gpu-lmcache-no-prefix-reuse] vllm_bam_direct_placement_followup_chunks=${VLLM_BAM_DIRECT_PLACEMENT_FOLLOWUP_CHUNKS_VALUE}"
+echo "[single-gpu-lmcache-no-prefix-reuse] vllm_bam_write_read_verify=${VLLM_BAM_WRITE_READ_VERIFY_VALUE}"
+echo "[single-gpu-lmcache-no-prefix-reuse] vllm_bam_write_read_verify_sync_compare=${VLLM_BAM_WRITE_READ_VERIFY_SYNC_COMPARE_VALUE}"
+echo "[single-gpu-lmcache-no-prefix-reuse] vllm_bam_direct_placement_verify_runtime_write=${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_VALUE}"
+echo "[single-gpu-lmcache-no-prefix-reuse] vllm_bam_direct_placement_verify_runtime_write_allow_live_refill=${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_ALLOW_LIVE_REFILL_VALUE}"
+echo "[single-gpu-lmcache-no-prefix-reuse] vllm_bam_direct_placement_verify_runtime_write_max_chunks=${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_MAX_CHUNKS_VALUE}"
+echo "[single-gpu-lmcache-no-prefix-reuse] vllm_bam_direct_placement_verify_runtime_write_max_layers=${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_MAX_LAYERS_VALUE}"
+echo "[single-gpu-lmcache-no-prefix-reuse] vllm_bam_direct_placement_verify_runtime_write_sample_tokens=${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_SAMPLE_TOKENS_VALUE}"
+echo "[single-gpu-lmcache-no-prefix-reuse] vllm_bam_direct_placement_verify_runtime_write_sample_dims=${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_SAMPLE_DIMS_VALUE}"
+echo "[single-gpu-lmcache-no-prefix-reuse] vllm_bam_direct_placement_verify_runtime_write_full_compare=${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_FULL_COMPARE_VALUE}"
+echo "[single-gpu-lmcache-no-prefix-reuse] vllm_bam_direct_placement_verify_official_write=${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_VALUE}"
+echo "[single-gpu-lmcache-no-prefix-reuse] vllm_bam_direct_placement_verify_official_write_max_chunks=${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_MAX_CHUNKS_VALUE}"
+echo "[single-gpu-lmcache-no-prefix-reuse] vllm_bam_direct_placement_verify_official_write_max_layers=${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_MAX_LAYERS_VALUE}"
+echo "[single-gpu-lmcache-no-prefix-reuse] vllm_bam_direct_placement_verify_official_write_sample_tokens=${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_SAMPLE_TOKENS_VALUE}"
+echo "[single-gpu-lmcache-no-prefix-reuse] vllm_bam_direct_placement_verify_official_write_sample_heads=${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_SAMPLE_HEADS_VALUE}"
+echo "[single-gpu-lmcache-no-prefix-reuse] vllm_bam_direct_placement_verify_official_write_sample_dims=${VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_SAMPLE_DIMS_VALUE}"
+echo "[single-gpu-lmcache-no-prefix-reuse] vllm_bam_direct_placement_runtime_one_copy=${VLLM_BAM_DIRECT_PLACEMENT_RUNTIME_ONE_COPY_VALUE}"
+echo "[single-gpu-lmcache-no-prefix-reuse] vllm_bam_direct_placement_require_runtime_one_copy=${VLLM_BAM_DIRECT_PLACEMENT_REQUIRE_RUNTIME_ONE_COPY_VALUE}"
+echo "[single-gpu-lmcache-no-prefix-reuse] vllm_bam_direct_placement_defer_runtime=${VLLM_BAM_DIRECT_PLACEMENT_DEFER_RUNTIME_VALUE}"
+echo "[single-gpu-lmcache-no-prefix-reuse] vllm_bam_direct_placement_defer_min_polls=${VLLM_BAM_DIRECT_PLACEMENT_DEFER_MIN_POLLS_VALUE}"
 echo "[single-gpu-lmcache-no-prefix-reuse] vllm_bam_xformers_prefix_fallback_profile=${VLLM_BAM_XFORMERS_PREFIX_FALLBACK_PROFILE_VALUE}"
-echo "[single-gpu-lmcache-no-prefix-reuse] vllm_bam_try_paged_prefix_zero_alibi=${VLLM_BAM_TRY_PAGED_PREFIX_ZERO_ALIBI_VALUE}"
+echo "[single-gpu-lmcache-no-prefix-reuse] vllm_bam_xformers_prefix_backend=${VLLM_BAM_XFORMERS_PREFIX_BACKEND_VALUE}"
+echo "[single-gpu-lmcache-no-prefix-reuse] vllm_bam_xformers_query_backend=${VLLM_BAM_XFORMERS_QUERY_BACKEND_VALUE}"
+echo "[single-gpu-lmcache-no-prefix-reuse] vllm_bam_xformers_verify_prefix_gather=${VLLM_BAM_XFORMERS_VERIFY_PREFIX_GATHER_VALUE}"
+echo "[single-gpu-lmcache-no-prefix-reuse] vllm_bam_xformers_verify_attention_output=${VLLM_BAM_XFORMERS_VERIFY_ATTENTION_OUTPUT_VALUE}"
+echo "[single-gpu-lmcache-no-prefix-reuse] vllm_bam_xformers_verify_attention_output_full=${VLLM_BAM_XFORMERS_VERIFY_ATTENTION_OUTPUT_FULL_VALUE}"
+echo "[single-gpu-lmcache-no-prefix-reuse] vllm_bam_xformers_verify_attention_output_full_layer=${VLLM_BAM_XFORMERS_VERIFY_ATTENTION_OUTPUT_FULL_LAYER_VALUE}"
+echo "[single-gpu-lmcache-no-prefix-reuse] vllm_bam_logits_semantic_debug=${VLLM_BAM_LOGITS_SEMANTIC_DEBUG_VALUE}"
+echo "[single-gpu-lmcache-no-prefix-reuse] vllm_bam_runtime_metadata_attachment_enable=${VLLM_BAM_RUNTIME_METADATA_ATTACHMENT_ENABLE_VALUE:-<auto>}"
 echo "[single-gpu-lmcache-no-prefix-reuse] vllm_bam_import_path=${VLLM_BAM_IMPORT_PATH_VALUE}"
 echo "[single-gpu-lmcache-no-prefix-reuse] vllm_bam_cache_size_mb=${VLLM_BAM_CACHE_SIZE_MB_VALUE}"
 echo "[single-gpu-lmcache-no-prefix-reuse] vllm_bam_num_ssd=${VLLM_BAM_NUM_SSD_VALUE}"
@@ -241,11 +443,16 @@ echo "[single-gpu-lmcache-no-prefix-reuse] vllm_bam_ctrl_idx=${VLLM_BAM_CTRL_IDX
 echo "[single-gpu-lmcache-no-prefix-reuse] gids_force_sync_read=${GIDS_FORCE_SYNC_READ_VALUE}"
 echo "[single-gpu-lmcache-no-prefix-reuse] gids_kv_debug=${GIDS_KV_DEBUG_VALUE}"
 echo "[single-gpu-lmcache-no-prefix-reuse] gids_kv_wait_timeout_s=${GIDS_KV_WAIT_TIMEOUT_S_VALUE}"
+echo "[single-gpu-lmcache-no-prefix-reuse] gids_kv_gpu_worker_runtime_enable=${GIDS_KV_GPU_WORKER_RUNTIME_ENABLE_VALUE}"
+echo "[single-gpu-lmcache-no-prefix-reuse] gids_kv_gpu_worker_persistent_enable=${GIDS_KV_GPU_WORKER_PERSISTENT_ENABLE_VALUE}"
 echo "[single-gpu-lmcache-no-prefix-reuse] bam_preflight=${BAM_PREFLIGHT_VALUE}"
 echo "[single-gpu-lmcache-no-prefix-reuse] bam_lib_dir=${BAM_LIB_DIR_VALUE}"
 echo "[single-gpu-lmcache-no-prefix-reuse] prompt_repeat=${PROMPT_REPEAT}"
 echo "[single-gpu-lmcache-no-prefix-reuse] max_tokens=${MAX_TOKENS}"
 echo "[single-gpu-lmcache-no-prefix-reuse] steady_repeat=${STEADY_REPEAT}"
+echo "[single-gpu-lmcache-no-prefix-reuse] prompt_build_mode=${PROMPT_BUILD_MODE}"
+echo "[single-gpu-lmcache-no-prefix-reuse] prompt_target_tokens=${PROMPT_TARGET_TOKENS}"
+echo "[single-gpu-lmcache-no-prefix-reuse] prompt_target_margin=${PROMPT_TARGET_MARGIN}"
 echo "[single-gpu-lmcache-no-prefix-reuse] direct_retrieve_prewarm_after_request1=${DIRECT_RETRIEVE_PREWARM_AFTER_REQUEST1}"
 echo "[single-gpu-lmcache-no-prefix-reuse] log_root=${LOG_ROOT}"
 echo "[single-gpu-lmcache-no-prefix-reuse] run_dir=${RUN_DIR}"
@@ -273,6 +480,9 @@ GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION}" \
 PROMPT_REPEAT="${PROMPT_REPEAT}" \
 MAX_TOKENS="${MAX_TOKENS}" \
 STEADY_REPEAT="${STEADY_REPEAT}" \
+PROMPT_BUILD_MODE="${PROMPT_BUILD_MODE}" \
+PROMPT_TARGET_TOKENS="${PROMPT_TARGET_TOKENS}" \
+PROMPT_TARGET_MARGIN="${PROMPT_TARGET_MARGIN}" \
 DIRECT_RETRIEVE_PREWARM_AFTER_REQUEST1="${DIRECT_RETRIEVE_PREWARM_AFTER_REQUEST1}" \
 DTYPE="${DTYPE}" \
 ENFORCE_EAGER="${ENFORCE_EAGER}" \
@@ -283,6 +493,7 @@ import os
 import time
 
 from lmcache.integration.vllm.utils import ENGINE_NAME
+from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 from vllm.config import KVTransferConfig
 
@@ -301,6 +512,10 @@ enforce_eager = os.environ.get("ENFORCE_EAGER", "true").lower() == "true"
 enable_chunked_prefill = os.environ.get("ENABLE_CHUNKED_PREFILL",
                                         "false").lower() == "true"
 steady_repeat = int(os.environ.get("STEADY_REPEAT", "0"))
+prompt_build_mode = os.environ.get("PROMPT_BUILD_MODE", "repeat").strip().lower()
+prompt_target_tokens = int(os.environ.get("PROMPT_TARGET_TOKENS", "0"))
+prompt_target_margin = int(os.environ.get("PROMPT_TARGET_MARGIN", "96"))
+prompt_reuse_request1_env = os.environ.get("PROMPT_REUSE_REQUEST1", "").strip()
 direct_retrieve_prewarm_after_request1 = int(
     os.environ.get("DIRECT_RETRIEVE_PREWARM_AFTER_REQUEST1", "0"))
 
@@ -332,16 +547,130 @@ sampling_params = SamplingParams(
     max_tokens=max_tokens,
 )
 
-shared_a = "介绍 LMCache 单卡基线的非复用开销。" * prompt_repeat
-shared_b = "介绍 BaM 接入前如何确认路径可重复性。" * prompt_repeat
-
 prefer_load_enable = os.environ.get("VLLM_BAM_LMCACHE_PREFER_LOAD_ENABLE",
                                      "0") == "1"
+if prompt_reuse_request1_env == "":
+    # 默认保持旧语义：只有 prefer-load 实验自动复用 request_1。
+    prompt_reuse_request1 = prefer_load_enable
+else:
+    # 显式开关用于 correctness 对照：
+    # 可以关闭 BaM prefer-load/direct-placement，但仍让 request_2 使用
+    # request_1 的同一份 prompt，从而单独验证 LMCache 原生 retrieve/rebuild。
+    prompt_reuse_request1 = prompt_reuse_request1_env.lower() in (
+        "1", "true", "yes", "on")
 
-prompt_a = [shared_a + "然后请用三句话介绍 Qwen2.5-7B-Instruct。"]
-prompt_b = [shared_b + "然后请说明为什么当前阶段先不测共享长前缀复用。"]
 
-if prefer_load_enable:
+def _build_repeat_prompts():
+    """维持原先按字符串重复构造样例的旧口径。"""
+    shared_a = "介绍 LMCache 单卡基线的非复用开销。" * prompt_repeat
+    shared_b = "介绍 BaM 接入前如何确认路径可重复性。" * prompt_repeat
+    prompt_a_local = [shared_a + "然后请用三句话介绍 Qwen2.5-7B-Instruct。"]
+    prompt_b_local = [shared_b + "然后请说明为什么当前阶段先不测共享长前缀复用。"]
+    return prompt_a_local, prompt_b_local
+
+
+def _build_token_budget_prompt(
+    *,
+    tokenizer,
+    prefix_title: str,
+    suffix_instruction: str,
+) -> tuple[list[str], int, int]:
+    """按目标 token 预算自动生成长前缀样例。
+
+    设计目标：
+
+    1. 尽量把 prompt 顶到接近 `max_model_len`，增加 prefix chunk 数；
+    2. 保证 prompt 长度不超过预算，避免再出现“猜 `PROMPT_REPEAT` 猜过头”；
+    3. 保持生成逻辑简单可读，不把复杂控制面掺进评测脚本。
+
+    返回：
+    - prompt 文本（按 vLLM `generate()` 的 list[str] 约定包装）
+    - 实际 prompt token 数
+    - 本次使用的目标 token 预算
+    """
+    # 没有显式传目标时，默认给输出 token 和少量控制余量留空间，
+    # 避免 prompt 过于贴边而把本轮生成直接顶爆。
+    target_budget = prompt_target_tokens
+    if target_budget <= 0:
+        target_budget = max(max_model_len - max_tokens - prompt_target_margin, 1)
+    target_budget = min(target_budget, max(max_model_len - 1, 1))
+
+    header = (
+        "下面是一段用于 LMCache + BaM direct retrieve 探测的长前缀材料。"
+        "请完整保留前缀上下文，再根据结尾指令作答。\n"
+        f"主题：{prefix_title}\n"
+        "说明：以下内容故意较长，用于观察 prefix chunk 恢复与 direct placement 行为。\n"
+    )
+    # 使用几种不同粒度的 filler unit，做一个简单贪心填充：
+    # - 大句子优先，快速把长度拉高
+    # - 中句子 / 小句子用于收尾，尽量把 token 数贴近预算
+    filler_units = [
+        "请继续从 LMCache、BaM、prefix reuse、direct placement、paged KV cache、异步轮询这几个角度补充系统细节。\n",
+        "请补充实现路径、日志观察点与性能含义。\n",
+        "继续补充说明。\n",
+    ]
+    trailer = suffix_instruction
+
+    def count_tokens(text: str) -> int:
+        return len(tokenizer.encode(text, add_special_tokens=False))
+
+    # 先保证基础头尾能放得下；如果连基础文本都超预算，就直接截断中间 filler，
+    # 返回一个尽量短但合法的 prompt。
+    prompt_text = header
+    base_with_trailer = header + trailer
+    if count_tokens(base_with_trailer) > target_budget:
+        # 这里保守退化成只保留 trailer，避免把脚本直接弄成 hard error。
+        prompt_text = trailer
+        actual_tokens = count_tokens(prompt_text)
+        return [prompt_text], actual_tokens, target_budget
+
+    while True:
+        appended = False
+        for unit in filler_units:
+            candidate = prompt_text + unit + trailer
+            if count_tokens(candidate) <= target_budget:
+                prompt_text += unit
+                appended = True
+                break
+        if not appended:
+            break
+
+    prompt_text += trailer
+    actual_tokens = count_tokens(prompt_text)
+    return [prompt_text], actual_tokens, target_budget
+
+
+def _build_prompts():
+    """统一构造本次实验要用的 prompt 样例。"""
+    if prompt_build_mode != "token_budget":
+        prompt_a_local, prompt_b_local = _build_repeat_prompts()
+        return prompt_a_local, prompt_b_local
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        model,
+        trust_remote_code=False,
+    )
+    prompt_a_local, prompt_a_tokens, prompt_a_budget = _build_token_budget_prompt(
+        tokenizer=tokenizer,
+        prefix_title="LMCache 单卡非共享前缀读取成本与 BaM direct placement 探测",
+        suffix_instruction="然后请用三句话介绍 Qwen2.5-7B-Instruct。",
+    )
+    prompt_b_local, prompt_b_tokens, prompt_b_budget = _build_token_budget_prompt(
+        tokenizer=tokenizer,
+        prefix_title="BaM 接入前如何确认路径可重复性与评测口径一致性",
+        suffix_instruction="然后请说明为什么当前阶段先不测共享长前缀复用。",
+    )
+    print(
+        "[prompt-build] mode=token_budget "
+        f"prompt_a_tokens={prompt_a_tokens} prompt_a_budget={prompt_a_budget} "
+        f"prompt_b_tokens={prompt_b_tokens} prompt_b_budget={prompt_b_budget}"
+    )
+    return prompt_a_local, prompt_b_local
+
+
+prompt_a, prompt_b = _build_prompts()
+
+if prompt_reuse_request1:
     # 为了明确验证 BaM/LMCache 读回链路，这里让第二个请求复用第一个请求的长 prompt。
     # 这样不会依赖 vLLM 自身的 prefix cache，而是直接观察 LMCache retrieve
     # 是否真的走到了我们新增的 BaM prefer-load。

@@ -6,16 +6,16 @@ The MooncakeStoreConnector transfers KV caches between prefill vLLM workers
 database-style KVStore.
 """
 import hashlib
-from typing import TYPE_CHECKING, List, Tuple, Union
+from typing import TYPE_CHECKING, List
 
 import torch
 
 from vllm.config import VllmConfig
-from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBase
+from vllm.distributed.kv_transfer.kv_connector.base import (KVConnectorBase,
+                                                            KVReceiveResult)
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     model_aware_kv_ops_helper as kv_helper)
 from vllm.logger import init_logger
-from vllm.sequence import IntermediateTensors
 
 if TYPE_CHECKING:
     from vllm.worker.model_runner import ModelInputForGPUWithSamplingMetadata
@@ -114,8 +114,7 @@ class MooncakeStoreConnector(KVConnectorBase):
         self, model_executable: torch.nn.Module,
         model_input: "ModelInputForGPUWithSamplingMetadata",
         kv_caches: List[torch.Tensor]
-    ) -> Tuple[Union[torch.Tensor, IntermediateTensors], bool,
-               "ModelInputForGPUWithSamplingMetadata"]:
+    ) -> KVReceiveResult:
         bypass_model_exec = True
         input_tokens_tensor = model_input.input_tokens
         seq_lens = model_input.attn_metadata.seq_lens
@@ -190,7 +189,15 @@ class MooncakeStoreConnector(KVConnectorBase):
             hidden_or_intermediate_states = torch.cat(
                 hidden_or_intermediate_states_for_one_req, dim=0)
 
-        return hidden_or_intermediate_states, bypass_model_exec, model_input
+        if bypass_model_exec:
+            return KVReceiveResult.ready_bypass(
+                model_input=model_input,
+                hidden_or_intermediate_states=hidden_or_intermediate_states,
+            )
+        return KVReceiveResult.ready_forward(
+            model_input=model_input,
+            hidden_or_intermediate_states=hidden_or_intermediate_states,
+        )
 
     @staticmethod
     def tensor_hash(tensor: torch.Tensor) -> int:

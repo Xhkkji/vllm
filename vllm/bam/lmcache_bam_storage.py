@@ -64,12 +64,11 @@ BAM_PAGE_BYTES = 128 * 1024
 # - rowctx_baseline:
 #     旧的稳定 rowctx batch read + host materialized placement。
 # - gpu_worker_persistent_materialized:
-#     当前端到端输出正确的 fast path。GPU persistent service 负责 poll/read/stage，
-#     host finalize 再用已验证正确的 materialized placement 写 vLLM paged KV cache。
+#     保留的稳定对照 fast path。GPU persistent service 负责 poll/read/stage，
+#     host finalize 再用 materialized placement 写 vLLM paged KV cache。
 # - gpu_worker_persistent_one_copy:
-#     最激进 one-copy 实验线。GPU persistent service 直接写最终 vLLM paged
-#     KV cache；前台只观察 consumable frontier 并做 cleanup，不再夹带
-#     materialized repair/verify 支线。
+#     当前稳定 one-copy 基线。GPU persistent service + mover CTA 直接写最终
+#     vLLM paged KV cache；前台只观察 consumable frontier 并做 cleanup。
 _DIRECT_PIPELINE_ROWCTX_BASELINE = "rowctx_baseline"
 _DIRECT_PIPELINE_GPU_WORKER_PERSISTENT_MATERIALIZED = (
     "gpu_worker_persistent_materialized")
@@ -423,7 +422,7 @@ class _InFlightDirectPlacementRequest:
     runtime_metadata_fast_path_authoritative: bool = False
     runtime_metadata_consumable_tokens: int = 0
     # runtime cleanup-only 主线下，`kv_read_handle` 会在 read consume 收口后清空，
-    # 但 verify / profile / 调试日志仍可能需要访问这次 native batch 对应的
+    # 但 profile / 调试日志仍可能需要访问这次 native batch 对应的
     # `request_table.pages`、submit_ms、poll_ms 等信息。
     #
     # 因此这里单独保留一份“cleanup 之后仍可只读观察”的句柄引用，避免后续调试支线
@@ -2639,7 +2638,7 @@ class LMCacheBaMStore:
         in_flight_request: _InFlightDirectPlacementRequest,
         runtime_cleanup_handle: Any | None,
     ) -> _DirectPlacementFinalizeBackendOutcome:
-        """收口 one-copy 实验主线。
+        """收口 one-copy 基线主线。
 
         这条路径只做两件事：
 

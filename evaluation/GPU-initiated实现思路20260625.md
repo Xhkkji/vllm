@@ -1,7 +1,7 @@
 # GPU-initiated BaM 实现思路
 
 日期：2026-06-25
-最近整理：2026-07-17
+最近整理：2026-07-19
 
 本文只保留当前 `vllm-bam` 中与 LMCache / vLLM KVCache 主线直接相关、并且仍有工程价值的实现思路。
 目标不是记录所有历史尝试，而是回答下面四个问题：
@@ -26,13 +26,37 @@
 
 ## 1. 当前主线结论
 
-截至 2026-07-17，当前主线可以概括成一句话：
+截至 2026-07-19，当前主线可以概括成一句话：
 
 ```text
 BaM 读回、direct placement 和现有 attention 消费链路已经基本打通；
-当前开发主线不再只是继续收薄某一个局部数据搬运步骤，
-而是把 completion、frontier 和 request 状态管理继续下沉到
-GPU persistent service。
+当前 one-copy 已经恢复到可正确跑通的 cta=4 性能基线；
+下一步不应再堆临时 repair / rescue 分支，
+而应在保持三条 KV 链路解耦的前提下，
+继续把 control service 和 data mover worker 的职责拆清楚。
+```
+
+当前最新可跑通的一次稳定 one-copy 日志：
+
+```text
+evaluation/logs/single_gpu_lmcache_no_prefix_reuse_qwen25/20260719_023812/run.log
+
+request_2_elapsed_s=1.5297
+pipeline=gpu_worker_persistent_one_copy
+worker_backend=kv_persistent_service_v0
+finalize_mode=runtime_direct
+read_ms=22.154
+poll_iters=4
+runtime_row=(1, 4, 3, 2, ...)
+```
+
+这次结果说明：
+
+```text
+1. 当前不是路径回退；
+2. request_2 已经从 SUBMITTED 正常推进到 CONSUMED；
+3. BaM cache page -> vLLM paged KV cache 的 one-copy scatter 正确性已经恢复；
+4. 性能回到之前约 1.55s/request 的口径。
 ```
 
 当前已经明确跑通的真实链路：
@@ -3585,4 +3609,172 @@ GPU 负责异步 I/O、状态机和数据移动；
 控制面轻量常驻；
 数据面宽并行、按资源预算执行；
 推理侧只消费已经发布的 consumable KV。
+```
+
+### 13.7.12 2026-07-19 cta=4 one-copy 恢复与 CQ 根因确认
+
+本轮回退后，`GIDS_KV_GPU_WORKER_MOVER_CTAS=4` 一度再次卡在 request 2：
+
+```text
+request_id=2
+runtime_row=(1, 1, 1, 2, ...)
+host_status=1
+read_ready_chunks=4/4
+cache_ready_chunks=0/4
+consumable_chunks=0/4
+```
+
+这个状态的含义是：
+
+```text
+1. request 已经 submit 并 attach 到 runtime slot；
+2. high-level frontier 已经知道本轮应该读 4 个 prefix chunk；
+3. 但 GPU runtime slot 仍停在 SUBMITTED；
+4. persistent service 没有把底层 CQ completion 推进到 IO_DONE / CONSUMED。
+```
+
+最终确认这不是没有重新编译，也不是路径回退。
+
+证据：
+
+```text
+BAM_ROW_STORE_IMPORT:
+  bam_feature_store=/home/xhk/llm-inference/BaM_IOStack/gids_module/build/BAM_Feature_Store/__init__.py
+
+BAM_Feature_Store.so:
+  /home/xhk/llm-inference/BaM_IOStack/gids_module/build/BAM_Feature_Store/BAM_Feature_Store.so
+
+request_1:
+  pipeline=gpu_worker_persistent_one_copy
+  worker_backend=kv_persistent_service_v0
+  finalize_mode=runtime_direct
+```
+
+真正根因是 BaM 底层 CQ service 的 missing `ctx_lookup` 处理方式被改偏了。
+
+错误改法：
+
+```text
+cq_try_peek_head()
+  -> 如果 cid 对应的 ctx_lookup[slot] == nullptr
+       保留 CQ head
+       break
+```
+
+这个写法看起来像是在避免 completion 丢失，但当前 BaM CQ/CID 语义里，
+CQ head 可能对应旧 request、stale entry 或已经不再有 lookup 的 completion。
+如果保留这个 head，就会永久堵住对应 queue，后续真正属于 request 2 的
+completion 无法被 service 到，所以 request 2 一直停在 `SUBMITTED`。
+
+恢复后的正确语义与 `22b7cc7` 已验证版本一致：
+
+```text
+cq_try_peek_head()
+  -> dequeue CQ head
+  -> put_cid()
+  -> 如果 cid >= capacity，跳过
+  -> 查 ctx_lookup[logical_queue, cid]
+  -> 如果 ctx_lookup 缺失，跳过
+  -> 如果 ctx_lookup 存在，finalize_registered_ctx_completion()
+```
+
+这条规则的工程含义：
+
+```text
+1. CQ head 不能被一个 missing lookup 永久堵住；
+2. 当前 CQ entry 没有 request/generation 级别匹配字段，
+   因此不能把 missing lookup 当成“未来一定会变有效”的 completion；
+3. 要彻底解决潜在竞态，应在底层引入 request/generation 匹配，
+   而不是在没有 generation 的情况下保留 CQ head；
+4. 当前阶段保持 22b7cc7 的已验证语义，优先保证 request 连续推进。
+```
+
+恢复后最新日志：
+
+```text
+evaluation/logs/single_gpu_lmcache_no_prefix_reuse_qwen25/20260719_023812/run.log
+```
+
+关键结果：
+
+```text
+request_id=2
+[BAM_KV_GPU_WORKER_POLL_READY] poll_iters=4 poll_ms=14.360
+runtime_row=(1, 4, 3, 2, ...)
+read_ms=22.154
+request_2_elapsed_s=1.5297
+```
+
+因此当前 cta=4 one-copy 链路已经恢复为：
+
+```text
+CPU:
+  1. submit request table
+  2. attach runtime placement / metadata descriptor
+  3. 非阻塞 observe runtime status
+  4. 看到 CONSUMED 后做 cleanup-only finalize
+
+GPU persistent service CTA:
+  1. 轮询 BaM CQ
+  2. dequeue completion
+  3. refresh runtime slot
+  4. request 到 IO_DONE 后发布 direct_move 任务
+  5. 等 mover CTA 完成
+  6. fill attention metadata
+  7. 发布 CONSUMED / consumable frontier
+
+GPU mover CTA1..N:
+  1. 观察 direct_move_state
+  2. atomic claim linear worker id
+  3. 按官方 vLLM paged KV ABI 执行 direct scatter
+  4. atomicAdd direct_move_done_ctas
+```
+
+当前应固定下来的实现约束：
+
+```text
+1. 不恢复 Python poll rescue。
+2. 不在 one-copy finalize 中 stop persistent service。
+3. 不恢复 official-write repair 覆盖 one-copy 结果。
+4. 不把 output_pages staging 混回 one-copy 正常热路径。
+5. CQ service 缺失 ctx_lookup 时不能堵 CQ head。
+6. 后续若要彻底修 CQ/lookup 竞态，应新增 generation/request 匹配语义。
+```
+
+当前三条链路仍应这样保留：
+
+```text
+rowctx_baseline:
+  正确性和回归兜底。
+
+gpu_worker_persistent_materialized:
+  GPU persistent poll/read/stage + host materialized placement。
+  用于判断 one-copy scatter 以外的 persistent 主线是否正常。
+
+gpu_worker_persistent_one_copy:
+  GPU persistent poll + mover CTA direct scatter + cleanup-only finalize。
+  当前已经恢复到 request_2_elapsed_s≈1.53s 的正确性能基线。
+```
+
+2026-07-19 已完成的基线收束：
+
+```text
+1. 主启动脚本已经按分支派生 mover CTA：
+   gpu_worker_persistent_one_copy -> GIDS_KV_GPU_WORKER_MOVER_CTAS=4
+   其它分支 -> GIDS_KV_GPU_WORKER_MOVER_CTAS=0
+
+2. one-copy wrapper 不再重复透传 debug/profile/mover/prewarm 默认值，
+   只声明 VLLM_BAM_KV_BRANCH=gpu_worker_persistent_one_copy。
+
+3. vLLM / BaM 注释已从“激进实验 / verify repair”收束为
+   “cta=4 one-copy 稳定基线”。
+```
+
+后续不建议继续围绕 CQ missing lookup 加临时保护分支。
+更合理的方向是：
+
+```text
+1. 如果继续优化性能，应从 control service / data mover worker 解耦入手；
+2. 如果继续优化稳定性，应在 BaM 底层补 request/generation 级 CQ 匹配，
+   而不是在 service loop 里用保留 CQ head 的方式猜测 completion 所属关系。
 ```

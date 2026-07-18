@@ -3250,3 +3250,339 @@ VLLM_BAM_XFORMERS_QUERY_BACKEND=...
 ```
 
 这些只用于日志或 xFormers fallback 诊断，不再决定三条 KV 主链路本身。
+
+### 13.7.11 2026-07-18 性能瓶颈重判：persistent service 不应同时承担控制面和大数据搬运
+
+最新 one-copy 正确版本已经确认：
+
+```text
+pipeline=gpu_worker_persistent_one_copy
+worker_backend=kv_persistent_service_v0
+impl=gpu_runtime_direct
+finalize_mode=runtime_direct
+```
+
+这说明当前 request_2 没有路径回退，已经走到：
+
+```text
+BaM cache page
+  -> GPU persistent service direct scatter
+  -> vLLM paged KV cache
+  -> xFormers 从 paged KV cache 消费 prefix
+```
+
+但最新性能仍然停在约：
+
+```text
+request_2_elapsed_s ~= 1.84s
+read_ms ~= 339ms
+poll_ms ~= 332ms
+poll_iters ~= 208
+```
+
+同时，清理掉 Python rebuild stage 日志和 device-side direct-place probe 后，
+性能只小幅改善，说明当前大头不是日志，也不是 xFormers fallback 的单点问题。
+
+当前底层实现的关键结构是：
+
+```text
+kv_worker_runtime_persistent_service_kernel<<<1, 128>>>:
+  1. service CQ / completion
+  2. refresh runtime slots
+  3. 扫描 runtime slot
+  4. 如果 request IO_DONE，直接在同一个 CTA 内执行：
+       BaM cache -> vLLM paged KV cache one-copy scatter
+  5. 发布 CONSUMED / consumable frontier
+```
+
+这条实现把原先 CPU 侧多线程同步忙等轮询，收缩成了 GPU 侧一个轻量
+persistent service CTA 轮询 CQ。这个方向是对的：
+
+```text
+轮询 / completion / request 状态机:
+  适合由少量 GPU 常驻线程负责
+```
+
+但同一个 CTA 又承担了大规模数据搬运：
+
+```text
+4 chunks * 112 pages/chunk * 128KB/page ~= 56MB
+```
+
+这就把 56MB 级别的数据面压进了 128 个线程里。128 线程适合控制面，
+不适合做几十 MB 的 scatter copy，因此 persistent one-copy 正确版本虽然
+语义更接近最终目标，性能却会被单 CTA 搬运吞吐限制。
+
+另一个次要低效点是 runtime slot 扫描：
+
+```text
+runtime_capacity 默认 1024
+即使当前只有 1 个活跃 request，
+service 也会在 consume 阶段串行扫描 1024 个 slot，
+并在 slot 循环中反复 __syncthreads()
+```
+
+这个会放大 service loop 成本，但不是 300ms 级瓶颈的主因。主因仍然是：
+
+```text
+控制面 service CTA 正在做数据面大搬运
+```
+
+#### 四篇工作的启发
+
+BaM 的启发：
+
+```text
+BaM 的核心不是“CPU 帮 GPU 做 I/O”，而是让 GPU 能以高并发方式发起
+细粒度 storage access，并通过 GPU-side software cache / high-throughput
+queues 合并请求、降低 I/O amplification。
+```
+
+映射到当前 KVCache 主线：
+
+```text
+1. 继续保留 BaM 的 GPU-side CQ / cache / request table 能力。
+2. 不应把 CPU poll 重新拉回热路径。
+3. 但也不应把大数据搬运限制在单个 service CTA 内。
+```
+
+Tutti 的启发：
+
+```text
+Tutti 把 SSD-backed KV cache 做成 GPU-centric KV object store，
+目标是把 CPU 从 HBM <-> SSD 的关键数据路径和 I/O 控制路径中移走。
+同时它强调 GPU-native object abstraction 和 slack-aware I/O scheduling。
+```
+
+映射到当前主线：
+
+```text
+1. 当前 chunk/page/slot_mapping/kv_cache_ptrs 应继续收成 GPU-visible object descriptor。
+2. CPU 可以负责高层 request admission / vLLM block 分配，但不应参与 page/chunk 数据搬运。
+3. I/O worker 不能无约束抢占 SM；需要能限制数据搬运 CTA 数量，避免和 attention 争资源。
+```
+
+TARDIS 的启发：
+
+```text
+TARDIS 的方向是 GPU-centric KV cache service。
+对 LLM 推理来说，KV cache 不应继续被当作普通 feature row 或通用 tensor
+读写，而应有面向层、chunk、request frontier 的专用服务语义。
+```
+
+映射到当前主线：
+
+```text
+1. 保留 KV 专用 request/frontier/completion table，不再回退通用 row 语义。
+2. 后续应支持 layer-wise / chunk-wise consumable，而不是只把整批 request
+   当作一个 blocking read。
+3. attention 需要哪一层、哪一段 prefix，GPU runtime 应能按 frontier 逐步发布。
+```
+
+AGIO 的启发：
+
+```text
+AGIO 强调把 I/O initiation 和 completion 解耦，让 GPU 线程发起异步 I/O 后，
+可以继续推进其它工作，而不是同步等待 completion。
+```
+
+映射到当前主线：
+
+```text
+1. CPU submit 之后立刻返回，只观察 consumable 状态，这是正确方向。
+2. GPU service 不应在一次 request 内同步卡死等待所有后续工作都完成。
+3. 应把 read completion、copy job、consumable publish 拆成异步流水。
+```
+
+#### 最终推荐架构
+
+最终不应该是：
+
+```text
+一个 persistent service CTA:
+  poll CQ
+  refresh state
+  搬 56MB KV
+  fill metadata
+  publish consumable
+```
+
+而应该拆成两个 GPU 角色：
+
+```text
+GPU persistent control service:
+  少量常驻线程 / 1 个 service CTA
+  负责：
+    - CQ poll
+    - page/chunk/request 状态机
+    - frontier / completion / consumable 发布
+    - 生成 copy job
+
+GPU data mover workers:
+  多 CTA / 可配置线程资源
+  负责：
+    - 读取 copy job queue
+    - 并行执行 BaM cache -> vLLM paged KV cache
+    - 搬完后更新 cache_ready / consumable
+```
+
+对应数据流：
+
+```text
+CPU / vLLM scheduler:
+  1. prefix 命中分析
+  2. 分配 vLLM paged KV blocks
+  3. 生成 GPU-visible request descriptor
+  4. submit seed request 后立即返回
+  5. 后续只 poll consumable frontier
+
+GPU control service:
+  1. 轮询 BaM CQ
+  2. 发现 page ready
+  3. 更新 page/chunk/read_ready 状态
+  4. 当 chunk/page 达到可搬运条件，写入 copy_job_queue
+  5. 观察 data mover 完成状态
+  6. 发布 chunk_consumable / request_consumable
+
+GPU data mover:
+  1. 从 copy_job_queue 取 job
+  2. 根据 request_table / chunk_start / slot_mapping / kv_cache_ptrs
+     计算源 BaM cache page 和目标 vLLM paged KV cache 地址
+  3. 多 CTA 并行 scatter
+  4. 写回 job_done / chunk cache_ready
+```
+
+这样可以同时满足两个目标：
+
+```text
+1. 轮询和状态管理仍然由 GPU 全权负责；
+2. 大规模数据搬运不再被 128-thread service CTA 限制。
+```
+
+#### 分阶段落地建议
+
+第一阶段：恢复正确 one-copy 的性能基线。
+
+```text
+persistent service CTA:
+  只做 CQ poll / 状态机 / 发布 IO_DONE
+
+host observe:
+  看到 IO_DONE 后只 launch 一个宽 scatter kernel
+  不做数据搬运、不做 CPU rebuild
+
+wide scatter kernel:
+  多 CTA 并行执行 BaM cache -> vLLM paged KV cache
+  完成后发布 CONSUMED / consumable
+```
+
+这一步仍有一次 CPU kernel launch，但 CPU 不参与数据搬运。它的价值是快速验证：
+
+```text
+当前 330ms 是否主要来自单 CTA 搬运。
+```
+
+如果宽 scatter kernel 能把 read/poll+place 拉回几十毫秒量级，就说明方向正确。
+
+第二阶段：把 wide scatter 的启动权下沉。
+
+```text
+GPU control service:
+  发现 chunk ready 后，不再等 CPU launch
+  直接向 GPU-resident copy_job_queue 发布 job
+
+GPU data mover persistent workers:
+  常驻或按资源预算运行
+  自己取 job 并执行 copy
+```
+
+这一步才是真正贴近最终 GPU-initiated runtime 的版本：
+
+```text
+CPU:
+  submit seed request
+  observe consumable
+
+GPU:
+  poll
+  issue follow-up work
+  move data
+  publish consumable
+```
+
+第三阶段：做推理引擎友好的 frontier。
+
+```text
+request-level consumable:
+  当前请求命中多少连续 prefix，就等待多少连续 prefix consumable 后返回。
+
+chunk/layer-level consumable:
+  后续可扩展到 layer-wise 或 chunk-wise publish，
+  让 attention 与 KV restore 有机会流水化。
+```
+
+这一步对应 Tutti / TARDIS 更强调的 serving 场景：不是单请求一次性搬完所有数据，
+而是在不破坏 vLLM 调度语义的前提下，把 I/O 和计算做成可重叠流水。
+
+#### 当前代码下一步应该怎么改
+
+短期不建议继续优化单 CTA 内部的 copy 循环，因为即使把 byte/uint4 细节调好，
+本质仍然是：
+
+```text
+1 个 CTA 搬几十 MB
+```
+
+更合理的下一步是：
+
+```text
+1. 把 persistent service 中 direct placement 的职责降级：
+   从“直接搬数据”改成“发布 ready/copy job”。
+
+2. 新增或复用一个宽 one-copy scatter kernel：
+   输入仍然是当前已经验证正确的 runtime descriptor：
+     request_table
+     ctx_ptr / ctx_count / ctx_stride
+     chunk_start
+     slot_mapping
+     kv_cache_ptrs
+     page layout 参数
+
+3. 先由 CPU 在 observe 到 IO_DONE 后 launch 这个宽 kernel，
+   用最少改动验证性能。
+
+4. 验证通过后，再把 launch 替换成 GPU-resident copy_job_queue +
+   persistent data mover workers。
+```
+
+需要保持的约束：
+
+```text
+1. 不回退到 output_pages staging。
+2. 不恢复 official-write repair。
+3. 不让 CPU rebuild / CPU copy 回到 one-copy 热路径。
+4. rowctx_baseline 和 materialized 分支继续保留，用作正确性对照。
+5. CNN/GNN/DNN 的通用 BaM 路径不参与这轮重构。
+```
+
+因此，新的最终主线应该从：
+
+```text
+GPU persistent service = poll + copy + publish
+```
+
+收束成：
+
+```text
+GPU runtime = control service + data mover workers
+```
+
+这才同时符合 BaM / Tutti / TARDIS / AGIO 给出的共同方向：
+
+```text
+CPU 从关键 I/O 控制路径和数据路径中退出；
+GPU 负责异步 I/O、状态机和数据移动；
+控制面轻量常驻；
+数据面宽并行、按资源预算执行；
+推理侧只消费已经发布的 consumable KV。
+```

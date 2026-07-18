@@ -112,7 +112,9 @@ class LMCacheBaMKVBatchReadPollSnapshot:
     这层对象只保存 direct placement request 当前真正需要观察的控制面信息：
 
     - `ready`
-      整个 native batch 是否已经到达 `IO_DONE`
+      整个 native batch 是否已经到达底层声明的可消费边界。对 runtime
+      one-copy 来说，这个边界是 GPU persistent service 已经完成
+      direct placement 并发布 `CONSUMED`。
     - `frontier_row`
       来自 BaM KV request 的 request-level frontier ABI
     - `read_ready_frontier_chunks`

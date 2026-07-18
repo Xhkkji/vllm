@@ -1292,15 +1292,19 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
                 full_value.shape[-1],
             )
 
-        logger.info(
-            "[XFORMERS_PREFIX_FALLBACK] query_lens=%s context_lens=%s "
-            "kv_lens=%s total_query_tokens=%d total_kv_tokens=%d",
-            list(plan.query_lens),
-            list(plan.context_lens),
-            list(plan.kv_lens),
-            query.shape[0],
-            plan.total_kv_tokens,
-        )
+        # xFormers fallback 每层都会执行一次；默认性能口径不逐层打印，
+        # 避免 Python logging 干扰端到端延迟。需要 profile 时由
+        # VLLM_BAM_XFORMERS_PREFIX_FALLBACK_PROFILE=1 恢复细粒度日志。
+        if profile_enabled:
+            logger.info(
+                "[XFORMERS_PREFIX_FALLBACK] query_lens=%s context_lens=%s "
+                "kv_lens=%s total_query_tokens=%d total_kv_tokens=%d",
+                list(plan.query_lens),
+                list(plan.context_lens),
+                list(plan.kv_lens),
+                query.shape[0],
+                plan.total_kv_tokens,
+            )
 
         stage_start = None
         stage_end = None
@@ -2819,14 +2823,17 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
         )
         prefill_meta._cached_prefix_fallback_plan = plan
         prefill_meta._cached_prefix_fallback_plan_key = plan_key
-        logger.info(
-            "[XFORMERS_PREFIX_FALLBACK_PLAN_BUILD] num_prefills=%d "
-            "query_lens=%s context_lens=%s total_context_tokens=%d",
-            prefill_meta.num_prefills,
-            list(query_lens),
-            list(context_lens),
-            total_context_tokens,
-        )
+        # plan build 通常每个 prefill 只打印一次，但仍属于 xFormers fallback
+        # 诊断信息；默认关闭，避免 performance run 的日志口径混入 profile。
+        if envs.VLLM_BAM_XFORMERS_PREFIX_FALLBACK_PROFILE:
+            logger.info(
+                "[XFORMERS_PREFIX_FALLBACK_PLAN_BUILD] num_prefills=%d "
+                "query_lens=%s context_lens=%s total_context_tokens=%d",
+                prefill_meta.num_prefills,
+                list(query_lens),
+                list(context_lens),
+                total_context_tokens,
+            )
         return plan
 
     def _gather_prefix_kv_from_cache(

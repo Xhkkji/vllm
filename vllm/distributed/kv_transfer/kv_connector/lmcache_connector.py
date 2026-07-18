@@ -8,6 +8,7 @@ The LMCacheConnector can (1) transfer KV caches between prefill vLLM worker
 """
 
 import dataclasses
+import os
 import time
 from typing import TYPE_CHECKING, Dict, List, Union
 
@@ -24,6 +25,33 @@ if TYPE_CHECKING:
     from vllm.worker.model_runner import ModelInputForGPUWithSamplingMetadata
 
 logger = init_logger(__name__)
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    """解析本 connector 只读调试开关。
+
+    这里不能复用 LMCache adapter 里的同名 helper，因为两个模块分属不同仓库、
+    导入方向也不同。connector 只需要用它判断是否打印热路径 poll 日志，不改变
+    任何 retrieve / placement 数据语义。
+    """
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _should_log_deferred_poll(attempts: int) -> bool:
+    """限制 deferred poll 热路径日志频率。
+
+    `GIDS_KV_DEBUG=1` 用来观察状态机，但 deferred retrieve 每个 engine
+    iteration 都会 poll 一次。如果每轮都打印，会把真正有用的状态变化淹没在
+    大量重复 WAIT 里，也会明显污染性能。因此这里采用固定节流：
+
+    - 前 5 次完整打印，方便看启动阶段；
+    - 之后每 1000 次打印一次，方便确认是否长期卡住。
+    """
+    attempts = int(attempts)
+    return attempts <= 5 or attempts % 1000 == 0
 
 
 @dataclasses.dataclass
@@ -433,15 +461,23 @@ class LMCacheConnector(KVConnectorBase):
         if not ready or force_extra_defer:
             wait_reason = ("forced_min_defer"
                            if force_extra_defer else "not_ready")
-            logger.info(
-                "[LMCACHE_BAM_DEFERRED_RETRIEVE_WAIT] request_ids=%s "
-                "wait_ms=%.3f poll_attempts=%d min_defer_polls=%d reason=%s",
-                ",".join(batch_key[0]),
-                (time.perf_counter() - pending_state.created_at_s) * 1000.0,
-                pending_state.poll_attempts,
-                min_defer_polls,
-                wait_reason,
-            )
+            # WAIT 发生在每个 engine iteration 的非阻塞 poll 热路径里。
+            # 性能跑默认只保留最终 DONE 统计；需要逐轮观察调度等待时再打开
+            # GIDS_KV_DEBUG=1，避免几百次 WAIT 日志污染延迟口径。
+            if (_env_flag("GIDS_KV_DEBUG")
+                    and _should_log_deferred_poll(
+                        pending_state.poll_attempts)):
+                logger.info(
+                    "[LMCACHE_BAM_DEFERRED_RETRIEVE_WAIT] request_ids=%s "
+                    "wait_ms=%.3f poll_attempts=%d min_defer_polls=%d "
+                    "reason=%s",
+                    ",".join(batch_key[0]),
+                    ((time.perf_counter() - pending_state.created_at_s) *
+                     1000.0),
+                    pending_state.poll_attempts,
+                    min_defer_polls,
+                    wait_reason,
+                )
             return KVReceiveResult.deferred(model_input=model_input)
 
         self._pending_deferred_retrieves.pop(batch_key, None)

@@ -2550,11 +2550,13 @@ class LMCacheBaMStore:
     ) -> _DirectPlacementFinalizeReadOutcome:
         """收口 `gpu_worker_persistent_one_copy` 的 read 阶段。
 
-        当前主线已经重新切回真正 one-copy：
+        当前主线恢复为之前可跑通的 one-copy 语义：
 
         ```text
         GPU persistent service:
+          CQ service / ctx refresh
           BaM cache page -> vLLM paged KV cache
+          发布 CONSUMED / consumable frontier
 
         host finalize:
           cleanup-only / detach request lifecycle

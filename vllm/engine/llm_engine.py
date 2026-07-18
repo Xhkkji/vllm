@@ -1424,7 +1424,11 @@ class LLMEngine:
                     seq_group_metadata_list=seq_group_metadata_list,
                     allow_async_output_proc=allow_async_output_proc,
                 )
-                logger.info(
+                # BaM/LMCache deferred retrieve 会在 I/O 未 ready 时跨多个
+                # engine iteration 重试同一批调度结果。这里是热路径，默认不再
+                # 用 info 逐轮打印，避免日志 I/O 影响性能测试；需要排查调度
+                # 行为时可打开 DEBUG 日志级别。
+                logger.debug(
                     "Deferred current model execution batch and will retry "
                     "the same schedule on the next engine iteration. "
                     "request_ids=%s",

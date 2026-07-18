@@ -3009,3 +3009,244 @@ first_xformers_prefix_total_ms=0.983
 先恢复 hidden prewarm + 关闭调试校验，再用 warmed steady-state 重新对比，
 才是和之前 1.55 iter/s 左右结果一致的比较方式。
 ```
+
+### 13.7.8 2026-07-17 清理后定版：三条 KV 链路与冗余支线收束
+
+本轮代码清理的原则是：保留已经有工程意义的三条 KV 链路，删除 one-copy 修错过程中临时堆出来的 verify / repair / live-pages decode 支线。清理后的主线不再依赖“先写错再 repair”的语义，也不再在常规启动脚本里透传大量调试开关。
+
+当前保留的三条链路如下：
+
+```text
+1. rowctx_baseline
+   CPU/rowctx batch read
+     -> materialized pages
+     -> BaMDirectKVPlacer / LMCache transfer
+     -> vLLM paged KV cache
+
+2. gpu_worker_persistent_materialized
+   GPU persistent service 负责 poll/read/stage
+     -> 前台 consume 出 materialized pages
+     -> BaMDirectKVPlacer / LMCache transfer
+     -> vLLM paged KV cache
+
+3. gpu_worker_persistent_one_copy
+   GPU persistent service 负责 poll/read/direct scatter/state publish
+     -> BaM cache page 按官方 flat paged-buffer ABI 直接写入 vLLM paged KV cache
+     -> 前台只做 cleanup、ret_mask 与 consumable frontier 发布
+```
+
+已经从主线代码中清理掉的内容：
+
+```text
+1. runtime-write verify：
+   不再从 live request pages 重新 materialize expected tensor。
+
+2. official-write repair：
+   不再调用 PagedAttention.write_to_paged_cache 覆盖 one-copy 写入结果。
+
+3. cross-source compare：
+   direct retrieve finalize 不再额外回头读 LMCache 原始 storage 做逐块对照。
+
+4. live-pages tensor decode：
+   KV fast path 不再保留 load_chunk_tensors_from_live_request_pages()
+   这类只服务 one-copy 调试校验的入口。
+```
+
+清理后 one-copy 的正确性边界更清楚：
+
+```text
+BaM cache page
+  -> GPU persistent service direct scatter
+  -> vLLM paged KV cache
+  -> xFormers 从 paged KV cache 消费 prefix
+```
+
+如果输出错误，不能再靠前台 repair 覆盖，而应直接回到底层 scatter ABI、slot_mapping、block table 和 xFormers paged-cache consume 语义排查。
+
+启动脚本也同步收束：
+
+```text
+run_single_gpu_lmcache_no_prefix_reuse_qwen25.sh
+  只保留基础 BaM/LMCache/direct-placement/runtime 参数；
+  不再透传 runtime-write verify、official-write verify、cross-source compare。
+
+run_single_gpu_lmcache_no_prefix_reuse_qwen25_gpu_worker_persistent.sh
+  固定 gpu_worker + runtime + persistent，默认 materialized fast path。
+
+run_single_gpu_lmcache_no_prefix_reuse_qwen25_gpu_worker_persistent_verify.sh
+  名字仍沿用，但当前语义是 one-copy 快速启动 wrapper：
+  默认打开 runtime one-copy + require one-copy，不再打开重型 verify。
+```
+
+后续如果要继续做性能恢复，应该基于这三条干净链路比较，而不是重新打开旧的 verify/repair 支线。
+
+### 13.7.9 2026-07-18 BaM 底层 KV façade 收束
+
+在上层三条 KV 链路已经定版之后，BaM 底层仍残留了一些早期实验接口：
+
+```text
+1. page-offset submit fallback
+2. status-only / no-status submit wrapper
+3. GIDS_KV_WORKER_POLL_IMPL 动态 poll 分支
+4. worker submit 失败后静默回退 rowctx batch
+```
+
+这些接口早期用于逐步接入 KV fast path，但当前会带来一个问题：
+
+```text
+日志上看起来是 gpu_worker / one-copy，
+底层却可能因为某个旧扩展符号或开关走到另一条语义。
+```
+
+因此本轮只对 KV 专用 façade 做收束，不碰 CNN/GNN/DNN 的通用 rowctx/read_feature 路径。
+
+收束后的底层入口如下：
+
+```text
+rowctx_baseline:
+  BaMRowCtxKVExecutor
+    -> BaMRowStore.kv_submit_chunk_batch_from_table()
+    -> C++ kv_submit_chunk_batch_from_table_with_completion()
+    -> kv_try_poll_batch()
+    -> kv_consume_chunk_batch()
+
+gpu_worker_persistent_materialized:
+  BaMGPUWorkerKVExecutor
+    -> BaMRowStore.kv_worker_submit()
+    -> C++ kv_worker_submit_from_table()
+    -> kv_worker_poll_request()
+    -> persistent service / rowctx_compat 状态推进
+    -> kv_worker_consume_batch()
+
+gpu_worker_persistent_one_copy:
+  BaMGPUWorkerKVExecutor
+    -> BaMRowStore.kv_worker_submit()
+    -> C++ kv_worker_submit_from_table()
+    -> attach runtime placement / attention metadata
+    -> persistent service direct scatter
+    -> kv_worker_cleanup_batch()
+```
+
+本轮清理后的关键约束：
+
+```text
+1. rowctx baseline 也固定从 request-table ABI 出发，
+   不再退回 page_offsets 路径。
+
+2. kv_worker_submit 必须显式传入 status/chunk_status/completion/frontier table，
+   缺少任意一张表直接报错，不再静默 fallback。
+
+3. C++ kv_worker_poll_batch 保留 ABI，但内部固定为 rowctx_compat_blocking。
+   persistent service 路径不依赖它，而是通过 kv_worker_poll_request()
+   只读 runtime slot 状态。
+
+4. 上层日志不再打印已废弃的 poll impl 开关，
+   改为打印 kv executor/runtime/persistent 三个真正影响分支的参数。
+```
+
+这样三条链路的区别被压回到明确的执行层：
+
+```text
+rowctx_baseline:
+  是否使用 worker = 否
+  是否 persistent = 否
+  是否 one-copy = 否
+
+gpu_worker_persistent_materialized:
+  是否使用 worker = 是
+  是否 persistent = 是
+  是否 one-copy = 否
+
+gpu_worker_persistent_one_copy:
+  是否使用 worker = 是
+  是否 persistent = 是
+  是否 one-copy = 是
+```
+
+后续如果 one-copy 或 materialized 再出问题，排查时不应再怀疑旧 submit/poll
+fallback 是否偷偷生效，而应直接看当前分支自己的状态机、placement attachment、
+frontier/consumable 发布和 xFormers 消费侧。
+
+### 13.7.10 2026-07-18 启动开关收束：三条分支只暴露一个用户层选择器
+
+当前启动层也进一步收束，不再要求命令行同时传：
+
+```text
+VLLM_BAM_KV_EXECUTOR
+GIDS_KV_GPU_WORKER_RUNTIME_ENABLE
+GIDS_KV_GPU_WORKER_PERSISTENT_ENABLE
+VLLM_BAM_DIRECT_PLACEMENT_RUNTIME_ONE_COPY
+VLLM_BAM_DIRECT_PLACEMENT_REQUIRE_RUNTIME_ONE_COPY
+```
+
+这些变量仍然会导出给底层代码使用，但不再作为用户手工组合的主入口。
+用户层只保留一个分支选择器：
+
+```text
+VLLM_BAM_KV_BRANCH=rowctx_baseline
+VLLM_BAM_KV_BRANCH=gpu_worker_persistent_materialized
+VLLM_BAM_KV_BRANCH=gpu_worker_persistent_one_copy
+```
+
+主脚本 `run_single_gpu_lmcache_no_prefix_reuse_qwen25.sh` 根据分支名统一派生低层开关：
+
+```text
+rowctx_baseline:
+  VLLM_BAM_KV_EXECUTOR=rowctx
+  GIDS_KV_GPU_WORKER_RUNTIME_ENABLE=0
+  GIDS_KV_GPU_WORKER_PERSISTENT_ENABLE=0
+  VLLM_BAM_DIRECT_PLACEMENT_RUNTIME_ONE_COPY=0
+  VLLM_BAM_DIRECT_PLACEMENT_REQUIRE_RUNTIME_ONE_COPY=0
+
+gpu_worker_persistent_materialized:
+  VLLM_BAM_KV_EXECUTOR=gpu_worker
+  GIDS_KV_GPU_WORKER_RUNTIME_ENABLE=1
+  GIDS_KV_GPU_WORKER_PERSISTENT_ENABLE=1
+  VLLM_BAM_DIRECT_PLACEMENT_RUNTIME_ONE_COPY=0
+  VLLM_BAM_DIRECT_PLACEMENT_REQUIRE_RUNTIME_ONE_COPY=0
+
+gpu_worker_persistent_one_copy:
+  VLLM_BAM_KV_EXECUTOR=gpu_worker
+  GIDS_KV_GPU_WORKER_RUNTIME_ENABLE=1
+  GIDS_KV_GPU_WORKER_PERSISTENT_ENABLE=1
+  VLLM_BAM_DIRECT_PLACEMENT_RUNTIME_ONE_COPY=1
+  VLLM_BAM_DIRECT_PLACEMENT_REQUIRE_RUNTIME_ONE_COPY=1
+```
+
+这样做的目的不是删除底层能力，而是减少错误组合：
+
+```text
+1. 不再出现 executor=gpu_worker 但 persistent 没开的半配置。
+2. 不再出现 one-copy 打开但 require-one-copy 没开的模糊语义。
+3. 日志先打印 vllm_bam_kv_branch，再打印派生后的低层值，方便确认真实路径。
+4. 旧命令仍兼容：未显式设置 VLLM_BAM_KV_BRANCH 时，主脚本会根据旧低层变量推断分支。
+```
+
+对应 wrapper 也收束为只声明分支：
+
+```text
+run_single_gpu_lmcache_no_prefix_reuse_qwen25.sh
+  默认等价 rowctx_baseline；
+  也可显式传 VLLM_BAM_KV_BRANCH=rowctx_baseline。
+
+run_single_gpu_lmcache_no_prefix_reuse_qwen25_gpu_worker_persistent.sh
+  默认只传：
+    VLLM_BAM_KV_BRANCH=gpu_worker_persistent_materialized
+
+run_single_gpu_lmcache_no_prefix_reuse_qwen25_gpu_worker_persistent_verify.sh
+  文件名沿用历史 verify 命名；
+  当前语义是 one-copy 快速启动 wrapper，默认只传：
+    VLLM_BAM_KV_BRANCH=gpu_worker_persistent_one_copy
+    DIRECT_RETRIEVE_PREWARM_AFTER_REQUEST1=0
+```
+
+仍然保留的非分支调试开关：
+
+```text
+GIDS_KV_DEBUG=1
+VLLM_BAM_XFORMERS_PREFIX_FALLBACK_PROFILE=1
+VLLM_BAM_XFORMERS_PREFIX_BACKEND=...
+VLLM_BAM_XFORMERS_QUERY_BACKEND=...
+```
+
+这些只用于日志或 xFormers fallback 诊断，不再决定三条 KV 主链路本身。

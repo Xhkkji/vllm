@@ -46,7 +46,6 @@ from vllm.bam.lmcache_bam_prefetch import (LMCacheBaMChunkReadRequest,
                                            LMCacheBaMPagePipeline)
 from vllm.bam.row_store_loader import (import_bam_row_store,
                                        parse_optional_int_list)
-from vllm.attention.ops.paged_attn import PagedAttention
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -68,8 +67,9 @@ BAM_PAGE_BYTES = 128 * 1024
 #     当前端到端输出正确的 fast path。GPU persistent service 负责 poll/read/stage，
 #     host finalize 再用已验证正确的 materialized placement 写 vLLM paged KV cache。
 # - gpu_worker_persistent_one_copy:
-#     最激进 one-copy 实验线。目标是让 GPU persistent service 直接写最终
-#     vLLM paged KV cache；当前仍允许带 correctness repair/verify。
+#     最激进 one-copy 实验线。GPU persistent service 直接写最终 vLLM paged
+#     KV cache；前台只观察 consumable frontier 并做 cleanup，不再夹带
+#     materialized repair/verify 支线。
 _DIRECT_PIPELINE_ROWCTX_BASELINE = "rowctx_baseline"
 _DIRECT_PIPELINE_GPU_WORKER_PERSISTENT_MATERIALIZED = (
     "gpu_worker_persistent_materialized")
@@ -137,32 +137,6 @@ class BaMChunkMetadata:
     actual_tokens: int
     shape: torch.Size
     dtype: torch.dtype
-
-
-@dataclass(frozen=True)
-class _BaMChunkWriteReadVerifySample:
-    """保存 shadow write 源 chunk 的轻量抽样。
-
-    这个对象只服务 `VLLM_BAM_WRITE_READ_VERIFY=1` 调试开关：
-
-    - 写入 BaM 时，从 LMCache 原始 chunk 中抽少量点保存到 CPU；
-    - 后续 direct retrieve 从 BaM 读回并 decode 成 dense chunk 后，再按同样
-      坐标抽样比对。
-
-    这样可以直接回答一个很关键的问题：
-
-      `LMCache 原始 chunk -> BaM page encode/store -> BaM read/decode`
-
-    这一段数据顺序是否保持一致。它不参与正式热路径，默认不开启。
-    """
-
-    chunk_hash: str
-    shape: torch.Size
-    dtype: torch.dtype
-    layer_indices: tuple[int, ...]
-    token_indices: tuple[int, ...]
-    dim_indices: tuple[int, ...]
-    values: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -455,16 +429,6 @@ class _InFlightDirectPlacementRequest:
     # 因此这里单独保留一份“cleanup 之后仍可只读观察”的句柄引用，避免后续调试支线
     # 再误回头读已经被置空的 `kv_read_handle`。
     runtime_cleanup_handle: Any | None = None
-    # 基于 live request pages 还原出来的 dense prefix chunk tensors。
-    #
-    # 这份数据的语义刻意对齐此前已经验证可跑通的“两次搬运”旧路径：
-    #
-    #   BaM pages -> [2, num_layers, tokens, hidden]
-    #
-    # 当前它只服务新的 xformers `dense_prefix_workspace_consume` backend，
-    # 让 prefix fallback 可以直接消费一份已经 materialize 正确的 dense KV，
-    # 从而暂时绕开 paged-KV consume 语义仍未完全收敛的问题。
-    materialized_prefix_chunk_tensors: tuple[torch.Tensor, ...] | None = None
     # 只在 native read 还活着的阶段用于“打一次 attach 日志”。
     # 一旦我们已经确认这次请求真的挂进了 GPU worker runtime slot，就不需要在
     # 后续每次 poll 都重复打印同一份上下文。
@@ -479,10 +443,8 @@ class _DirectPlacementFinalizeReadOutcome:
 
     1. 当前请求最终落在哪条读收口主线
     2. 若是 cleanup-only，当前仍可用于读统计/校验的原始 handle 是谁
-    3. 安全校验场景下，是否已经成功从 live request pages 构造出 expected_tensors
-
-    这样 `_finalize_direct_placement_request()` 后续就不需要再把这些临时变量
-    一路在大函数内部链式传递。
+    这样 `_finalize_direct_placement_request()` 后续只需要按 finalize mode 分派，
+    不再把 one-copy 调试期的 expected tensor / repair 状态一路传递。
     """
 
     # 当前只保留两条明确命名的 finalize 主线：
@@ -496,7 +458,6 @@ class _DirectPlacementFinalizeReadOutcome:
     read_finalize_mode: str
     pipeline_name: str
     runtime_cleanup_handle: Any | None
-    runtime_verify_expected_tensors: dict[str, torch.Tensor] | None
 
 
 @dataclass(frozen=True)
@@ -508,10 +469,6 @@ class _DirectPlacementFinalizeBackendOutcome:
     place_stats: Any
     frontier_wave_ms: float
     cache_ready_log_ms: float
-    # one-copy raw runtime write verify 必须在 official-write repair 前执行。
-    # 外层 finalize 用这个标记避免 repair 之后再次跑同一个 verifier，导致“原始
-    # GPU scatter 结果”和“repair 后结果”在日志里混淆。
-    raw_runtime_write_verified: bool = False
 
 
 class LMCacheBaMStore:
@@ -526,8 +483,6 @@ class LMCacheBaMStore:
 
         self._chunk_slots: "OrderedDict[str, int]" = OrderedDict()
         self._chunk_metadata: Dict[str, BaMChunkMetadata] = {}
-        self._write_read_verify_refs: Dict[
-            str, _BaMChunkWriteReadVerifySample] = {}
         self._slot_lock = threading.Lock()
         self._prefetch_pipeline: Optional[LMCacheBaMPagePipeline] = None
         # Direct placement 的 placer 需要跨请求复用，才能真正保留：
@@ -626,35 +581,6 @@ class LMCacheBaMStore:
             )
             return False
 
-    def _stop_kv_runtime_service_if_idle_for_verify_debug(self) -> bool:
-        """verify 调试路径复用通用 idle-stop 边界。
-
-        这里保留旧 helper 名称，避免调试分支四处改动；实际语义已经收束到
-        `_stop_kv_runtime_service_if_idle()`。
-        """
-        return self._stop_kv_runtime_service_if_idle(
-            source="verify_debug",
-            reason="read_final_kv_cache_for_debug",
-        )
-
-    def _stop_kv_runtime_service_if_idle_for_one_copy_dense_refill(self) -> bool:
-        """one-copy correctness repair 进入 materialized refill 前的安全边界。
-
-        当前 one-copy 仍处在 correctness-first 收敛阶段：GPU persistent service
-        已负责 submit/poll/read，但最后为了和已知正确的 materialized 路径对齐，
-        需要从 live request pages 还原一份 dense prefix，再用 vLLM 官方写端
-        覆盖 paged KV cache。
-
-        这份 dense prefix 现在复用 materialized 路径同一套 Triton refill kernel。
-        在 V100 上，如果 persistent service 已经 idle 但仍常驻运行，前台再 launch
-        refill kernel 可能被空转 service 拖住。因此这里明确只在 active_count=0
-        时停止 service；如果还有活跃 request，底层会拒绝停止，主线不会误杀。
-        """
-        return self._stop_kv_runtime_service_if_idle(
-            source="one_copy_dense_refill",
-            reason="prepare_dense_prefix_with_materialized_refill",
-        )
-
     def __del__(self) -> None:
         try:
             self.close()
@@ -741,7 +667,6 @@ class LMCacheBaMStore:
                 evicted_chunk_hash, evicted_slot_id = self._chunk_slots.popitem(
                     last=False)
                 self._chunk_metadata.pop(evicted_chunk_hash, None)
-                self._write_read_verify_refs.pop(evicted_chunk_hash, None)
                 logger.info(
                     "[LMCACHE_BAM] evict oldest chunk slot chunk_hash=%s slot=%d",
                     evicted_chunk_hash[:16],
@@ -763,205 +688,6 @@ class LMCacheBaMStore:
 
     def get_chunk_metadata(self, key: Any) -> Optional[BaMChunkMetadata]:
         return self._lookup_metadata(_extract_chunk_hash(key))
-
-    @staticmethod
-    def _verify_sample_indices(length: int, candidates: tuple[int, ...],
-                               *, fallback_count: int) -> tuple[int, ...]:
-        """生成稳定抽样下标，覆盖开头、page 边界和尾部。
-
-        这里不用随机采样，是为了让同一次问题在多轮运行里能稳定复现。
-        """
-        valid: list[int] = []
-        for index in candidates:
-            if 0 <= int(index) < int(length) and int(index) not in valid:
-                valid.append(int(index))
-        cursor = 0
-        while len(valid) < fallback_count and cursor < int(length):
-            if cursor not in valid:
-                valid.append(cursor)
-            cursor += 1
-        return tuple(valid)
-
-    def _build_write_read_verify_sample(
-        self,
-        *,
-        chunk_hash: str,
-        tensor: torch.Tensor,
-    ) -> _BaMChunkWriteReadVerifySample:
-        """从 LMCache 原始 chunk 中抽取一小块 CPU reference。
-
-        抽样点特意包含 token 127/128/255 一类边界位置。对于当前 128KB page
-        布局，Qwen2.5-7B fp16 的一个 page 正好容纳 128 个 token，所以这些
-        位置可以帮助我们快速识别“page 顺序错位”。
-        """
-        if tensor.dim() != 4:
-            raise ValueError(
-                "write/read verify expects LMCache tensor shape "
-                f"[2, layers, tokens, hidden], got {tuple(tensor.shape)}")
-
-        _, num_layers, actual_tokens, hidden_dim = tensor.shape
-        layer_indices = self._verify_sample_indices(
-            int(num_layers),
-            (0, 1, int(num_layers) - 1),
-            fallback_count=min(2, int(num_layers)),
-        )
-        token_indices = self._verify_sample_indices(
-            int(actual_tokens),
-            (0, 1, 2, 127, 128, int(actual_tokens) - 2,
-             int(actual_tokens) - 1),
-            fallback_count=min(4, int(actual_tokens)),
-        )
-        dim_indices = self._verify_sample_indices(
-            int(hidden_dim),
-            (0, 1, 2, 3, 7, 15, 63, 127, int(hidden_dim) - 1),
-            fallback_count=min(8, int(hidden_dim)),
-        )
-
-        layer_index_tensor = torch.tensor(
-            layer_indices, device=tensor.device, dtype=torch.long)
-        token_index_tensor = torch.tensor(
-            token_indices, device=tensor.device, dtype=torch.long)
-        dim_index_tensor = torch.tensor(
-            dim_indices, device=tensor.device, dtype=torch.long)
-
-        # 只保留很小的 CPU 样本，不把完整 KV chunk 留在 Python 侧。
-        values = tensor.index_select(1, layer_index_tensor).index_select(
-            2, token_index_tensor).index_select(3, dim_index_tensor)
-        return _BaMChunkWriteReadVerifySample(
-            chunk_hash=chunk_hash,
-            shape=torch.Size(tensor.shape),
-            dtype=tensor.dtype,
-            layer_indices=layer_indices,
-            token_indices=token_indices,
-            dim_indices=dim_indices,
-            values=values.detach().cpu().clone(),
-        )
-
-    def _record_write_read_verify_reference(self, chunk_hash: str,
-                                            tensor: torch.Tensor) -> None:
-        """记录写入 BaM 前的源 chunk 抽样。"""
-        try:
-            sample = self._build_write_read_verify_sample(
-                chunk_hash=chunk_hash,
-                tensor=tensor,
-            )
-            with self._slot_lock:
-                self._write_read_verify_refs[chunk_hash] = sample
-            logger.info(
-                "[LMCACHE_BAM_WRITE_READ_VERIFY_REF] chunk_hash=%s "
-                "shape=%s layers=%s tokens=%s dims=%s",
-                chunk_hash[:16],
-                tuple(sample.shape),
-                sample.layer_indices,
-                sample.token_indices,
-                sample.dim_indices,
-            )
-        except Exception:
-            logger.exception(
-                "[LMCACHE_BAM_WRITE_READ_VERIFY_REF_FAIL] chunk_hash=%s",
-                chunk_hash[:16],
-            )
-
-    def _verify_decoded_chunk_against_write_reference(
-        self,
-        *,
-        chunk_hash: str,
-        decoded_tensor: torch.Tensor,
-    ) -> bool:
-        """核对 BaM 读回 decode 后的 chunk 是否等于 shadow write 源数据。
-
-        这一步是当前排查里最关键的分界线：
-
-        - 如果这里失败，说明问题在 BaM 写入顺序、row offset、slot 复用或读回
-          decode 上，后面的 paged KV / xformers 都只是消费了错误源数据。
-        - 如果这里通过，说明 BaM 写读闭环基本正确，问题应继续往
-          official write slot_mapping 或 xformers gather 方向查。
-        """
-        with self._slot_lock:
-            sample = self._write_read_verify_refs.get(chunk_hash)
-        if sample is None:
-            logger.warning(
-                "[LMCACHE_BAM_WRITE_READ_VERIFY_SKIP] chunk_hash=%s "
-                "reason=no_write_reference",
-                chunk_hash[:16],
-            )
-            return True
-
-        if tuple(decoded_tensor.shape) != tuple(sample.shape):
-            logger.error(
-                "[LMCACHE_BAM_WRITE_READ_VERIFY_FAIL] chunk_hash=%s "
-                "reason=shape_mismatch expected=%s actual=%s",
-                chunk_hash[:16],
-                tuple(sample.shape),
-                tuple(decoded_tensor.shape),
-            )
-            return False
-
-        if decoded_tensor.is_cuda and not _env_enabled(
-                "VLLM_BAM_WRITE_READ_VERIFY_SYNC_COMPARE"):
-            # 这里不能默认做 `decoded_tensor -> CPU` 的逐值比对。
-            #
-            # 原因是当前 GPU worker persistent service 仍保持常驻运行；
-            # 对 CUDA tensor 调 `.cpu()` 会引入一次隐式同步。在这条路径里，
-            # 这个同步点可能和后台 service / 当前 stream 的生命周期互相等待，
-            # 表现为“主线已经 consumable，但前台卡在 verify”。
-            #
-            # 因此默认只记录写端 reference 和读端 decode 边界。真要做强同步
-            # 数据值对比时，再显式打开二级调试开关：
-            #
-            #   VLLM_BAM_WRITE_READ_VERIFY_SYNC_COMPARE=1
-            logger.warning(
-                "[LMCACHE_BAM_WRITE_READ_VERIFY_SKIP] chunk_hash=%s "
-                "reason=gpu_tensor_sync_compare_disabled shape=%s",
-                chunk_hash[:16],
-                tuple(decoded_tensor.shape),
-            )
-            return True
-
-        layer_index_tensor = torch.tensor(
-            sample.layer_indices, device=decoded_tensor.device, dtype=torch.long)
-        token_index_tensor = torch.tensor(
-            sample.token_indices, device=decoded_tensor.device, dtype=torch.long)
-        dim_index_tensor = torch.tensor(
-            sample.dim_indices, device=decoded_tensor.device, dtype=torch.long)
-        actual = decoded_tensor.index_select(1, layer_index_tensor).index_select(
-            2, token_index_tensor).index_select(3, dim_index_tensor)
-        actual_cpu = actual.detach().cpu()
-        expected_cpu = sample.values
-        if torch.equal(actual_cpu, expected_cpu):
-            logger.info(
-                "[LMCACHE_BAM_WRITE_READ_VERIFY_OK] chunk_hash=%s "
-                "shape=%s layers=%s tokens=%s dims=%s",
-                chunk_hash[:16],
-                tuple(sample.shape),
-                sample.layer_indices,
-                sample.token_indices,
-                sample.dim_indices,
-            )
-            return True
-
-        diff = (actual_cpu.float() - expected_cpu.float()).abs()
-        mismatch_flat = torch.nonzero(actual_cpu != expected_cpu, as_tuple=False)
-        first = mismatch_flat[0].tolist() if mismatch_flat.numel() > 0 else []
-        detail = ""
-        if len(first) == 4:
-            kv_i, layer_i, token_i, dim_i = [int(x) for x in first]
-            detail = (
-                f" kv={kv_i}"
-                f" layer={sample.layer_indices[layer_i]}"
-                f" token={sample.token_indices[token_i]}"
-                f" dim={sample.dim_indices[dim_i]}"
-                f" expected={expected_cpu[kv_i, layer_i, token_i, dim_i].item()}"
-                f" actual={actual_cpu[kv_i, layer_i, token_i, dim_i].item()}")
-        logger.error(
-            "[LMCACHE_BAM_WRITE_READ_VERIFY_FAIL] chunk_hash=%s "
-            "reason=value_mismatch max_abs_diff=%s first_mismatch=%s%s",
-            chunk_hash[:16],
-            diff.max().item() if diff.numel() > 0 else "n/a",
-            first,
-            detail,
-        )
-        return False
 
     def register_existing_chunk(self, key: Any, *, slot_id: int,
                                 page_offset: int, actual_tokens: int,
@@ -1000,7 +726,6 @@ class LMCacheBaMStore:
             self._chunk_slots[chunk_hash] = slot_id
             self._chunk_slots.move_to_end(chunk_hash)
             self._chunk_metadata[chunk_hash] = metadata
-            self._write_read_verify_refs.pop(chunk_hash, None)
 
     def store_chunk(self, key: Any, tensor: torch.Tensor) -> None:
         # BaM shadow write 的主入口。
@@ -1012,8 +737,6 @@ class LMCacheBaMStore:
         # 然后把 page bytes 作为 BaM row 写入 page cache / SSD。
         chunk_hash = _extract_chunk_hash(key)
         actual_tokens = int(tensor.shape[2])
-        if _env_enabled("VLLM_BAM_WRITE_READ_VERIFY"):
-            self._record_write_read_verify_reference(chunk_hash, tensor)
         pages = self.layout.encode_pages(tensor)
         slot_id = self._get_or_assign_slot(chunk_hash)
         page_offset = int(self.base_row_offset +
@@ -1326,1453 +1049,6 @@ class LMCacheBaMStore:
 
         return self._ensure_kv_fast_path().load_chunk_tensors_batch(items)
 
-    def load_chunk_tensors_kv_fast_path_direct_batch(
-        self,
-        keys: list[Any],
-    ) -> dict[str, torch.Tensor]:
-        """通过 direct-cache-load 旁路批量读取 chunk，并还原成 KV tensor。
-
-        与 `load_chunk_tensors_kv_fast_path_batch()` 的区别：
-
-        - 不创建新的 native KV batch request
-        - 不进入 submit/poll/consume/runtime 生命周期
-        - 只基于当前 metadata/page ids 直接同步读取 BaM cache 可见页
-
-        因此这条接口最适合放在“主链已经有一条 persistent request 正在或刚刚
-        完成”的调试校验场景里，用来安全地构造期望 tensor。
-        """
-        items: list[tuple[str, BaMChunkMetadata]] = []
-        for key in keys:
-            chunk_hash = _extract_chunk_hash(key)
-            metadata = self._lookup_metadata(chunk_hash)
-            if metadata is None:
-                raise KeyError(f"BaM chunk not found: {chunk_hash}")
-            items.append((chunk_hash, metadata))
-
-        if not items:
-            return {}
-
-        return self._ensure_kv_fast_path().load_chunk_tensors_direct_batch(
-            items)
-
-    def load_chunk_tensors_kv_fast_path_from_live_request_pages(
-        self,
-        request_handle: Any,
-        *,
-        max_chunks: int | None = None,
-    ) -> dict[str, torch.Tensor]:
-        """复用当前 live request 的 pages buffer，还原期望 chunk tensor。"""
-        return self._ensure_kv_fast_path(
-        ).load_chunk_tensors_from_live_request_pages(
-            request_handle,
-            max_chunks=max_chunks,
-        )
-
-    @staticmethod
-    def _find_first_tensor_mismatch(
-        actual_tensor: torch.Tensor,
-        expected_tensor: torch.Tensor,
-    ) -> tuple[list[int], float] | None:
-        """返回第一处不一致位置及最大绝对误差。
-
-        当前这个 helper 只服务 runtime direct placement verify 调试路径。
-
-        因此这里刻意把 compare 放到 CPU 上做，而不是继续在 GPU 上做：
-        - 避免 persistent service 常驻时，调试 compare 自己再次发起额外 CUDA
-          kernel 干扰观察结果
-        - 保持正式数据面完全不变，只让调试路径更稳定地给出 mismatch 结论
-        """
-        actual_cpu = actual_tensor.detach().to(device="cpu")
-        expected_cpu = expected_tensor.detach().to(device="cpu")
-        if torch.equal(actual_cpu, expected_cpu):
-            return None
-        mismatch_mask = actual_cpu.ne(expected_cpu)
-        mismatch_pos = mismatch_mask.nonzero(as_tuple=False)
-        first_pos = mismatch_pos[0].detach().cpu().tolist()
-        max_abs = float(
-            (actual_cpu.float() - expected_cpu.float()).abs().max().item())
-        return first_pos, max_abs
-
-    @staticmethod
-    def _find_first_tensor_mismatch_in_sample_cpu_debug(
-        actual_tensor: torch.Tensor,
-        expected_tensor: torch.Tensor,
-        *,
-        sample_tokens: int,
-        sample_heads: int,
-        sample_dims: int,
-    ) -> tuple[list[int], float, float, float] | None:
-        """仅在 CPU 上比较一个很小的 packed 样本切片。
-
-        这条 helper 只服务 runtime direct placement verify 调试路径，目标是：
-
-        1. 不再像之前那样把整块 packed tensor 都搬回 CPU
-        2. 先用很小的样本快速判断“最终 cache 里是不是已经明显写错”
-        3. 若样本已经错，立即给出精确 token/head/dim 与实际值/期望值
-
-        之所以默认只验一个很小的样本，而不是直接做 full compare，是因为
-        当前 persistent service 常驻时，我们首先需要把“正式主链是否可跑”
-        和“verify 调试本身是否过重”这两件事拆开。
-        """
-        capped_tokens = min(max(int(sample_tokens), 1), int(actual_tensor.shape[0]))
-        capped_heads = min(max(int(sample_heads), 1), int(actual_tensor.shape[1]))
-        capped_dims = min(max(int(sample_dims), 1), int(actual_tensor.shape[2]))
-        actual_sample = actual_tensor[:capped_tokens, :capped_heads,
-                                      :capped_dims].detach().to(device="cpu")
-        expected_sample = expected_tensor[:capped_tokens, :capped_heads,
-                                          :capped_dims].detach().to(device="cpu")
-        if torch.equal(actual_sample, expected_sample):
-            return None
-        mismatch_mask = actual_sample.ne(expected_sample)
-        mismatch_pos = mismatch_mask.nonzero(as_tuple=False)
-        first_pos = mismatch_pos[0].detach().cpu().tolist()
-        token_idx = int(first_pos[0])
-        head_idx = int(first_pos[1])
-        dim_idx = int(first_pos[2])
-        actual_value = float(actual_sample[token_idx, head_idx, dim_idx].item())
-        expected_value = float(
-            expected_sample[token_idx, head_idx, dim_idx].item())
-        max_abs = float((actual_sample.float() - expected_sample.float()).abs().
-                        max().item())
-        return first_pos, max_abs, actual_value, expected_value
-
-    @staticmethod
-    def _build_packed_verify_slot_indices_cpu_debug(
-        *,
-        slot_slice: torch.Tensor,
-        block_size: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """仅供 verify 调试路径使用：在 CPU 上组织 packed gather 索引。
-
-        这里返回的就是 CPU tensor，而不是再拷回 GPU。
-
-        当前 verify 的目标已经进一步收窄成：
-        - 不再发任何新的 GPU gather/helper kernel
-        - 只在 CPU 上观察一个很小的 packed 样本
-
-        因此这一步只负责把：
-          slot -> (block_id, block_offset)
-        在 CPU 上算好，后续 sample compare 会继续完全留在 CPU。
-
-        原因是当前 persistent service 常驻时，即使只是很小的：
-        - `torch.div(slot_slice, block_size)`
-        - `torch.remainder(slot_slice, block_size)`
-
-        这类辅助 CUDA kernel 也可能和后台 service 相互干扰，导致我们定位不了
-        真正的数据面问题。
-
-        因此这里把“slot -> (block_id, block_offset)”的索引组织显式下沉到 CPU：
-        - CPU 负责算很小的一组索引
-        - verify sample compare 后续也继续留在 CPU
-        - 这样就不会再被这些辅助小 kernel 污染观察结果
-        """
-        slot_slice_host = slot_slice.detach().to(device="cpu", dtype=torch.long)
-        slot_blocks_host = torch.div(
-            slot_slice_host,
-            block_size,
-            rounding_mode="floor",
-        ).to(torch.long)
-        slot_offsets_host = torch.remainder(
-            slot_slice_host,
-            block_size,
-        ).to(torch.long)
-        return (
-            slot_blocks_host,
-            slot_offsets_host,
-        )
-
-    @staticmethod
-    def _extract_packed_verify_sample_cpu_debug(
-        *,
-        layer_cache: torch.Tensor,
-        expected_layer: torch.Tensor,
-        slot_blocks_host: torch.Tensor,
-        slot_offsets_host: torch.Tensor,
-        num_kv_heads: int,
-        head_size: int,
-        pack_size: int,
-        block_size: int,
-        sample_tokens: int,
-        sample_heads: int,
-        sample_dims: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
-        """仅供 verify 调试路径使用：在 CPU 上还原一个极小写入样本。
-
-        当前 one-copy 写端已经统一到 LMCache 官方
-        `multi_layer_kv_transfer(direction=false)` 的物理写入语义：
-
-        ```text
-        layer_cache[kv, slot_id, hidden]
-        ```
-
-        因此 verifier 也必须按同一套 flat paged-buffer ABI 读回。这里保留
-        `slot_blocks_host/slot_offsets_host` 入参，是为了不大改调用链；实际读回
-        时会先恢复 `slot_id = block * block_size + offset`，再在 CPU 上按
-        `[2, page_buffer_size, num_kv_heads, head_size]` 取样比较。
-
-        因此这条 helper 只增加极小的 D2H 连续切片拷贝，不会再向 GPU
-        提交额外的 gather helper kernel。
-        """
-        capped_tokens = min(max(int(sample_tokens), 1), int(slot_blocks_host.numel()))
-        capped_heads = min(max(int(sample_heads), 1), int(num_kv_heads))
-        capped_dims = min(max(int(sample_dims), 1), int(head_size))
-
-        expected_key_cpu = expected_layer[0].reshape(
-            int(expected_layer.shape[1]),
-            num_kv_heads,
-            head_size,
-        )[:capped_tokens, :capped_heads, :capped_dims].detach().to(device="cpu")
-        expected_value_cpu = expected_layer[1].reshape(
-            int(expected_layer.shape[1]),
-            num_kv_heads,
-            head_size,
-        )[:capped_tokens, :capped_heads, :capped_dims].detach().to(device="cpu")
-
-        actual_key_cpu = torch.empty_like(expected_key_cpu)
-        actual_value_cpu = torch.empty_like(expected_value_cpu)
-
-        unique_block_rows: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-        for token_idx in range(capped_tokens):
-            block_id = int(slot_blocks_host[token_idx].item())
-            if block_id in unique_block_rows:
-                continue
-            # 只把 sample 涉及到的 block 拷到 CPU，避免 verify 变成新的性能路径。
-            # block row 的底层布局与官方 transfer 一致：
-            #   [2, block_size, num_kv_heads, head_size]
-            block_row_cpu = layer_cache[:, block_id].detach().to(
-                device="cpu").view(2, block_size, num_kv_heads, head_size)
-            unique_block_rows[block_id] = (
-                block_row_cpu[0],
-                block_row_cpu[1],
-            )
-
-        for token_idx in range(capped_tokens):
-            block_id = int(slot_blocks_host[token_idx].item())
-            block_offset = int(slot_offsets_host[token_idx].item())
-            key_row_cpu, value_row_cpu = unique_block_rows[block_id]
-            actual_key_cpu[token_idx].copy_(
-                key_row_cpu[
-                    block_offset,
-                    :capped_heads,
-                    :capped_dims,
-                ])
-            actual_value_cpu[token_idx].copy_(
-                value_row_cpu[
-                    block_offset,
-                    :capped_heads,
-                    :capped_dims,
-                ])
-
-        return (
-            actual_key_cpu,
-            actual_value_cpu,
-            expected_key_cpu,
-            expected_value_cpu,
-            len(unique_block_rows),
-        )
-
-    def _run_host_reference_packed_verify_sample_cpu_debug(
-        self,
-        *,
-        in_flight_request: _InFlightDirectPlacementRequest,
-        chunk_index: int,
-        actual_tokens: int,
-        slot_slice: torch.Tensor,
-        expected_layer: torch.Tensor,
-        sample_tokens: int,
-        sample_heads: int,
-        sample_dims: int,
-        num_kv_heads: int,
-        head_size: int,
-        pack_size: int,
-        block_size: int,
-        layer_id: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
-        """用 host Triton 参考写端对同一份 live request pages 做一次小样本对照。
-
-        这条 helper 的目的非常单一：
-
-        - runtime persistent service 已经把 live request pages 直接写进了真实
-          vLLM paged KV cache
-        - 现在我们怀疑“最终 packed KV cache 写端”有 bug
-        - 但还需要再定责：问题究竟出在
-          1. runtime device scatter
-          2. 还是更上游 `live request pages` / slot mapping / packed ABI 理解
-
-        因此这里复用“同一份 live request pages + 同一份 slot_slice”，额外走一遍
-        host Triton 参考写端，写到一份临时 scratch KV cache，然后只抽一个极小的
-        packed sample 做 CPU compare。
-
-        如果 host 参考写端正确、runtime 实际写入错误，那么根因就能进一步收敛到：
-          `gids_nvme.cu` 里的 runtime device scatter / 时序逻辑
-        """
-        kv_read_handle = (getattr(in_flight_request, "runtime_cleanup_handle",
-                                  None)
-                          or getattr(in_flight_request, "kv_read_handle", None))
-        # 当前 request 级句柄里保存的 `kv_read_handle` 实际上就是底层 native batch
-        # handle，而不是外层 `LMCacheBaMKVBatchReadRequestHandle` 包装对象。
-        #
-        # 因此这里兼容两种传入形态：
-        # 1. 直接就是 native handle
-        # 2. 外层包装对象，再通过 `.native_handle` 取到底层句柄
-        native_handle = None
-        if kv_read_handle is not None:
-            if hasattr(kv_read_handle, "request_table"):
-                native_handle = kv_read_handle
-            else:
-                native_handle = getattr(kv_read_handle, "native_handle", None)
-        if native_handle is None or not hasattr(native_handle, "request_table"):
-            raise RuntimeError(
-                "host reference verify requires live native request_table pages")
-
-        request_table = native_handle.request_table
-        page_count = int(request_table.page_count)
-        start = int(chunk_index) * page_count
-        end = start + page_count
-        pages = request_table.pages[start:end]
-        if int(pages.shape[0]) != page_count:
-            raise RuntimeError(
-                "host reference verify pages slice mismatch: "
-                f"chunk_index={chunk_index} page_count={page_count} "
-                f"got={tuple(pages.shape)}")
-
-        # 这里显式新建 scratch cache，而不是复用真实 kv_caches。
-        #
-        # 原因：
-        # 1. verify 的职责只是定责，不应该再污染真实运行时状态；
-        # 2. 我们要观察的是“同一份 pages 经 host 参考写端后会写成什么”；
-        # 3. scratch cache 完全隔离后，后续 sample compare 的结论才可信。
-        scratch_kv_caches = [
-            torch.zeros_like(layer_cache)
-            for layer_cache in in_flight_request.kv_caches
-        ]
-        scratch_kv_cache_pointers_gpu = torch.tensor(
-            tuple(int(layer_cache.data_ptr()) for layer_cache in scratch_kv_caches),
-            dtype=torch.int64,
-            device=scratch_kv_caches[0].device,
-        )
-        # 不能调用 `_fused_pages_to_vllm_cache()`：那个 helper 为正式热路径服务，
-        # 内部固定使用 direct_placer 缓存的真实 kv_cache pointer table。
-        #
-        # 这里是调试参考写端，必须把数据写入 scratch cache，否则后续从 scratch
-        # 读回时会看到全 0，并把 host reference 误判成 mismatch。
-        in_flight_request.direct_placer._launch_fused_pages_to_vllm_cache(
-            pages,
-            slot_slice.contiguous(),
-            scratch_kv_cache_pointers_gpu,
-            actual_tokens=int(actual_tokens),
-            page_buffer_size=int(
-                getattr(in_flight_request.direct_placer, "_page_buffer_size")),
-            num_kv_heads=int(num_kv_heads),
-            head_size=int(head_size),
-            block_size=int(block_size),
-            pack_size=int(pack_size),
-        )
-        torch.cuda.synchronize(device=scratch_kv_caches[0].device)
-
-        slot_blocks_host, slot_offsets_host = (
-            self._build_packed_verify_slot_indices_cpu_debug(
-                slot_slice=slot_slice,
-                block_size=block_size,
-            ))
-        return self._extract_packed_verify_sample_cpu_debug(
-            layer_cache=scratch_kv_caches[layer_id],
-            expected_layer=expected_layer,
-            slot_blocks_host=slot_blocks_host,
-            slot_offsets_host=slot_offsets_host,
-            num_kv_heads=num_kv_heads,
-            head_size=head_size,
-            pack_size=pack_size,
-            block_size=block_size,
-            sample_tokens=sample_tokens,
-            sample_heads=sample_heads,
-            sample_dims=sample_dims,
-        )
-
-    def _run_official_paged_cache_oracle_verify_sample_cpu_debug(
-        self,
-        *,
-        in_flight_request: _InFlightDirectPlacementRequest,
-        slot_slice: torch.Tensor,
-        expected_layer: torch.Tensor,
-        sample_tokens: int,
-        sample_heads: int,
-        sample_dims: int,
-        num_kv_heads: int,
-        head_size: int,
-        pack_size: int,
-        block_size: int,
-        layer_cache: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
-        """用 vLLM 官方 `reshape_and_cache` 作为 packed 写端 oracle。
-
-        这条 helper 的定位比 host fused 参考更“硬”：
-
-        - `expected_layer` 已经是从 live request pages 还原出来的 dense K/V
-        - 这里不再走我们自己的 fused/Triton 写端
-        - 而是直接调用 vLLM 官方 `PagedAttention.write_to_paged_cache()`
-
-        因而它回答的是：
-
-        ```text
-        如果 dense K/V 是对的，
-        那么官方 paged cache 写端写出来的 packed 结果是什么？
-        ```
-
-        后续只要：
-        - 官方 oracle 正确
-        - host fused 错
-        - runtime direct 错
-
-        就可以把根因彻底收敛到“我们自己实现的 packed scatter 语义”，而不是
-        再怀疑 `decode_pages()` 或 packed sample 抽取 helper。
-        """
-        actual_tokens = int(expected_layer.shape[1])
-        scratch_layer_cache = torch.zeros_like(layer_cache)
-        oracle_key_cache, oracle_value_cache = PagedAttention.split_kv_cache(
-            scratch_layer_cache,
-            int(num_kv_heads),
-            int(head_size),
-        )
-        dense_key = expected_layer[0].reshape(
-            actual_tokens,
-            num_kv_heads,
-            head_size,
-        ).contiguous()
-        dense_value = expected_layer[1].reshape(
-            actual_tokens,
-            num_kv_heads,
-            head_size,
-        ).contiguous()
-        # 当前 verify 场景的 kv_cache_dtype 仍是 `auto/fp16` 主线，
-        # 因此这里用 1.0 的 scale 即可复现官方非量化写端语义。
-        oracle_scale = torch.tensor(
-            1.0,
-            dtype=torch.float32,
-            device=scratch_layer_cache.device,
-        )
-        PagedAttention.write_to_paged_cache(
-            dense_key,
-            dense_value,
-            oracle_key_cache,
-            oracle_value_cache,
-            slot_slice.contiguous(),
-            str(getattr(in_flight_request, "kv_cache_dtype", "auto")),
-            oracle_scale,
-            oracle_scale,
-        )
-        torch.cuda.synchronize(device=scratch_layer_cache.device)
-
-        slot_blocks_host, slot_offsets_host = (
-            self._build_packed_verify_slot_indices_cpu_debug(
-                slot_slice=slot_slice,
-                block_size=block_size,
-            ))
-        return self._extract_packed_verify_sample_cpu_debug(
-            layer_cache=scratch_layer_cache,
-            expected_layer=expected_layer,
-            slot_blocks_host=slot_blocks_host,
-            slot_offsets_host=slot_offsets_host,
-            num_kv_heads=num_kv_heads,
-            head_size=head_size,
-            pack_size=pack_size,
-            block_size=block_size,
-            sample_tokens=sample_tokens,
-            sample_heads=sample_heads,
-            sample_dims=sample_dims,
-        )
-
-    def _rewrite_runtime_direct_prefix_into_paged_kv_cache_with_official_write(
-        self,
-        *,
-        in_flight_request: _InFlightDirectPlacementRequest,
-    ) -> None:
-        """用 vLLM 官方写端把当前 runtime prefix 重新落到真实 paged KV cache。
-
-        当前已经通过 verify 明确了三件事：
-
-        1. `live request pages -> dense expected tensor` 这一步是稳定可用的
-        2. vLLM 官方 `reshape_and_cache` 语义是正确的
-        3. 现阶段 runtime direct placement 自己的 packed scatter 仍然有错
-
-        因此这条 helper 先走一条 correctness-first 的收敛路径：
-
-        - 保留 GPU persistent poll / cleanup-only runtime 主线不变
-        - 只在“最终真正要把 prefix 暴露给模型计算”之前
-        - 用已经 materialize 出来的 dense prefix tensor
-        - 调 vLLM 官方写端，覆盖真实 paged KV cache
-
-        这样做的边界很清楚：
-
-        - 不回退 read/poll/runtime 生命周期
-        - 不重新引入额外的 BaM 读
-        - 只把当前最后一跳的 packed cache 写入收敛到官方正确语义
-
-        后续如果把 runtime device scatter 修对了，可以再把这层去掉；但在那之前，
-        它能保证：
-
-        `GPU 负责把页读回来`
-          -> `CPU 只触发一次官方 GPU cache-write kernel`
-          -> `模型消费到的 paged KV cache 内容正确`
-        """
-        dense_chunks = in_flight_request.materialized_prefix_chunk_tensors
-        if not dense_chunks:
-            return
-
-        num_kv_heads = int(in_flight_request.num_kv_heads)
-        head_size = int(in_flight_request.head_size)
-        if num_kv_heads <= 0 or head_size <= 0:
-            raise RuntimeError(
-                "runtime direct official write repair requires "
-                f"valid num_kv_heads/head_size, got "
-                f"{num_kv_heads}/{head_size}")
-
-        kv_caches = in_flight_request.kv_caches
-        split_layer_caches = [
-            PagedAttention.split_kv_cache(
-                layer_cache,
-                num_kv_heads,
-                head_size,
-            ) for layer_cache in kv_caches
-        ]
-        scale = torch.tensor(
-            1.0,
-            dtype=torch.float32,
-            device=kv_caches[0].device,
-        )
-
-        rewrite_begin = time.perf_counter()
-        total_tokens = 0
-        for chunk_index, dense_chunk in enumerate(dense_chunks):
-            actual_tokens = int(dense_chunk.shape[2])
-            if actual_tokens <= 0:
-                continue
-            chunk_start = int(in_flight_request.chunk_starts[chunk_index])
-            slot_slice = in_flight_request.slot_mapping[
-                chunk_start:chunk_start + actual_tokens
-            ].contiguous()
-            total_tokens += actual_tokens
-            for layer_id, (key_cache, value_cache) in enumerate(split_layer_caches):
-                dense_key = dense_chunk[0, layer_id].reshape(
-                    actual_tokens,
-                    num_kv_heads,
-                    head_size,
-                ).contiguous()
-                dense_value = dense_chunk[1, layer_id].reshape(
-                    actual_tokens,
-                    num_kv_heads,
-                    head_size,
-                ).contiguous()
-                PagedAttention.write_to_paged_cache(
-                    dense_key,
-                    dense_value,
-                    key_cache,
-                    value_cache,
-                    slot_slice,
-                    str(in_flight_request.kv_cache_dtype),
-                    scale,
-                    scale,
-                )
-
-        # 这里显式只同步当前 stream，保证官方写端已经完成；
-        # 不去做整卡同步，避免把同卡上不相关工作一起纳入等待。
-        torch.cuda.current_stream(device=kv_caches[0].device).synchronize()
-        logger.info(
-            "[LMCACHE_BAM_DIRECT_PLACEMENT_RUNTIME_OFFICIAL_WRITE_REPAIR] "
-            "chunks=%d tokens=%d layers=%d rewrite_ms=%.3f",
-            len(dense_chunks),
-            total_tokens,
-            len(kv_caches),
-            (time.perf_counter() - rewrite_begin) * 1000.0,
-        )
-        if envs.VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE:
-            # official-write verifier 会把最终 paged KV cache 的小样本读回 CPU。
-            #
-            # 这类 D2H 调试读回会触发 CUDA 同步；如果 persistent service 此时
-            # 仍在空转，调试路径可能被后台 service 拖住，表现为只打印
-            # VERIFY_OFFICIAL_WRITE_BEGIN 后不再前进。
-            #
-            # 因此这里复用 runtime-write verify 已经验证过的保护：只在调试
-            # 开关打开、且当前 runtime 已经 cleanup 后，尝试停止 idle service。
-            # 正式路径不开这个开关时，GPU 后台 service 仍保持原来的生命周期。
-            self._stop_kv_runtime_service_if_idle_for_verify_debug()
-        self._verify_official_write_repair_against_paged_kv_cache(
-            in_flight_request=in_flight_request,
-            split_layer_caches=split_layer_caches,
-        )
-
-    def _verify_official_write_repair_against_paged_kv_cache(
-        self,
-        *,
-        in_flight_request: _InFlightDirectPlacementRequest,
-        split_layer_caches: list[tuple[torch.Tensor, torch.Tensor]],
-    ) -> None:
-        """校验 official write repair 是否真的写对最终 paged KV cache。
-
-        这条调试支线只在
-        `VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE=1` 时启用。
-
-        当前主线为了先保证 correctness，会把 BaM live pages 解码成 dense
-        chunk，再调用 vLLM 官方 `PagedAttention.write_to_paged_cache()` 写入
-        真实 paged KV cache。模型后续的 xformers fallback 也是从这份真实
-        cache 里按 block table 读取 prefix KV。
-
-        因此这里不再引入 scratch cache / host reference / 旧 runtime scatter
-        等额外分支，只做最小闭环：
-
-        1. 从 dense chunk 取少量 K/V reference；
-        2. 用同一段 `slot_mapping` 反算 `(block_id, block_offset)`；
-        3. 按 vLLM 官方 packed ABI 从真实 key_cache/value_cache 读回；
-        4. 精确比较 sampled values。
-
-        如果这里失败，说明 official write repair 的输入解释或 slot 坐标已经错；
-        如果这里通过，后续问题就应继续查 metadata rebuild 后的 block table
-        是否和写入时的 slot_mapping 对齐。
-        """
-        if not envs.VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE:
-            return
-
-        dense_chunks = in_flight_request.materialized_prefix_chunk_tensors
-        if not dense_chunks:
-            logger.warning(
-                "[LMCACHE_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_SKIP] "
-                "reason=no_materialized_prefix_chunks")
-            return
-
-        num_kv_heads = int(in_flight_request.num_kv_heads)
-        head_size = int(in_flight_request.head_size)
-        if num_kv_heads <= 0 or head_size <= 0:
-            raise RuntimeError(
-                "official write verify requires num_kv_heads/head_size, got "
-                f"{num_kv_heads}/{head_size}")
-
-        max_chunks = min(
-            int(envs.VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_MAX_CHUNKS),
-            len(dense_chunks),
-        )
-        max_layers = min(
-            int(envs.VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_MAX_LAYERS),
-            len(split_layer_caches),
-        )
-        sample_token_cap = int(
-            envs.VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_SAMPLE_TOKENS)
-        sample_head_cap = int(
-            envs.VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_SAMPLE_HEADS)
-        sample_dim_cap = int(
-            envs.VLLM_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_SAMPLE_DIMS)
-
-        verify_begin = time.perf_counter()
-        compared_values = 0
-        logger.info(
-            "[LMCACHE_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_BEGIN] "
-            "chunks=%d verify_chunks=%d verify_layers=%d sample_tokens=%d "
-            "sample_heads=%d sample_dims=%d",
-            len(dense_chunks),
-            max_chunks,
-            max_layers,
-            sample_token_cap,
-            sample_head_cap,
-            sample_dim_cap,
-        )
-
-        for chunk_index, dense_chunk in enumerate(dense_chunks[:max_chunks]):
-            actual_tokens = int(dense_chunk.shape[2])
-            if actual_tokens <= 0:
-                continue
-            hidden_dim = int(dense_chunk.shape[3])
-            if hidden_dim != num_kv_heads * head_size:
-                raise RuntimeError(
-                    "official write verify hidden size mismatch: "
-                    f"chunk={chunk_index} hidden_dim={hidden_dim} "
-                    f"num_kv_heads={num_kv_heads} head_size={head_size}")
-
-            chunk_start = int(in_flight_request.chunk_starts[chunk_index])
-            slot_slice = in_flight_request.slot_mapping[
-                chunk_start:chunk_start + actual_tokens
-            ].contiguous()
-            if int(slot_slice.numel()) != actual_tokens:
-                raise RuntimeError(
-                    "official write verify slot slice length mismatch: "
-                    f"chunk={chunk_index} actual_tokens={actual_tokens} "
-                    f"slot_slice={int(slot_slice.numel())}")
-
-            # 抽样覆盖 chunk 开头、page 边界和 chunk 尾部；这些位置最容易暴露
-            # chunk 顺序、128KB page 边界、slot offset 解释错误。
-            token_indices = self._verify_sample_indices(
-                actual_tokens,
-                (0, 1, 2, 15, 16, 127, 128, actual_tokens - 2,
-                 actual_tokens - 1),
-                fallback_count=min(sample_token_cap, actual_tokens),
-            )[:sample_token_cap]
-            head_indices = self._verify_sample_indices(
-                num_kv_heads,
-                (0, 1, num_kv_heads - 1),
-                fallback_count=min(sample_head_cap, num_kv_heads),
-            )[:sample_head_cap]
-            dim_indices = self._verify_sample_indices(
-                head_size,
-                (0, 1, 2, 3, 7, 15, 63, 127, head_size - 1),
-                fallback_count=min(sample_dim_cap, head_size),
-            )[:sample_dim_cap]
-
-            token_index_tensor = torch.tensor(
-                token_indices, device=slot_slice.device, dtype=torch.long)
-            logger.info(
-                "[LMCACHE_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_STAGE] "
-                "stage=slot_sample_cpu_begin chunk=%d chunk_start=%d "
-                "token_indices=%s",
-                chunk_index,
-                chunk_start,
-                token_indices,
-            )
-            sampled_slots_cpu = slot_slice.index_select(
-                0, token_index_tensor).detach().to(
-                    device="cpu", dtype=torch.long)
-            logger.info(
-                "[LMCACHE_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_STAGE] "
-                "stage=slot_sample_cpu_done chunk=%d sampled_slots=%s",
-                chunk_index,
-                tuple(int(x.item()) for x in sampled_slots_cpu),
-            )
-
-            for layer_id in range(max_layers):
-                key_cache, value_cache = split_layer_caches[layer_id]
-                block_size = int(value_cache.shape[3])
-                pack_size = int(key_cache.shape[4])
-                if pack_size <= 0 or head_size % pack_size != 0:
-                    raise RuntimeError(
-                        "official write verify invalid key cache packed view: "
-                        f"layer={layer_id} head_size={head_size} "
-                        f"pack_size={pack_size}")
-
-                expected_layer_cpu = dense_chunk[:, layer_id].reshape(
-                    2,
-                    actual_tokens,
-                    num_kv_heads,
-                    head_size,
-                ).detach().to(device="cpu")
-                logger.info(
-                    "[LMCACHE_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_STAGE] "
-                    "stage=expected_layer_cpu_done chunk=%d layer=%d "
-                    "shape=%s",
-                    chunk_index,
-                    layer_id,
-                    tuple(expected_layer_cpu.shape),
-                )
-
-                unique_block_rows: dict[int, tuple[torch.Tensor,
-                                                   torch.Tensor]] = {}
-                for slot_id_tensor in sampled_slots_cpu:
-                    slot_id = int(slot_id_tensor.item())
-                    if slot_id < 0:
-                        raise RuntimeError(
-                            "official write verify sampled a negative slot: "
-                            f"chunk={chunk_index} layer={layer_id} "
-                            f"slot_id={slot_id}")
-                    block_id = slot_id // block_size
-                    if block_id in unique_block_rows:
-                        continue
-                    if block_id < 0 or block_id >= int(key_cache.shape[0]):
-                        raise RuntimeError(
-                            "official write verify block id out of range: "
-                            f"chunk={chunk_index} layer={layer_id} "
-                            f"slot_id={slot_id} block_id={block_id} "
-                            f"num_blocks={int(key_cache.shape[0])}")
-                    logger.info(
-                        "[LMCACHE_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_STAGE] "
-                        "stage=cache_block_cpu_begin chunk=%d layer=%d "
-                        "block=%d slot=%d",
-                        chunk_index,
-                        layer_id,
-                        block_id,
-                        slot_id,
-                    )
-                    # 这里只拷贝 sampled token 涉及到的少量 block row 到 CPU。
-                    # 这是调试路径，不进入性能主线；好处是读回公式完全透明。
-                    key_row_cpu = key_cache[block_id].detach().to(
-                        device="cpu").view(
-                            num_kv_heads,
-                            head_size // pack_size,
-                            block_size,
-                            pack_size,
-                        )
-                    value_row_cpu = value_cache[block_id].detach().to(
-                        device="cpu").view(
-                            num_kv_heads,
-                            head_size,
-                            block_size,
-                        )
-                    unique_block_rows[block_id] = (key_row_cpu, value_row_cpu)
-                    logger.info(
-                        "[LMCACHE_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_STAGE] "
-                        "stage=cache_block_cpu_done chunk=%d layer=%d "
-                        "block=%d",
-                        chunk_index,
-                        layer_id,
-                        block_id,
-                    )
-
-                for sample_pos, token_idx in enumerate(token_indices):
-                    slot_id = int(sampled_slots_cpu[sample_pos].item())
-                    block_id = slot_id // block_size
-                    block_offset = slot_id % block_size
-                    key_row_cpu, value_row_cpu = unique_block_rows[block_id]
-                    for head_idx in head_indices:
-                        for dim_idx in dim_indices:
-                            x_idx = int(dim_idx) // pack_size
-                            x_offset = int(dim_idx) % pack_size
-                            actual_key = key_row_cpu[
-                                int(head_idx), x_idx, block_offset,
-                                x_offset]
-                            expected_key = expected_layer_cpu[
-                                0, int(token_idx), int(head_idx), int(dim_idx)]
-                            if actual_key.item() != expected_key.item():
-                                raise RuntimeError(
-                                    "official write repair key mismatch: "
-                                    f"chunk={chunk_index} layer={layer_id} "
-                                    f"token={int(token_idx)} slot={slot_id} "
-                                    f"block={block_id} offset={block_offset} "
-                                    f"head={int(head_idx)} dim={int(dim_idx)} "
-                                    f"actual={float(actual_key.item())} "
-                                    f"expected={float(expected_key.item())}")
-
-                            actual_value = value_row_cpu[
-                                int(head_idx), int(dim_idx), block_offset]
-                            expected_value = expected_layer_cpu[
-                                1, int(token_idx), int(head_idx), int(dim_idx)]
-                            if actual_value.item() != expected_value.item():
-                                raise RuntimeError(
-                                    "official write repair value mismatch: "
-                                    f"chunk={chunk_index} layer={layer_id} "
-                                    f"token={int(token_idx)} slot={slot_id} "
-                                    f"block={block_id} offset={block_offset} "
-                                    f"head={int(head_idx)} dim={int(dim_idx)} "
-                                    f"actual={float(actual_value.item())} "
-                                    f"expected={float(expected_value.item())}")
-                            compared_values += 2
-
-                logger.info(
-                    "[LMCACHE_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_CHUNK] "
-                    "chunk=%d layer=%d tokens=%s heads=%s dims=%s "
-                    "sampled_slots=%s unique_blocks=%d",
-                    chunk_index,
-                    layer_id,
-                    token_indices,
-                    head_indices,
-                    dim_indices,
-                    tuple(int(x.item()) for x in sampled_slots_cpu),
-                    len(unique_block_rows),
-                )
-
-        logger.info(
-            "[LMCACHE_BAM_DIRECT_PLACEMENT_VERIFY_OFFICIAL_WRITE_OK] "
-            "verify_chunks=%d verify_layers=%d compared_values=%d "
-            "elapsed_ms=%.3f",
-            max_chunks,
-            max_layers,
-            compared_values,
-            (time.perf_counter() - verify_begin) * 1000.0,
-        )
-
-    def _verify_runtime_direct_placement_write_against_materialized_chunks(
-        self,
-        *,
-        in_flight_request: _InFlightDirectPlacementRequest,
-        consumable_chunks: int,
-        expected_tensors: dict[str, torch.Tensor] | None = None,
-    ) -> None:
-        """核对 runtime direct placement 的最终写入结果是否正确。
-
-        这条校验路径刻意只在调试场景下打开，目的不是替代主逻辑，而是尽快回答：
-
-        ```text
-        GPU persistent service 已经把数据直接写进 vLLM paged KV cache
-          -> 这些最终写进去的值
-          -> 是否和“旧 materialize 语义下的期望 chunk tensor”一致？
-        ```
-
-        之所以不直接把整条旧 placement 路径再跑一遍，是因为这里真正需要验证
-        的只有一件事：最终 cache 里的目标 slot 内容对不对。
-
-        因此这里选择一条更轻、更聚焦，同时也更安全的数据面对照方式：
-
-        1. 只复用当前 live request 已经镜像到 `request_table.pages` 的同批 pages，
-           本地还原成“旧 materialize 语义”下的期望 chunk tensor
-        2. 按当前 request 真正使用的 `slot_mapping`
-           从最终 `kv_caches[layer]` 里抽取对应 token slot
-        3. 逐层、逐 K/V、逐 token 向量做精确比对
-
-        一旦这里发现不一致，就说明问题已经落在：
-
-        - runtime direct placement 的 scatter 目标
-        - 或其发布时序
-        - 或其 layout 解释
-
-        而不是上层 runtime metadata / rebuild 控制面。
-
-        这里刻意不再允许校验路径自己退回额外的 BaM 读操作。否则就会把：
-
-        - “验证当前 request 最终写入值是否正确”
-        - “旁路再读一遍底层 pages”
-
-        重新耦合起来，并再次把主链拖回此前已经确认会卡住的
-        `read_feature async kernel..` 路径。
-        """
-        if not envs.VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE:
-            return
-        if consumable_chunks <= 0:
-            return
-        if expected_tensors is None:
-            logger.warning(
-                "[LMCACHE_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_SKIP] "
-                "reason=missing_live_request_pages consumable_chunks=%d",
-                consumable_chunks,
-            )
-            return
-
-        verify_start = time.perf_counter()
-
-        def _debug_mark_stage(stage: str) -> None:
-            """只打无同步阶段日志，避免再次被 persistent service 干扰。
-
-            之前这里尝试过 `torch.cuda.synchronize(device=...)`，但在当前
-            persistent service 常驻模型下，这类整卡/整设备同步本身就会被后台
-            service 拖住，反而无法继续区分“真正的读写卡点”。
-
-            因此当前调试策略收敛为：
-            - 只记录阶段 begin/done
-            - 不再主动等待任何 CUDA stream / device
-            - 让下一轮日志自然告诉我们：最后到底停在哪个阶段
-            """
-            logger.info(
-                "[LMCACHE_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_STAGE] "
-                "stage=%s",
-                stage,
-            )
-
-        # 这里默认故意只跑一个很小的“快速定责版”校验窗口：
-        #
-        # 1. 先只看最前面的少量 consumable chunk
-        # 2. 先只看最前面的少量 layer
-        #
-        # 目标不是一次性做完整 correctness sweep，而是尽快回答：
-        # - flat 写端是不是已经错了
-        # - 如果 flat 没错，packed 读侧是不是解释错了
-        #
-        # 当前 persistent service 会常驻占着同一张卡。若这里继续按
-        # “4 chunks * 28 layers * flat+packed 全量扫”去做，调试校验本身就会
-        # 变成新的阻塞源，反而看不清真正的问题。
-        max_verify_chunks = min(
-            int(envs.VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_MAX_CHUNKS),
-            int(consumable_chunks),
-        )
-        max_verify_layers = min(
-            int(envs.VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_MAX_LAYERS),
-            int(len(in_flight_request.kv_caches)),
-        )
-        sample_token_limit = int(
-            envs.VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_SAMPLE_TOKENS)
-        sample_dim_limit = int(
-            envs.VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_SAMPLE_DIMS)
-        enable_full_compare = bool(
-            envs.VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_FULL_COMPARE)
-        keys_to_verify = list(in_flight_request.keys[:max_verify_chunks])
-        logger.info(
-            "[LMCACHE_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_BEGIN] "
-            "chunks=%d verify_chunks=%d verify_layers=%d sample_tokens=%d "
-            "sample_dims=%d full_compare=%s source=live_request_pages",
-            consumable_chunks,
-            max_verify_chunks,
-            max_verify_layers,
-            sample_token_limit,
-            sample_dim_limit,
-            "true" if enable_full_compare else "false",
-        )
-
-        total_chunk_tokens = 0
-        compared_packed_layer_slices = 0
-        packed_verify_enabled = (
-            int(getattr(in_flight_request, "num_kv_heads", 0)) > 0
-            and int(getattr(in_flight_request, "head_size", 0)) > 0)
-        if not packed_verify_enabled:
-            raise RuntimeError(
-                "runtime direct placement verify now requires packed-view "
-                "metadata (num_kv_heads/head_size), but it is missing")
-        for chunk_index, key in enumerate(keys_to_verify):
-            chunk_hash = _extract_chunk_hash(key)
-            expected_chunk = expected_tensors[chunk_hash]
-            actual_tokens = int(expected_chunk.shape[2])
-            chunk_start = int(in_flight_request.chunk_starts[chunk_index])
-            logger.info(
-                "[LMCACHE_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_STAGE] "
-                "stage=slot_slice_begin chunk_index=%d chunk_hash=%s "
-                "chunk_start=%d actual_tokens=%d",
-                chunk_index,
-                chunk_hash,
-                chunk_start,
-                actual_tokens,
-            )
-            slot_slice = in_flight_request.slot_mapping[
-                chunk_start:chunk_start + actual_tokens].to(
-                    device=in_flight_request.kv_caches[0].device,
-                    dtype=torch.long,
-                )
-            _debug_mark_stage(f"slot_slice_ready_chunk_{chunk_index}")
-            logger.info(
-                "[LMCACHE_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_STAGE] "
-                "stage=slot_slice_done chunk_index=%d chunk_hash=%s "
-                "slot_count=%d",
-                chunk_index,
-                chunk_hash,
-                int(slot_slice.numel()),
-            )
-
-            if int(slot_slice.numel()) != actual_tokens:
-                raise RuntimeError(
-                    "runtime direct placement verify slot slice length mismatch: "
-                    f"chunk_hash={chunk_hash} expected_tokens={actual_tokens} "
-                    f"slot_slice={int(slot_slice.numel())}")
-            # 这里不再做 `(<0).any().item()` 这类 host 标量回读检查。
-            #
-            # 原因不是这些检查不重要，而是当前我们正在定位：
-            #   persistent service 常驻时，verify 究竟卡在哪一步
-            #
-            # 这类 `.item()` 会强制把 CUDA 标量同步回 host，本身就会重新引入
-            # 一次隐藏同步点，导致日志停在“检查语句”而不是实际的数据访问语句上，
-            # 反而模糊真正的卡点。
-            #
-            # 当前调试阶段更重要的是先把流程推进到：
-            #   flat_index_select_begin / done
-            # 再判断真正的设备访问是否有问题。
-
-            total_chunk_tokens += actual_tokens
-            # 当前最终 KV cache 的真实语义已经确认是 paged/block packed 视图，
-            # 不是早期假设的 flat token-slot 视图。
-            #
-            # 因此这里把 verify 主线收敛成 packed-only：
-            # - 直接按 block / offset / head 的真实读侧口径抽取
-            # - 再和 live request pages 还原出的期望 chunk tensor 对比
-            #
-            # 这样能直接回答当前真正关键的问题：
-            #   GPU 后台写进最终 paged KV cache 的 packed 数据对不对
-            #
-            # 而不会再被错误的 flat 布局假设误导。
-            for layer_id, layer_cache in enumerate(
-                    in_flight_request.kv_caches[:max_verify_layers]):
-                expected_layer = expected_chunk[:, layer_id, :, :]
-                num_kv_heads = int(in_flight_request.num_kv_heads)
-                head_size = int(in_flight_request.head_size)
-                hidden_dim = int(expected_layer.shape[-1])
-                if hidden_dim != num_kv_heads * head_size:
-                    raise RuntimeError(
-                        "runtime direct placement packed-view verify hidden size "
-                        "mismatch: "
-                        f"chunk_hash={chunk_hash} layer={layer_id} "
-                        f"hidden_dim={hidden_dim} num_kv_heads={num_kv_heads} "
-                        f"head_size={head_size}")
-                if layer_cache.ndim != 3 or int(layer_cache.shape[0]) != 2:
-                    raise RuntimeError(
-                        "runtime direct placement packed-view verify expects "
-                        f"layer cache shaped [2, num_blocks, width], got={tuple(layer_cache.shape)}")
-
-                num_blocks = int(layer_cache.shape[1])
-                flattened_width = int(layer_cache.shape[2])
-                if hidden_dim <= 0 or flattened_width % hidden_dim != 0:
-                    raise RuntimeError(
-                        "runtime direct placement packed-view verify failed to "
-                        "infer block size from layer cache: "
-                        f"chunk_hash={chunk_hash} layer={layer_id} "
-                        f"flattened_width={flattened_width} hidden_dim={hidden_dim}")
-                block_size = flattened_width // hidden_dim
-                if block_size <= 0:
-                    raise RuntimeError(
-                        "runtime direct placement packed-view verify inferred "
-                        f"invalid block_size={block_size}")
-
-                pack_size = 16 // int(layer_cache.element_size())
-                if pack_size <= 0 or head_size % pack_size != 0:
-                    raise RuntimeError(
-                        "runtime direct placement packed-view verify cannot "
-                        "build key packed view: "
-                        f"head_size={head_size} pack_size={pack_size}")
-
-                logger.info(
-                    "[LMCACHE_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_STAGE] "
-                    "stage=packed_extract_begin chunk_index=%d layer=%d "
-                    "chunk_hash=%s block_size=%d num_blocks=%d num_kv_heads=%d "
-                    "head_size=%d layer_shape=%s expected_layer_shape=%s",
-                    chunk_index,
-                    layer_id,
-                    chunk_hash,
-                    block_size,
-                    num_blocks,
-                    num_kv_heads,
-                    head_size,
-                    tuple(layer_cache.shape),
-                    tuple(expected_layer.shape),
-                )
-                # 注意：这里的 block / offset 索引组织故意放在 CPU。
-                #
-                # 这是一条很薄的 verify 专用调试支线，不进入正式数据面。
-                # 当前目标是先稳定观察“最终 packed cache 里到底写成了什么”，
-                # 因此优先避免继续在 GPU 上发起辅助小 kernel。
-                slot_blocks, slot_offsets = (
-                    self._build_packed_verify_slot_indices_cpu_debug(
-                        slot_slice=slot_slice,
-                        block_size=block_size,
-                    ))
-                _debug_mark_stage(
-                    f"packed_indices_ready_chunk_{chunk_index}_layer_{layer_id}")
-
-                sample_tokens = min(actual_tokens, sample_token_limit)
-                sample_heads = 1
-                sample_dims = min(head_size, sample_dim_limit)
-                logger.info(
-                    "[LMCACHE_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_STAGE] "
-                    "stage=packed_sample_extract_begin chunk_index=%d layer=%d "
-                    "chunk_hash=%s sample_tokens=%d sample_heads=%d sample_dims=%d",
-                    chunk_index,
-                    layer_id,
-                    chunk_hash,
-                    sample_tokens,
-                    sample_heads,
-                    sample_dims,
-                )
-                (packed_key_sample, packed_value_sample, expected_key_sample,
-                 expected_value_sample, unique_block_count) = (
-                     self._extract_packed_verify_sample_cpu_debug(
-                         layer_cache=layer_cache,
-                         expected_layer=expected_layer,
-                         slot_blocks_host=slot_blocks,
-                         slot_offsets_host=slot_offsets,
-                         num_kv_heads=num_kv_heads,
-                         head_size=head_size,
-                         pack_size=pack_size,
-                         block_size=block_size,
-                         sample_tokens=sample_tokens,
-                         sample_heads=sample_heads,
-                         sample_dims=sample_dims,
-                     ))
-                _debug_mark_stage(
-                    f"packed_extract_done_chunk_{chunk_index}_layer_{layer_id}")
-                logger.info(
-                    "[LMCACHE_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_STAGE] "
-                    "stage=packed_sample_cpu_copy_done chunk_index=%d layer=%d "
-                    "chunk_hash=%s unique_blocks=%d packed_key_sample_shape=%s "
-                    "packed_value_sample_shape=%s",
-                    chunk_index,
-                    layer_id,
-                    chunk_hash,
-                    unique_block_count,
-                    tuple(packed_key_sample.shape),
-                    tuple(packed_value_sample.shape),
-                )
-                logger.info(
-                    "[LMCACHE_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_STAGE] "
-                    "stage=packed_compare_begin chunk_index=%d layer=%d "
-                    "chunk_hash=%s packed_key_shape=%s packed_value_shape=%s",
-                    chunk_index,
-                    layer_id,
-                    chunk_hash,
-                    tuple(packed_key_sample.shape),
-                    tuple(packed_value_sample.shape),
-                )
-                compared_packed_layer_slices += 1
-
-                packed_key_sample_mismatch = (
-                    self._find_first_tensor_mismatch_in_sample_cpu_debug(
-                        packed_key_sample,
-                        expected_key_sample,
-                        sample_tokens=sample_tokens,
-                        sample_heads=sample_heads,
-                        sample_dims=sample_dims,
-                    ))
-                logger.info(
-                    "[LMCACHE_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_STAGE] "
-                    "stage=packed_key_sample_compare_done chunk_index=%d "
-                    "layer=%d chunk_hash=%s mismatch=%s",
-                    chunk_index,
-                    layer_id,
-                    chunk_hash,
-                    "true" if packed_key_sample_mismatch is not None else "false",
-                )
-                if packed_key_sample_mismatch is not None:
-                    (first_pos, max_abs, actual_value,
-                     expected_value_scalar) = packed_key_sample_mismatch
-                    token_idx = int(first_pos[0])
-                    head_idx = int(first_pos[1])
-                    dim_idx = int(first_pos[2])
-                    slot_id = int(slot_slice[token_idx].detach().to(device="cpu").item())
-                    host_reference_summary = "host_reference=not_run"
-                    official_oracle_summary = "official_oracle=not_run"
-                    try:
-                        (host_key_sample, _host_value_sample,
-                         host_expected_key_sample, _host_expected_value_sample,
-                         host_unique_block_count) = (
-                             self._run_host_reference_packed_verify_sample_cpu_debug(
-                                 in_flight_request=in_flight_request,
-                                 chunk_index=chunk_index,
-                                 actual_tokens=actual_tokens,
-                                 slot_slice=slot_slice,
-                                 expected_layer=expected_layer,
-                                 sample_tokens=sample_tokens,
-                                 sample_heads=sample_heads,
-                                 sample_dims=sample_dims,
-                                 num_kv_heads=num_kv_heads,
-                                 head_size=head_size,
-                                 pack_size=pack_size,
-                                 block_size=block_size,
-                                 layer_id=layer_id,
-                             ))
-                        host_key_mismatch = (
-                            self._find_first_tensor_mismatch_in_sample_cpu_debug(
-                                host_key_sample,
-                                host_expected_key_sample,
-                                sample_tokens=sample_tokens,
-                                sample_heads=sample_heads,
-                                sample_dims=sample_dims,
-                            ))
-                        if host_key_mismatch is None:
-                            host_reference_summary = (
-                                "host_reference=match "
-                                f"unique_blocks={host_unique_block_count}")
-                        else:
-                            (host_first_pos, host_max_abs, host_actual_value,
-                             host_expected_value_scalar) = host_key_mismatch
-                            host_reference_summary = (
-                                "host_reference=mismatch "
-                                f"token_idx={int(host_first_pos[0])} "
-                                f"head={int(host_first_pos[1])} "
-                                f"dim={int(host_first_pos[2])} "
-                                f"actual={host_actual_value} "
-                                f"expected={host_expected_value_scalar} "
-                                f"max_abs={host_max_abs} "
-                                f"unique_blocks={host_unique_block_count}")
-                    except Exception as host_reference_exc:
-                        host_reference_summary = (
-                            "host_reference=error "
-                            f"type={type(host_reference_exc).__name__} "
-                            f"msg={host_reference_exc}")
-                    try:
-                        (oracle_key_sample, _oracle_value_sample,
-                         oracle_expected_key_sample,
-                         _oracle_expected_value_sample,
-                         oracle_unique_block_count) = (
-                             self._run_official_paged_cache_oracle_verify_sample_cpu_debug(
-                                 in_flight_request=in_flight_request,
-                                 slot_slice=slot_slice,
-                                 expected_layer=expected_layer,
-                                 sample_tokens=sample_tokens,
-                                 sample_heads=sample_heads,
-                                 sample_dims=sample_dims,
-                                 num_kv_heads=num_kv_heads,
-                                 head_size=head_size,
-                                 pack_size=pack_size,
-                                 block_size=block_size,
-                                 layer_cache=layer_cache,
-                             ))
-                        oracle_key_mismatch = (
-                            self._find_first_tensor_mismatch_in_sample_cpu_debug(
-                                oracle_key_sample,
-                                oracle_expected_key_sample,
-                                sample_tokens=sample_tokens,
-                                sample_heads=sample_heads,
-                                sample_dims=sample_dims,
-                            ))
-                        if oracle_key_mismatch is None:
-                            official_oracle_summary = (
-                                "official_oracle=match "
-                                f"unique_blocks={oracle_unique_block_count}")
-                        else:
-                            (oracle_first_pos, oracle_max_abs,
-                             oracle_actual_value,
-                             oracle_expected_value_scalar) = oracle_key_mismatch
-                            official_oracle_summary = (
-                                "official_oracle=mismatch "
-                                f"token_idx={int(oracle_first_pos[0])} "
-                                f"head={int(oracle_first_pos[1])} "
-                                f"dim={int(oracle_first_pos[2])} "
-                                f"actual={oracle_actual_value} "
-                                f"expected={oracle_expected_value_scalar} "
-                                f"max_abs={oracle_max_abs} "
-                                f"unique_blocks={oracle_unique_block_count}")
-                    except Exception as official_oracle_exc:
-                        official_oracle_summary = (
-                            "official_oracle=error "
-                            f"type={type(official_oracle_exc).__name__} "
-                            f"msg={official_oracle_exc}")
-                    raise RuntimeError(
-                        "runtime direct placement packed-key sample mismatch: "
-                        f"chunk_hash={chunk_hash} layer={layer_id} "
-                        f"token_idx={token_idx} slot_id={slot_id} "
-                        f"head={head_idx} dim={dim_idx} actual={actual_value} "
-                        f"expected={expected_value_scalar} max_abs={max_abs} "
-                        f"{host_reference_summary} {official_oracle_summary}")
-
-                packed_value_sample_mismatch = (
-                    self._find_first_tensor_mismatch_in_sample_cpu_debug(
-                        packed_value_sample,
-                        expected_value_sample,
-                        sample_tokens=sample_tokens,
-                        sample_heads=sample_heads,
-                        sample_dims=sample_dims,
-                    ))
-                logger.info(
-                    "[LMCACHE_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_STAGE] "
-                    "stage=packed_value_sample_compare_done chunk_index=%d "
-                    "layer=%d chunk_hash=%s mismatch=%s",
-                    chunk_index,
-                    layer_id,
-                    chunk_hash,
-                    "true" if packed_value_sample_mismatch is not None else "false",
-                )
-                if packed_value_sample_mismatch is not None:
-                    (first_pos, max_abs, actual_value,
-                     expected_value_scalar) = packed_value_sample_mismatch
-                    token_idx = int(first_pos[0])
-                    head_idx = int(first_pos[1])
-                    dim_idx = int(first_pos[2])
-                    slot_id = int(slot_slice[token_idx].detach().to(device="cpu").item())
-                    raise RuntimeError(
-                        "runtime direct placement packed-value sample mismatch: "
-                        f"chunk_hash={chunk_hash} layer={layer_id} "
-                        f"token_idx={token_idx} slot_id={slot_id} "
-                        f"head={head_idx} dim={dim_idx} actual={actual_value} "
-                        f"expected={expected_value_scalar} max_abs={max_abs}")
-
-                logger.info(
-                    "[LMCACHE_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_STAGE] "
-                    "stage=packed_sample_compare_done chunk_index=%d layer=%d "
-                    "chunk_hash=%s",
-                    chunk_index,
-                    layer_id,
-                    chunk_hash,
-                )
-
-                if not enable_full_compare:
-                    logger.info(
-                        "[LMCACHE_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_STAGE] "
-                        "stage=packed_full_compare_skipped chunk_index=%d "
-                        "layer=%d chunk_hash=%s",
-                        chunk_index,
-                        layer_id,
-                        chunk_hash,
-                    )
-                    continue
-
-                slot_blocks_device = slot_blocks.to(
-                    device=layer_cache.device,
-                    dtype=torch.long,
-                )
-                slot_offsets_device = slot_offsets.to(
-                    device=layer_cache.device,
-                    dtype=torch.long,
-                )
-                flat_cache = layer_cache.view(
-                    2,
-                    num_blocks * block_size,
-                    num_kv_heads,
-                    head_size,
-                )
-                flat_slots_device = (
-                    slot_blocks_device * int(block_size) + slot_offsets_device)
-                packed_key = flat_cache[
-                    0,
-                    flat_slots_device,
-                    :,
-                    :,
-                ]
-                packed_value = flat_cache[
-                    1,
-                    flat_slots_device,
-                    :,
-                    :,
-                ]
-                expected_key = expected_layer[0].reshape(
-                    actual_tokens,
-                    num_kv_heads,
-                    head_size,
-                )
-                expected_value = expected_layer[1].reshape(
-                    actual_tokens,
-                    num_kv_heads,
-                    head_size,
-                )
-
-                packed_key_mismatch = self._find_first_tensor_mismatch(
-                    packed_key,
-                    expected_key,
-                )
-                logger.info(
-                    "[LMCACHE_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_STAGE] "
-                    "stage=packed_key_compare_done chunk_index=%d layer=%d "
-                    "chunk_hash=%s mismatch=%s",
-                    chunk_index,
-                    layer_id,
-                    chunk_hash,
-                    "true" if packed_key_mismatch is not None else "false",
-                )
-                if packed_key_mismatch is not None:
-                    first_pos, max_abs = packed_key_mismatch
-                    token_idx = int(first_pos[0])
-                    head_idx = int(first_pos[1])
-                    dim_idx = int(first_pos[2])
-                    slot_id = int(slot_slice[token_idx].item())
-                    actual_value = packed_key[token_idx, head_idx, dim_idx].item()
-                    expected_value = expected_key[token_idx, head_idx,
-                                                  dim_idx].item()
-                    raise RuntimeError(
-                        "runtime direct placement packed-key mismatch: "
-                        f"chunk_hash={chunk_hash} layer={layer_id} "
-                        f"token_idx={token_idx} slot_id={slot_id} "
-                        f"head={head_idx} dim={dim_idx} actual={actual_value} "
-                        f"expected={expected_value} max_abs={max_abs}")
-
-                packed_value_mismatch = self._find_first_tensor_mismatch(
-                    packed_value,
-                    expected_value,
-                )
-                logger.info(
-                    "[LMCACHE_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_STAGE] "
-                    "stage=packed_value_compare_done chunk_index=%d layer=%d "
-                    "chunk_hash=%s mismatch=%s",
-                    chunk_index,
-                    layer_id,
-                    chunk_hash,
-                    "true" if packed_value_mismatch is not None else "false",
-                )
-                if packed_value_mismatch is not None:
-                    first_pos, max_abs = packed_value_mismatch
-                    token_idx = int(first_pos[0])
-                    head_idx = int(first_pos[1])
-                    dim_idx = int(first_pos[2])
-                    slot_id = int(slot_slice[token_idx].item())
-                    actual_value = packed_value[token_idx, head_idx,
-                                                dim_idx].item()
-                    expected_value_scalar = expected_value[token_idx, head_idx,
-                                                           dim_idx].item()
-                    raise RuntimeError(
-                        "runtime direct placement packed-value mismatch: "
-                        f"chunk_hash={chunk_hash} layer={layer_id} "
-                        f"token_idx={token_idx} slot_id={slot_id} "
-                        f"head={head_idx} dim={dim_idx} actual={actual_value} "
-                        f"expected={expected_value_scalar} max_abs={max_abs}")
-
-        verify_ms = (time.perf_counter() - verify_start) * 1000.0
-        logger.info(
-            "[LMCACHE_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_OK] "
-            "chunks=%d verify_chunks=%d verify_layers=%d chunk_tokens=%d "
-            "compared_packed_layer_slices=%d packed_verify_enabled=%s "
-            "elapsed_ms=%.3f",
-            consumable_chunks,
-            max_verify_chunks,
-            max_verify_layers,
-            total_chunk_tokens,
-            compared_packed_layer_slices,
-            str(packed_verify_enabled).lower(),
-            verify_ms,
-        )
-
     def read_chunk_pages_kv_fast_path_batch(
         self,
         keys: list[Any],
@@ -2907,38 +1183,15 @@ class LMCacheBaMStore:
             timeout_s=timeout_s,
         )
 
-    def read_chunk_pages_kv_fast_path_direct_batch(
-        self,
-        keys: list[Any],
-        *,
-        max_chunks: int | None = None,
-    ) -> list[Any]:
-        """直接从当前 BaM store 读取指定前缀 chunk 子集的 pages。"""
-        if max_chunks is not None:
-            keys = keys[:max(int(max_chunks), 0)]
-        items: list[tuple[str, BaMChunkMetadata]] = []
-        for key in keys:
-            chunk_hash = _extract_chunk_hash(key)
-            metadata = self._lookup_metadata(chunk_hash)
-            if metadata is None:
-                raise KeyError(f"BaM chunk not found: {chunk_hash}")
-            items.append((chunk_hash, metadata))
-
-        if not items:
-            return []
-        return self._ensure_kv_fast_path().read_chunk_pages_direct_batch(items)
-
     def get_last_direct_placement_state_snapshot(
         self,
     ) -> Optional[BaMDirectPlacementBatchStateSnapshot]:
         """返回最近一次 direct placement 的状态快照。
 
-        当前主线还没有把这份状态真正接到 attention consume 侧，因此这里先提供
-        只读快照接口，方便：
-
-        - 在测试里直接断言 ready 语义
-        - 在联调中核对 direct placement 究竟推进到了哪个阶段
-        - 后续把它接给更细粒度的 prefix consume 逻辑
+        这是三条 KV 链路共用的只读观察接口：
+        - 单测用它断言 frontier/ret_mask 语义；
+        - 联调用它确认 read/stage/cache/consumable 推进到哪里；
+        - 正式数据面不依赖它做额外搬运。
         """
         if self._last_direct_placement_state_tracker is None:
             return None
@@ -2951,33 +1204,19 @@ class LMCacheBaMStore:
         tokens: torch.Tensor,
         mask: Optional[torch.Tensor],
     ) -> list[tuple[int, int, Any]]:
-        """收集本轮 direct placement 可由 BaM 服务的前缀 chunks。
+        """收集本轮 direct placement 可由 BaM 服务的连续前缀 chunks。
 
-        这里刻意把“命中判断”和“真正发起 I/O”拆开，原因有两个：
+        这一步是三条 KV 链路共同的控制面入口，只负责判断“哪些 chunk 可以由
+        BaM 接管”，不发起 I/O，也不做 placement。
 
-        1. 让 `LMCacheBaMStorageManager` 不需要知道 token_database 的迭代细节，
-           它只负责把 direct placement 请求转交给 BaM store。
-        2. 保持 LMCache prefix 语义不变。`process_tokens()` 产出的 chunk 是按前缀
-           顺序排列的，一旦中间有一个 chunk 在 BaM 中缺失，就必须停止；否则
-           后面的 chunk 即使存在，也不能越过缺口直接注回 vLLM KV cache。
-
-        返回值中的三元组含义：
-
-        ```text
-        (start, end, key)
-        ```
-
-        其中 `start/end` 使用的是当前 `tokens` / `slot_mapping` 这一段局部坐标，
-        后续 placement kernel 会用它把 chunk 对应的 token 范围映射回正确 slot。
+        LMCache 的 prefix 语义要求命中必须连续：一旦中间某个 chunk 在 BaM 中
+        缺失，后面的 chunk 即使存在，也不能越过缺口直接写回 vLLM KV cache。
+        因此这里遇到第一个 miss 就停止。
         """
         entries: list[tuple[int, int, Any]] = []
         for start, end, key in token_database.process_tokens(tokens, mask):
             metadata = self.get_chunk_metadata(key)
             if metadata is None:
-                # direct placement 只能消费“连续前缀命中”。
-                # 因此一旦这里遇到第一个 miss，就必须立刻停止，并把断点
-                # 记录下来，帮助排查“为什么前几个 chunk 能复用、最后一个
-                # 不能复用”的具体位置。
                 logger.info(
                     "[LMCACHE_BAM_DIRECT_PLACEMENT_PREFIX_BREAK] "
                     "prefix_chunks=%d miss_range=[%d,%d) chunk_hash=%s",
@@ -2989,50 +1228,6 @@ class LMCacheBaMStore:
                 break
             entries.append((int(start), int(end), key))
         return entries
-
-    def _build_direct_placement_descriptor(
-        self,
-        *,
-        entries: list[tuple[int, int, Any]],
-        results: list[Any],
-    ) -> BaMDirectPlacementBatchDescriptor:
-        """把本轮命中的 chunk 与 BaM 读结果收成稳定 descriptor。
-
-        这一步和 direct placement 内部 `_build_plan()` 的职责不同：
-
-        - `_build_plan()` 面向“当前这次真正怎么执行 placement”
-        - 这里面向“这次 batch 在控制面上由哪些 chunk 组成”
-
-        因此这里保留 chunk hash / token range / total_bytes 这些更适合状态跟踪与
-        后续按需 consume 的信息，而不掺入临时的 CUDA tensor / launch 细节。
-        """
-        if len(entries) != len(results):
-            raise ValueError(
-                "direct placement descriptor requires matching entries/results: "
-                f"{len(entries)} vs {len(results)}")
-
-        chunk_descriptors: list[BaMDirectPlacementChunkDescriptor] = []
-        total_tokens = 0
-        total_bytes = 0
-        for (start, end, key), result in zip(entries, results):
-            actual_tokens = int(result.descriptor.actual_tokens)
-            total_chunk_bytes = int(result.descriptor.total_bytes)
-            chunk_descriptors.append(
-                BaMDirectPlacementChunkDescriptor(
-                    chunk_hash=_extract_chunk_hash(key),
-                    chunk_start=int(start),
-                    chunk_end=int(end),
-                    actual_tokens=actual_tokens,
-                    total_bytes=total_chunk_bytes,
-                ))
-            total_tokens += actual_tokens
-            total_bytes += total_chunk_bytes
-
-        return BaMDirectPlacementBatchDescriptor(
-            chunks=tuple(chunk_descriptors),
-            total_tokens=total_tokens,
-            total_bytes=total_bytes,
-        )
 
     def _build_direct_placement_descriptor_from_metadata(
         self,
@@ -4287,7 +2482,6 @@ class LMCacheBaMStore:
                     runtime_direct_placement_attached=False,
                 ),
                 runtime_cleanup_handle=in_flight_request.kv_read_handle,
-                runtime_verify_expected_tensors=None,
             )
 
         if in_flight_request.kv_read_handle is None:
@@ -4349,244 +2543,6 @@ class LMCacheBaMStore:
             read_finalize_mode,
         )
 
-    def _prepare_one_copy_runtime_verify_expected_tensors(
-        self,
-        *,
-        in_flight_request: _InFlightDirectPlacementRequest,
-    ) -> dict[str, torch.Tensor] | None:
-        """为 one-copy 写后校验准备 expected dense tensors。
-
-        这是强调试支线，不参与默认正确 fast path。把它单独拆出来后，one-copy
-        主线的 cleanup 语义不会再和 verify live refill 逻辑缠在一起。
-        """
-        if not envs.VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE:
-            return None
-
-        # one-copy correctness repair 现在会先用“正确 materialized 线路”同源的
-        # refill kernel 准备 dense prefix。raw verify 的 reference 应该优先复用
-        # 这份已经准备好的 tensor：
-        #
-        # - 避免为了 verify 再从 live request pages 重复 refill 一遍；
-        # - 保证 raw verify、official repair、后续 xformers 诊断看到的是同一份
-        #   correctness anchor；
-        # - 避免重新引入“旁路 decode 自洽但模型输出错误”的循环校验。
-        existing_dense = in_flight_request.materialized_prefix_chunk_tensors
-        if existing_dense:
-            prefix_keys = in_flight_request.keys[:len(existing_dense)]
-            logger.info(
-                "[LMCACHE_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_PREPARE_REUSE] "
-                "chunks=%d source=materialized_prefix_refill",
-                len(existing_dense),
-            )
-            return {
-                _extract_chunk_hash(key): dense_chunk
-                for key, dense_chunk in zip(prefix_keys, existing_dense)
-            }
-
-        if (envs.VLLM_BAM_DIRECT_PLACEMENT_RUNTIME_ONE_COPY and not envs.
-                VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_ALLOW_LIVE_REFILL):
-            logger.warning(
-                "[LMCACHE_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_SKIP] "
-                "reason=live_refill_disabled_for_runtime_one_copy "
-                "batch_size=%d prefix_hit_chunks=%d",
-                len(in_flight_request.keys),
-                int(in_flight_request.prefix_hit_chunks),
-            )
-            return None
-        logger.info(
-            "[LMCACHE_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_PREPARE_BEGIN] "
-            "batch_size=%d prefix_hit_chunks=%d source=live_request_pages",
-            len(in_flight_request.keys),
-            int(in_flight_request.prefix_hit_chunks),
-        )
-        try:
-            tensors = (
-                self.load_chunk_tensors_kv_fast_path_from_live_request_pages(
-                    in_flight_request.kv_read_handle,
-                    max_chunks=in_flight_request.prefix_hit_chunks,
-                ))
-            logger.info(
-                "[LMCACHE_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_PREPARE_DONE] "
-                "prepared_chunks=%d",
-                len(tensors),
-            )
-            return tensors
-        except Exception:
-            logger.exception(
-                "[LMCACHE_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_PREPARE_FAIL] "
-                "failed to build expected tensors from live request pages")
-            return None
-
-    def _prepare_one_copy_dense_prefix_workspace(
-        self,
-        *,
-        in_flight_request: _InFlightDirectPlacementRequest,
-    ) -> None:
-        """为 one-copy correctness repair / dense consume 准备 dense prefix tensor。
-
-        这一步只属于 `gpu_worker_persistent_one_copy` 实验线。当前 one-copy 写端
-        还没有完全收敛到官方 paged KV 语义，因此这里保留一份从 live pages
-        materialize 出来的 dense prefix，供后续 official-write repair 和调试校验
-        使用。materialized fast path 不走这里。
-        """
-        if in_flight_request.prefix_hit_chunks <= 0:
-            return
-        try:
-            logger.info(
-                "[LMCACHE_BAM_DIRECT_PLACEMENT_DENSE_PREFIX_PREPARE_BEGIN] "
-                "chunks=%d source=live_request_pages",
-                int(in_flight_request.prefix_hit_chunks),
-            )
-            dense_prefix_tensors = (
-                self.load_chunk_tensors_kv_fast_path_from_live_request_pages(
-                    in_flight_request.kv_read_handle,
-                    max_chunks=in_flight_request.prefix_hit_chunks,
-                ))
-            logger.info(
-                "[LMCACHE_BAM_DIRECT_PLACEMENT_DENSE_PREFIX_PREPARE_LOAD_DONE] "
-                "loaded_chunks=%d",
-                len(dense_prefix_tensors),
-            )
-            in_flight_request.materialized_prefix_chunk_tensors = tuple(
-                dense_prefix_tensors[_extract_chunk_hash(key)]
-                for key in in_flight_request.keys[
-                    :in_flight_request.prefix_hit_chunks]
-            )
-            self._verify_one_copy_dense_prefix_against_write_reference(
-                in_flight_request=in_flight_request)
-            logger.info(
-                "[LMCACHE_BAM_DIRECT_PLACEMENT_DENSE_PREFIX_PREPARE_DONE] "
-                "chunks=%d",
-                len(in_flight_request.materialized_prefix_chunk_tensors),
-            )
-        except Exception:
-            logger.exception(
-                "[LMCACHE_BAM_DIRECT_PLACEMENT_DENSE_PREFIX_PREPARE_FAIL] "
-                "failed to materialize dense prefix chunk tensors "
-                "from live request pages")
-            in_flight_request.materialized_prefix_chunk_tensors = None
-
-    def _resolve_one_copy_runtime_verify_expected_tensors(
-        self,
-        *,
-        in_flight_request: _InFlightDirectPlacementRequest,
-        runtime_verify_expected_tensors: dict[str, torch.Tensor] | None,
-    ) -> dict[str, torch.Tensor] | None:
-        """取得 one-copy raw 写入校验所需的 expected dense tensors。
-
-        one-copy 当前有两种可能已经拿到“正确参考值”：
-
-        1. `VERIFY_RUNTIME_WRITE_ALLOW_LIVE_REFILL=1` 时，读收口阶段会直接从
-           live request pages 构造 `dict[chunk_hash, dense_tensor]`；
-        2. correctness repair 为了调用 vLLM 官方写端，会准备
-           `materialized_prefix_chunk_tensors`，其顺序与当前 prefix keys 一一对应。
-
-        raw one-copy 校验必须发生在 official-write repair 之前，否则 repair 会把
-        GPU persistent service 原始 scatter 的错误覆盖掉。这里优先复用已有 dict，
-        不存在时再把 dense prefix tuple 轻量组回 dict，避免为了调试再次触发 BaM
-        读路径。
-        """
-        if runtime_verify_expected_tensors is not None:
-            return runtime_verify_expected_tensors
-
-        dense_chunks = in_flight_request.materialized_prefix_chunk_tensors
-        if not dense_chunks:
-            return None
-
-        prefix_keys = in_flight_request.keys[:len(dense_chunks)]
-        return {
-            _extract_chunk_hash(key): dense_chunk
-            for key, dense_chunk in zip(prefix_keys, dense_chunks)
-        }
-
-    def _verify_one_copy_raw_runtime_write_before_repair(
-        self,
-        *,
-        in_flight_request: _InFlightDirectPlacementRequest,
-        runtime_verify_expected_tensors: dict[str, torch.Tensor] | None,
-    ) -> bool:
-        """在 official repair 前校验 GPU service 的原始 one-copy 写入。
-
-        这条 helper 是 one-copy 下一阶段最关键的“定责钩子”：
-
-        - 如果这里通过，说明 persistent service 直接写 paged KV cache 已经正确，
-          后续可以安全移除 official-write repair；
-        - 如果这里失败，错误会暴露在 repair 之前，mismatch 日志就能直接指向
-          CUDA scatter 的源布局、目标 packed offset 或 slot 映射问题。
-
-        返回值表示本轮是否已经做过 runtime-write verify。调用方用它避免在
-        repair 之后再次调用同一个 verifier，从而把 raw 结果和 repair 结果混在一起。
-        """
-        if not envs.VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE:
-            return False
-
-        expected_tensors = self._resolve_one_copy_runtime_verify_expected_tensors(
-            in_flight_request=in_flight_request,
-            runtime_verify_expected_tensors=runtime_verify_expected_tensors,
-        )
-        logger.info(
-            "[LMCACHE_BAM_DIRECT_PLACEMENT_RAW_RUNTIME_WRITE_VERIFY_BEGIN] "
-            "chunks=%d expected_source=%s",
-            int(in_flight_request.prefix_hit_chunks),
-            "available" if expected_tensors is not None else "missing",
-        )
-        if expected_tensors is None:
-            logger.warning(
-                "[LMCACHE_BAM_DIRECT_PLACEMENT_RAW_RUNTIME_WRITE_VERIFY_SKIP] "
-                "reason=missing_expected_tensors chunks=%d",
-                int(in_flight_request.prefix_hit_chunks),
-            )
-            return False
-        # raw verify 会从最终 paged KV cache 做少量 D2H 抽样读回。当前 V100
-        # persistent service 是常驻 CTA，如果此时 service 已经没有活跃 request
-        # 但仍在空转，D2H 调试读回可能被后台 kernel 拖住，表现为日志停在
-        # `packed_sample_extract_begin`。
-        #
-        # 因此这里和 official-write verify 使用同一个安全边界：只在 runtime
-        # 已经 idle 时退役 service；如果还有活跃请求，底层不会停止它。这样 raw
-        # verify 看到的仍然是 repair 前的原始 one-copy 写入结果，但不会被空转
-        # persistent CTA 卡住。
-        self._stop_kv_runtime_service_if_idle_for_verify_debug()
-        self._verify_runtime_direct_placement_write_against_materialized_chunks(
-            in_flight_request=in_flight_request,
-            consumable_chunks=int(in_flight_request.prefix_hit_chunks),
-            expected_tensors=expected_tensors,
-        )
-        logger.info(
-            "[LMCACHE_BAM_DIRECT_PLACEMENT_RAW_RUNTIME_WRITE_VERIFY_DONE] "
-            "chunks=%d",
-            int(in_flight_request.prefix_hit_chunks),
-        )
-        return True
-
-    def _verify_one_copy_dense_prefix_against_write_reference(
-        self,
-        *,
-        in_flight_request: _InFlightDirectPlacementRequest,
-    ) -> None:
-        """可选校验 one-copy dense prefix 是否等于 shadow write 源数据。"""
-        if not _env_enabled("VLLM_BAM_WRITE_READ_VERIFY"):
-            return
-        if _env_enabled("VLLM_BAM_WRITE_READ_VERIFY_SYNC_COMPARE"):
-            # 写读源数据校验会把少量 decoded tensor 样本从 GPU 拷回 CPU。
-            # 这个同步点只属于强调试支线；为了避免它和已经 idle 的 persistent
-            # service 互相等待，这里在真正做 D2H 对比前先尝试停止后台 service。
-            self._stop_kv_runtime_service_if_idle_for_verify_debug()
-        verified = True
-        prefix_keys = in_flight_request.keys[:in_flight_request.prefix_hit_chunks]
-        for key, decoded_tensor in zip(
-                prefix_keys,
-                in_flight_request.materialized_prefix_chunk_tensors or ()):
-            verified = (
-                self._verify_decoded_chunk_against_write_reference(
-                    chunk_hash=_extract_chunk_hash(key),
-                    decoded_tensor=decoded_tensor,
-                ) and verified)
-        if not verified:
-            raise RuntimeError(
-                "BaM write/read verify failed; decoded prefix chunk does not "
-                "match shadow write source")
-
     def _finalize_one_copy_read_request(
         self,
         *,
@@ -4605,16 +2561,12 @@ class LMCacheBaMStore:
         ```
 
         这里不再消费出 `BaMKVReadResult[]`，也不再把请求绕回
-        `_finalize_materialized_pipeline()`。如果显式打开 runtime-write verify，
-        会在 cleanup 前用 live request pages 构造一份小规模 correctness anchor；
-        默认性能路径不做这一步。
+        `_finalize_materialized_pipeline()`。one-copy 的正确性以底层 runtime
+        scatter 为准，前台不再夹带 live-pages refill / official-write repair。
         """
         read_consume_start = self._log_direct_read_consume_begin(
             in_flight_request=in_flight_request)
         runtime_cleanup_handle = in_flight_request.kv_read_handle
-        runtime_verify_expected_tensors = (
-            self._prepare_one_copy_runtime_verify_expected_tensors(
-                in_flight_request=in_flight_request))
 
         runtime_cleanup_done = (
             self.finalize_chunk_pages_kv_fast_path_batch_request_runtime_direct_placement(
@@ -4637,7 +2589,6 @@ class LMCacheBaMStore:
             read_finalize_mode=_DIRECT_FINALIZE_MODE_RUNTIME_DIRECT,
             pipeline_name=_DIRECT_PIPELINE_GPU_WORKER_PERSISTENT_ONE_COPY,
             runtime_cleanup_handle=runtime_cleanup_handle,
-            runtime_verify_expected_tensors=runtime_verify_expected_tensors,
         )
 
     def _consume_materialized_read_request(
@@ -4678,7 +2629,6 @@ class LMCacheBaMStore:
                 runtime_direct_placement_attached=False,
             ),
             runtime_cleanup_handle=runtime_cleanup_handle,
-            runtime_verify_expected_tensors=None,
         )
 
     def _finalize_persistent_one_copy_pipeline(
@@ -4686,7 +2636,6 @@ class LMCacheBaMStore:
         *,
         in_flight_request: _InFlightDirectPlacementRequest,
         runtime_cleanup_handle: Any | None,
-        runtime_verify_expected_tensors: dict[str, torch.Tensor] | None,
     ) -> _DirectPlacementFinalizeBackendOutcome:
         """收口 one-copy 实验主线。
 
@@ -4702,15 +2651,11 @@ class LMCacheBaMStore:
             in_flight_request.prefix_hit_chunks)
         state_tracker.mark_chunks_cache_ready_upto(
             in_flight_request.prefix_hit_chunks)
-        raw_runtime_write_verified = (
-            self._verify_one_copy_raw_runtime_write_before_repair(
-                in_flight_request=in_flight_request,
-                runtime_verify_expected_tensors=runtime_verify_expected_tensors,
-            ))
-        # 这里不再执行 official-write repair。真正的 one-copy 语义是：
+        # 这里不再执行 official-write repair 或 runtime-write verify。真正的
+        # one-copy 语义是：
         # GPU persistent service 已经把 BaM cache page 直接写进最终 vLLM paged
         # KV cache；host 只发布 frontier/ret_mask。若输出仍错，必须继续修
-        # runtime scatter 或读侧解释，而不是再用 repair 覆盖错误。
+        # runtime scatter 或读侧解释，而不是再用 repair/verify 支线覆盖错误。
         place_stats = type(
             "PlaceStats", (),
             {
@@ -4736,7 +2681,6 @@ class LMCacheBaMStore:
             place_stats=place_stats,
             frontier_wave_ms=frontier_wave_ms,
             cache_ready_log_ms=cache_ready_log_ms,
-            raw_runtime_write_verified=raw_runtime_write_verified,
         )
 
     def _finalize_materialized_pipeline(
@@ -4883,14 +2827,12 @@ class LMCacheBaMStore:
         read_finalize_mode: str,
         in_flight_request: _InFlightDirectPlacementRequest,
         runtime_cleanup_handle: Any | None,
-        runtime_verify_expected_tensors: dict[str, torch.Tensor] | None,
     ) -> _DirectPlacementFinalizeBackendOutcome:
         """按显式 finalize consume backend 收口 direct placement request。"""
         if read_finalize_mode == _DIRECT_FINALIZE_MODE_RUNTIME_DIRECT:
             return self._finalize_persistent_one_copy_pipeline(
                 in_flight_request=in_flight_request,
                 runtime_cleanup_handle=runtime_cleanup_handle,
-                runtime_verify_expected_tensors=runtime_verify_expected_tensors,
             )
         if read_finalize_mode == _DIRECT_FINALIZE_MODE_RESULTS_MATERIALIZED:
             return self._finalize_materialized_pipeline(
@@ -4926,19 +2868,15 @@ class LMCacheBaMStore:
         read_finalize_mode = str(read_outcome.read_finalize_mode)
         pipeline_name = str(read_outcome.pipeline_name)
         runtime_cleanup_handle = read_outcome.runtime_cleanup_handle
-        runtime_verify_expected_tensors = read_outcome.runtime_verify_expected_tensors
         finalize_backend_outcome = self._finalize_direct_placement_with_backend(
             read_finalize_mode=read_finalize_mode,
             in_flight_request=in_flight_request,
             runtime_cleanup_handle=runtime_cleanup_handle,
-            runtime_verify_expected_tensors=runtime_verify_expected_tensors,
         )
         first_wave_snapshot = finalize_backend_outcome.snapshot
         place_stats = finalize_backend_outcome.place_stats
         frontier_wave_ms = finalize_backend_outcome.frontier_wave_ms
         cache_ready_log_ms = finalize_backend_outcome.cache_ready_log_ms
-        raw_runtime_write_verified = (
-            finalize_backend_outcome.raw_runtime_write_verified)
 
         # ret_mask 必须绑定到当前这次单波 placement 真正形成的 contiguous
         # consumable frontier，而不能简单等同于“这次命中了多少 prefix chunk”。
@@ -4951,44 +2889,6 @@ class LMCacheBaMStore:
         )
         ret_mask_ms = (time.perf_counter() - ret_mask_start) * 1000.0
         return_snapshot = first_wave_snapshot
-        if read_finalize_mode == _DIRECT_FINALIZE_MODE_RUNTIME_DIRECT:
-            # 这条校验只服务当前最关键的定位问题：
-            #
-            #   persistent service + cleanup-only direct placement
-            #     已经跑通
-            #   但最终模型输出仍然错误
-            #
-            # 这时我们首先要确认的，不是 metadata fast path，而是：
-            #
-            #   最终写进 vLLM paged KV cache 的值
-            #   是否已经与旧 materialize 语义完全一致
-            #
-            # 因此这里把对照点放在 cleanup-only 收口之后、ret_mask 已可见之前。
-            #
-            # 注意：这里还会额外做一件只属于 verify 调试支线的事：
-            # - 如果当前 persistent service 已经空闲，就先把它停掉
-            # - 再去直接回读最终 paged KV cache
-            #
-            # 原因是当前已经验证到：
-            # - 主线 `consumable` 已经形成
-            # - 但 verify 若在 service 常驻时直接读最终 kv_cache，仍可能被拖住
-            #
-            # 因此这里显式把“主线已经完成”和“调试读取最终 cache”拆开。
-            if (envs.VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE
-                    and not raw_runtime_write_verified):
-                self._stop_kv_runtime_service_if_idle_for_verify_debug()
-                self._verify_runtime_direct_placement_write_against_materialized_chunks(
-                    in_flight_request=in_flight_request,
-                    consumable_chunks=int(return_snapshot.consumable_chunks),
-                    expected_tensors=runtime_verify_expected_tensors,
-                )
-            elif raw_runtime_write_verified:
-                logger.info(
-                    "[LMCACHE_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE_SKIP] "
-                    "reason=raw_runtime_write_already_verified_before_repair "
-                    "consumable_chunks=%d",
-                    int(return_snapshot.consumable_chunks),
-                )
         # 只有 runtime direct cleanup-only 这条主线，才能说明：
         #
         # 1. GPU persistent service 已经完成
@@ -5779,8 +3679,10 @@ class LMCacheBaMStorageManager:
             envs.VLLM_BAM_CTRL_IDX,
         )
         logger.info(
-            "[LMCACHE_BAM] env gids_kv_worker_poll_impl=%s",
-            os.environ.get("GIDS_KV_WORKER_POLL_IMPL", "<unset>"),
+            "[LMCACHE_BAM] env kv_executor=%s runtime=%s persistent=%s",
+            os.environ.get("VLLM_BAM_KV_EXECUTOR", "<unset>"),
+            os.environ.get("GIDS_KV_GPU_WORKER_RUNTIME_ENABLE", "<unset>"),
+            os.environ.get("GIDS_KV_GPU_WORKER_PERSISTENT_ENABLE", "<unset>"),
         )
 
     def _ensure_bam_store(self, memory_obj: Any) -> Optional[LMCacheBaMStore]:
@@ -6003,249 +3905,6 @@ class LMCacheBaMStorageManager:
                 "[LMCACHE_BAM_VERIFY] failed to compare BaM tensor with "
                 "original LMCache tensor")
 
-    def _maybe_verify_direct_retrieve_against_original_storage(
-        self,
-        *,
-        in_flight_request: Any,
-    ) -> None:
-        """校验 direct retrieve 读回的 dense chunk 是否等于 LMCache 原始源。
-
-        这一步只服务当前 correctness 排查，不参与正式热路径。它和 store 内部
-        `WRITE_READ_VERIFY` 的区别是：
-
-        - store 内部校验：BaM 读回结果 vs shadow write 当时记录的轻量样本；
-        - 这里的校验：BaM 读回结果 vs 当前原始 LMCache storage manager.get(key)。
-
-        后者能回答一个更独立的问题：BaM 读回的 prefix chunk 是否和 LMCache
-        自己会返回给 vLLM 的 chunk 语义一致。如果这里通过，说明问题更可能在
-        后续 paged KV 写入或 attention consume；如果这里失败，则说明 BaM
-        shadow/read/page decode 的源数据语义就已经和 LMCache 原路径分叉。
-
-        默认仍然保留轻量抽样，避免把普通 verify 路径拖得过重。当前如果需要
-        定位 request_2 乱码，可以打开：
-
-            VLLM_BAM_DIRECT_RETRIEVE_CROSS_SOURCE_FULL_COMPARE=1
-
-        这会对所有命中的 prefix chunk 做逐元素精确比较。该开关只用于诊断，
-        不进入正式性能口径。
-        """
-        if not _env_enabled("VLLM_BAM_WRITE_READ_VERIFY"):
-            return
-        if not _env_enabled("VLLM_BAM_WRITE_READ_VERIFY_SYNC_COMPARE"):
-            logger.warning(
-                "[LMCACHE_BAM_DIRECT_RETRIEVE_CROSS_SOURCE_SKIP] "
-                "reason=sync_compare_disabled")
-            return
-        if self._bam_store is None:
-            return
-
-        materialized_tensors = getattr(
-            in_flight_request, "materialized_prefix_chunk_tensors", None)
-        if materialized_tensors is None:
-            logger.warning(
-                "[LMCACHE_BAM_DIRECT_RETRIEVE_CROSS_SOURCE_SKIP] "
-                "reason=no_materialized_prefix_tensors")
-            return
-
-        prefix_hit_chunks = int(getattr(in_flight_request, "prefix_hit_chunks", 0))
-        keys = list(getattr(in_flight_request, "keys", []))
-        compare_count = min(prefix_hit_chunks, len(keys), len(materialized_tensors))
-        if compare_count <= 0:
-            logger.warning(
-                "[LMCACHE_BAM_DIRECT_RETRIEVE_CROSS_SOURCE_SKIP] "
-                "reason=no_prefix_chunks prefix_hit_chunks=%d keys=%d tensors=%d",
-                prefix_hit_chunks,
-                len(keys),
-                len(materialized_tensors),
-            )
-            return
-
-        verified = True
-        full_compare = _env_enabled(
-            "VLLM_BAM_DIRECT_RETRIEVE_CROSS_SOURCE_FULL_COMPARE")
-        logger.info(
-            "[LMCACHE_BAM_DIRECT_RETRIEVE_CROSS_SOURCE_BEGIN] chunks=%d "
-            "full_compare=%s",
-            compare_count,
-            str(bool(full_compare)).lower(),
-        )
-        for idx in range(compare_count):
-            key = keys[idx]
-            chunk_hash = _extract_chunk_hash(key)
-            bam_tensor = materialized_tensors[idx]
-            try:
-                original_memory_obj = self._storage_manager.get(key)
-                original_tensor = getattr(original_memory_obj, "tensor", None)
-                if original_tensor is None:
-                    logger.error(
-                        "[LMCACHE_BAM_DIRECT_RETRIEVE_CROSS_SOURCE_FAIL] "
-                        "chunk_hash=%s reason=original_missing",
-                        chunk_hash[:16],
-                    )
-                    verified = False
-                    continue
-
-                if tuple(original_tensor.shape) != tuple(bam_tensor.shape):
-                    logger.error(
-                        "[LMCACHE_BAM_DIRECT_RETRIEVE_CROSS_SOURCE_FAIL] "
-                        "chunk_hash=%s reason=shape_mismatch original=%s bam=%s",
-                        chunk_hash[:16],
-                        tuple(original_tensor.shape),
-                        tuple(bam_tensor.shape),
-                    )
-                    verified = False
-                    continue
-
-                if original_tensor.dtype != bam_tensor.dtype:
-                    logger.error(
-                        "[LMCACHE_BAM_DIRECT_RETRIEVE_CROSS_SOURCE_FAIL] "
-                        "chunk_hash=%s reason=dtype_mismatch original=%s bam=%s",
-                        chunk_hash[:16],
-                        original_tensor.dtype,
-                        bam_tensor.dtype,
-                    )
-                    verified = False
-                    continue
-
-                if full_compare:
-                    # 全量 compare 只在 correctness 排查时打开：
-                    #
-                    # - 原始 LMCache tensor 是“LMCache 原生 retrieve 会交给
-                    #   vLLM 的真实 chunk”；
-                    # - bam_tensor 是当前 BaM direct retrieve 从 live pages 解码
-                    #   出来的 dense chunk；
-                    # - 两者逐元素相等，才能说明 BaM shadow/read/page decode 这层
-                    #   与 LMCache 原生路径完全等价。
-                    #
-                    # 这里把两边都搬到 CPU 做比较，避免为了诊断再发额外 GPU
-                    # kernel，也避免和 persistent service 的设备侧工作交织。
-                    original_cpu = original_tensor.detach().to(
-                        device="cpu",
-                        copy=True,
-                    )
-                    bam_cpu = bam_tensor.detach().to(
-                        device="cpu",
-                        copy=True,
-                    )
-                    if torch.equal(original_cpu, bam_cpu):
-                        logger.info(
-                            "[LMCACHE_BAM_DIRECT_RETRIEVE_CROSS_SOURCE_FULL_OK] "
-                            "chunk_hash=%s shape=%s dtype=%s",
-                            chunk_hash[:16],
-                            tuple(bam_cpu.shape),
-                            bam_cpu.dtype,
-                        )
-                        continue
-
-                    diff = (bam_cpu.float() - original_cpu.float()).abs()
-                    mismatch_flat = torch.nonzero(
-                        bam_cpu != original_cpu, as_tuple=False)
-                    first = (mismatch_flat[0].tolist()
-                             if mismatch_flat.numel() > 0 else [])
-                    detail = ""
-                    if len(first) == 4:
-                        kv_i, layer_i, token_i, dim_i = [int(x) for x in first]
-                        detail = (
-                            f" kv={kv_i}"
-                            f" layer={layer_i}"
-                            f" token={token_i}"
-                            f" dim={dim_i}"
-                            f" original={original_cpu[kv_i, layer_i, token_i, dim_i].item()}"
-                            f" bam={bam_cpu[kv_i, layer_i, token_i, dim_i].item()}")
-                    logger.error(
-                        "[LMCACHE_BAM_DIRECT_RETRIEVE_CROSS_SOURCE_FULL_FAIL] "
-                        "chunk_hash=%s max_abs_diff=%s first_mismatch=%s%s",
-                        chunk_hash[:16],
-                        diff.max().item() if diff.numel() > 0 else "n/a",
-                        first,
-                        detail,
-                    )
-                    verified = False
-                    continue
-
-                # 复用 store 里的稳定采样坐标，覆盖开头、128-token page 边界
-                # 和 chunk 尾部。这里只抽样，不做整块 full compare，避免调试
-                # 逻辑把性能口径和主线行为搅在一起。
-                sample = self._bam_store._build_write_read_verify_sample(
-                    chunk_hash=chunk_hash,
-                    tensor=original_tensor,
-                )
-                layer_index_tensor = torch.tensor(
-                    sample.layer_indices,
-                    device=bam_tensor.device,
-                    dtype=torch.long,
-                )
-                token_index_tensor = torch.tensor(
-                    sample.token_indices,
-                    device=bam_tensor.device,
-                    dtype=torch.long,
-                )
-                dim_index_tensor = torch.tensor(
-                    sample.dim_indices,
-                    device=bam_tensor.device,
-                    dtype=torch.long,
-                )
-                actual = bam_tensor.index_select(
-                    1, layer_index_tensor).index_select(
-                        2, token_index_tensor).index_select(3, dim_index_tensor)
-                actual_cpu = actual.detach().cpu()
-                expected_cpu = sample.values
-                if torch.equal(actual_cpu, expected_cpu):
-                    logger.info(
-                        "[LMCACHE_BAM_DIRECT_RETRIEVE_CROSS_SOURCE_OK] "
-                        "chunk_hash=%s shape=%s layers=%s tokens=%s dims=%s",
-                        chunk_hash[:16],
-                        tuple(sample.shape),
-                        sample.layer_indices,
-                        sample.token_indices,
-                        sample.dim_indices,
-                    )
-                    continue
-
-                diff = (actual_cpu.float() - expected_cpu.float()).abs()
-                mismatch_flat = torch.nonzero(
-                    actual_cpu != expected_cpu, as_tuple=False)
-                first = (mismatch_flat[0].tolist()
-                         if mismatch_flat.numel() > 0 else [])
-                detail = ""
-                if len(first) == 4:
-                    kv_i, layer_i, token_i, dim_i = [int(x) for x in first]
-                    detail = (
-                        f" kv={kv_i}"
-                        f" layer={sample.layer_indices[layer_i]}"
-                        f" token={sample.token_indices[token_i]}"
-                        f" dim={sample.dim_indices[dim_i]}"
-                        f" original={expected_cpu[kv_i, layer_i, token_i, dim_i].item()}"
-                        f" bam={actual_cpu[kv_i, layer_i, token_i, dim_i].item()}")
-                logger.error(
-                    "[LMCACHE_BAM_DIRECT_RETRIEVE_CROSS_SOURCE_FAIL] "
-                    "chunk_hash=%s reason=value_mismatch max_abs_diff=%s "
-                    "first_mismatch=%s%s",
-                    chunk_hash[:16],
-                    diff.max().item() if diff.numel() > 0 else "n/a",
-                    first,
-                    detail,
-                )
-                verified = False
-            except Exception:
-                logger.exception(
-                    "[LMCACHE_BAM_DIRECT_RETRIEVE_CROSS_SOURCE_FAIL] "
-                    "chunk_hash=%s reason=exception",
-                    chunk_hash[:16],
-                )
-                verified = False
-
-        if verified:
-            logger.info(
-                "[LMCACHE_BAM_DIRECT_RETRIEVE_CROSS_SOURCE_OK] chunks=%d",
-                compare_count,
-            )
-        else:
-            logger.error(
-                "[LMCACHE_BAM_DIRECT_RETRIEVE_CROSS_SOURCE_FAIL] chunks=%d",
-                compare_count,
-            )
-
     def put(self, key: Any, memory_obj: Any) -> None:
         # 写路径顺序：
         #   1. 尝试初始化 BaM store
@@ -6452,9 +4111,6 @@ class LMCacheBaMStorageManager:
         if self._bam_store is None:
             return None
         ret_mask = self._bam_store.finalize_direct_placement_request(
-            in_flight_request=in_flight_request,
-        )
-        self._maybe_verify_direct_retrieve_against_original_storage(
             in_flight_request=in_flight_request,
         )
         return ret_mask

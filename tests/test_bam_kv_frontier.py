@@ -300,6 +300,7 @@ def test_gpu_worker_consume_skips_host_consume_when_service_already_consumed():
 
         def __init__(self):
             self.consume_calls = 0
+            self.cleanup_calls = 0
             self.poll_calls = 0
 
         def kv_worker_backend_name(self):
@@ -314,6 +315,10 @@ def test_gpu_worker_consume_skips_host_consume_when_service_already_consumed():
             del request, out_rows
             self.consume_calls += 1
             raise AssertionError("host consume should be skipped")
+
+        def kv_worker_cleanup(self, request):
+            assert request.request_id == 55
+            self.cleanup_calls += 1
 
     class _FakeRowCtxExecutor:
 
@@ -413,5 +418,7 @@ def test_gpu_worker_consume_skips_host_consume_when_service_already_consumed():
     assert int(result.results[0].descriptor.chunk_id) == 7
     assert row_store.poll_calls == 1
     assert row_store.consume_calls == 0
-    assert handle.get_ms == 0.0
+    assert row_store.cleanup_calls == 1
+    assert handle.get_ms is not None
+    assert handle.get_ms >= 0.0
     assert handle.consumed_snapshot is not None

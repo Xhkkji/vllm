@@ -27,7 +27,7 @@ class _FakeStats:
     poll_iters: int = 1
     get_ms: float = 0.33
     executor_name: str = "gpu_worker"
-    worker_backend: str = "kv_cq_service_v1"
+    worker_backend: str = "rowctx_compat_blocking"
 
 
 @dataclass(frozen=True)

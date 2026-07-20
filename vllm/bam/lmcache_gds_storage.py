@@ -38,7 +38,12 @@ class LMCacheGDSStorageManager:
         self._gds_store: Optional[LMCacheStyleGDSChunkStore] = None
         self._gds_init_attempted = False
         self._gds_init_failed = False
-        self._prefer_load_verify_budget = 2
+        # GDS prefer-load 的正确性对照会额外调用一次原生 LMCache get()。
+        # 这对排查很有用，但会把“SSD->GPU(GDS)”性能口径污染成
+        # “GDS 读 + 原生 SSD 读”。因此默认保留历史的前 2 个 chunk 校验，
+        # 性能脚本可以显式设为 0，只观察 GDS prefer-load 本身。
+        self._prefer_load_verify_budget = max(
+            int(os.getenv("VLLM_GDS_LMCACHE_VERIFY_BUDGET", "2")), 0)
 
     def _log_gds_runtime_context(self, tensor: torch.Tensor) -> None:
         logger.info(

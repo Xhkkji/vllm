@@ -207,6 +207,11 @@ shellcheck*/
 csrc/moe/marlin_moe_wna16/kernel_*
 
 # Evaluation generated binary payloads
+evaluation/logs/
+evaluation/lmcache_ssd_read_paths_baseline/logs/
+evaluation/lmcache_ssd_read_paths_baseline/logs_longbench_triviaqa/
+evaluation/lmcache_ssd_read_paths_baseline/**/lmcache_local_disk/
+evaluation/lmcache_ssd_read_paths_baseline/**/metrics.jsonl
 evaluation/logs/**/lmcache_gds/
 evaluation/logs/**/*.safetensors
 evaluation/logs/**/*.bin

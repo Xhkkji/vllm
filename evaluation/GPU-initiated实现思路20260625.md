@@ -3778,3 +3778,307 @@ gpu_worker_persistent_one_copy:
 2. 如果继续优化稳定性，应在 BaM 底层补 request/generation 级 CQ 匹配，
    而不是在 service loop 里用保留 CQ head 的方式猜测 completion 所属关系。
 ```
+
+---
+
+## 14. 相关 SSD/KVCache 工作的评测数据集与后续 baseline 选择
+
+这一节用于记录后续做 BaM one-copy / LMCache SSD / GDS / GPU-initiated
+对比时应该参考哪些公开 workload。这里不改变当前实现主线，只约束后续
+benchmark 不要只停留在单条固定 prompt。
+
+### 14.1 相关工作的 workload 口径
+
+当前能直接对应到 KV cache / SSD-backed KV cache 的工作，大致分成两类：
+
+```text
+1. 长上下文 QA / 摘要 / 多文档检索类数据集
+   目的：
+     拉长 prompt，制造大量可复用 prefix KV，
+     观察 SSD read、KV restore、prefix consume 对 TTFT 的影响。
+
+2. 多轮对话 / 请求 trace 类数据集
+   目的：
+     制造跨请求 prefix reuse、cache hit/miss、warmup/steady-state，
+     更接近 serving 系统里的真实缓存复用行为。
+```
+
+各工作的评测 workload 目前整理如下：
+
+| 工作 | 使用的数据集 / workload | 对我们的意义 |
+| --- | --- | --- |
+| SolidAttention | 性能侧使用 `WikiText-2` 构造不同长度 prompt；准确率侧使用 `OpenCompass`，包括 `Winogrande`、`ARC-Challenge`、`MMLU`、`GSM8K`、`LongBench`；长上下文任务里包含 `2WikiMQA`、`TriviaQA`、`HotpotQA`、`MultiFieldQA`、`MuSiQue`、`NarrativeQA`、`Qasper`、`GovReport` | 适合参考它的“合成长 prompt + LongBench 正确性”组合；但它更偏 sparse attention / 本地 SSD offload，不完全等价于我们的 BaM KV restore |
+| Tutti | `LEval`、`LooGLE` | 最贴近 SSD-backed KV cache 主线；适合用于长上下文、长 prefix 读回、GPU bubble 和 storage bandwidth 对比 |
+| TARDIS | 公开可访问材料里暂未稳定确认完整 dataset 列表 | 目前只把它作为 GPU-centric KV cache service 的系统设计参考，不把 dataset 作为确定依据写入实验计划 |
+| LMCache | 合成 multi-round QA、`LongBench` long-context QA、vLLM random benchmark；centralized storage server 实验里可重点看 `LongBench-TriviaQA` | 这是和我们当前 LMCache/BaM connector 最直接的 baseline 对照，应优先对齐它的 LongBench 与 random workload |
+| HCache | `ShareGPT4`、`L-Eval` | 适合补多轮对话与 long-context/RAG 两类复用场景 |
+| CachedAttention / AttentionStore | `ShareGPT` sessions | 适合评估多轮对话里的 prefix reuse、cache hit、warmup/steady-state |
+| KVPR | 主要使用 synthetic sequence settings，例如固定 batch size、prompt length、generation length | 更适合做机制拆解，不适合作为真实 SSD KV cache workload 主线 |
+
+### 14.2 当前项目建议采用的 benchmark 层次
+
+结合上面的工作，后续 benchmark 不建议一次性铺太大，而应分三层固定：
+
+```text
+第一层：固定 prompt 双请求样例
+  用途：
+    保持当前 one-copy / LMCache SSD / GDS 通路可快速回归。
+  当前已经使用：
+    request_1 写入或建立缓存；
+    request_2 命中共享 prefix 后读回 4 个 chunk。
+  主要指标：
+    request_2_elapsed_s
+    read_ms / poll_ms / get_ms
+    输出正确性
+
+第二层：LongBench / LEval / LooGLE 长上下文样例
+  用途：
+    对齐 SolidAttention、Tutti、LMCache 这类论文口径，
+    观察长 prefix 下 read bandwidth、placement、attention consume 的占比。
+  建议优先顺序：
+    LongBench-TriviaQA
+    LongBench-GovReport
+    LEval
+    LooGLE
+
+第三层：ShareGPT / ShareGPT4 多轮 trace
+  用途：
+    评估 serving 场景里的 cache reuse、warmup、steady-state、
+    多请求调度和未来 GPU follow-up submit。
+  主要指标：
+    TTFT
+    request throughput
+    cache hit rate
+    storage read bandwidth
+    GPU bubble / SM occupancy
+    p50 / p90 / p99 latency
+```
+
+这三层的关系是：
+
+```text
+固定 prompt 双请求：
+  验证链路是否正确，定位单次 read/placement 开销。
+
+LongBench / LEval / LooGLE：
+  验证长上下文下 KV restore 是否有扩展性。
+
+ShareGPT / ShareGPT4：
+  验证多请求、多轮、prefix reuse 场景下是否真的能服务化。
+```
+
+### 14.3 与当前 BaM one-copy / LMCache SSD baseline 的对应关系
+
+当前已经新增的 baseline 文件夹：
+
+```text
+evaluation/lmcache_ssd_read_paths_baseline/
+```
+
+这组 baseline 现在只覆盖第一层固定 prompt 双请求样例：
+
+```text
+ssd_cpu_gpu:
+  原生 LMCache V0 local_disk
+  数据路径：
+    SSD -> CPU MemoryObj -> multi_layer_kv_transfer -> vLLM paged KV cache
+
+gds_gpu:
+  LMCache-style GDS wrapper
+  数据路径：
+    SSD/cufile -> CUDA chunk tensor -> LMCache MemoryObj
+    -> multi_layer_kv_transfer -> vLLM paged KV cache
+
+bam one-copy:
+  当前 cta=4 稳定基线
+  数据路径：
+    BaM cache -> vLLM paged KV cache
+```
+
+截至 2026-07-19 的固定 prompt request 2 对比：
+
+```text
+原生 LMCache SSD:
+  request_2_elapsed_s=2.0372
+
+LMCache-style GDS:
+  request_2_elapsed_s=2.0507
+  4 个 chunk GDS read 合计约 39.97ms
+
+BaM one-copy cta=4:
+  request_2_elapsed_s=1.5252
+  read_ms=19.926
+  poll_iters=4
+```
+
+这个结果说明：
+
+```text
+1. 当前 BaM one-copy request 2 端到端约比两条 LMCache SSD 路径快 0.51s；
+2. GDS 纯 chunk read 与 BaM read/direct placement 的差距只有约 20ms；
+3. 因此端到端差距不只来自 SSD 读带宽，
+   还需要继续拆 LMCache retrieve、MemoryObj 包装、
+   multi_layer_kv_transfer 和 xformers prefix consume 的上层固定开销。
+```
+
+后续扩展 baseline 时，建议先保持这个目录结构：
+
+```text
+evaluation/lmcache_ssd_read_paths_baseline/
+  run_single_gpu_lmcache_ssd_read_paths_qwen25.sh
+  logs/
+    ssd_cpu_gpu/
+    gds_gpu/
+  RESULT_20260719.md
+```
+
+然后再新增子目录，而不是把长上下文、多轮 trace 和固定 prompt 混到一起：
+
+```text
+evaluation/lmcache_ssd_read_paths_baseline/
+  fixed_prompt/
+  long_context/
+  sharegpt_trace/
+```
+
+### 14.4 后续测试优先级
+
+短期优先做：
+
+```text
+1. 给原生 LMCache SSD 路径补 chunk 级 timing：
+   LocalDiskBackend.get_blocking()
+   MemoryObj 构造 / tensor 转换
+   multi_layer_kv_transfer(direction=false)
+
+2. 给 GDS wrapper 路径拆 timing：
+   cufile / POSIX read
+   CUDA chunk tensor populate
+   MemoryObj 包装
+   multi_layer_kv_transfer
+
+3. 固定 one-copy cta=4 作为 BaM 当前稳定基线，
+   暂时不要把 cta=2 这类已知会卡住的配置放进正式对比。
+```
+
+中期再做：
+
+```text
+1. 接 LongBench-TriviaQA / GovReport。
+2. 接 LEval / LooGLE。
+3. 接 ShareGPT / ShareGPT4 trace。
+```
+
+如果当前只选一个数据集来同时覆盖 SSD-backend 性能和后续类似 SolidAttention 的预取机制，
+优先级应定为：
+
+```text
+LongBench-TriviaQA  >  LongBench-GovReport  >  WikiText-2 sliced prompt
+```
+
+原因是：
+
+```text
+1. TriviaQA 属于长上下文 QA，输入足够长，输出通常较短，
+   适合先看 SSD read / KV restore / prefix consume 的纯性能。
+
+2. GovReport 更偏长文档摘要，适合在 TriviaQA 之后拉长 prefix，
+   观察 read bandwidth 和 consume 开销的扩展性。
+
+3. WikiText-2 sliced prompt 更适合专门验证 SolidAttention 式预取，
+   但不适合作为第一条 SSD-backend baseline。
+```
+
+这些 workload 的使用目标不是替代当前固定 prompt 样例，而是补齐论文对齐：
+
+```text
+固定 prompt:
+  工程回归。
+
+LongBench / LEval / LooGLE:
+  长上下文论文口径。
+
+ShareGPT / ShareGPT4:
+  多轮 serving 口径。
+```
+
+### 14.5 参考链接
+
+```text
+SolidAttention FAST'26:
+  https://www.usenix.org/system/files/fast26-zheng.pdf
+
+Tutti:
+  https://arxiv.org/abs/2605.03375
+
+TARDIS:
+  https://dl.acm.org/doi/10.1145/3725783.3764393
+
+LMCache:
+  https://arxiv.org/abs/2410.05004
+
+CachedAttention:
+  https://prongs1996.github.io/assets/pdf/CachedAttention.pdf
+
+KVPR:
+  https://arxiv.org/abs/2411.17089
+```
+
+### 14.6 LongBench-TriviaQA 的收集与处理建议
+
+如果当前目标是先测 SSD-backend 链路，再为后续 SolidAttention 式预取做铺垫，
+LongBench-TriviaQA 建议按下面方式落地：
+
+```text
+1. 数据源选择
+   优先使用 LongBench 的 TriviaQA 任务。
+   原始 LongBench 的官方说明里，TriviaQA 是按阅读理解式长文档问答构造的，
+   数据格式已经标准化为 input / context / answers / length / dataset / language / _id。
+
+2. 下载方式
+   直接通过 Hugging Face datasets 加载任务切片。
+   当前可见的公开镜像包括 LongBench 的 HF 数据集卡，
+   官方仓库 README 也给出了 load_dataset('THUDM/LongBench', 'triviaqa', split='test')
+   这样的用法。
+   如果环境里镜像名不同，优先以当前 HF dataset card 为准。
+
+3. 预处理目标
+   把每条样本整理成我们自己的 benchmark manifest，
+   至少保留：
+     _id
+     dataset
+     length
+     prompt_text
+     answers
+     context_len / prompt_len
+     prefix_hash
+
+4. prompt 组织
+   使用 LongBench 原始 task template，
+   将 context 和 input 拼成最终 prompt，
+   不要在这个阶段额外做会改变 token 边界的二次改写。
+   后面如果要测 prefetch，最好在 tokenization 之后再做 block 化，
+   这样更容易和 SSD / KV cache 的 page 边界对齐。
+
+5. 样本切分
+   先固定一个小而稳定的子集做系统回归，
+   再按 length 分桶扩展。
+   建议顺序：
+     - 先跑 50~100 条固定样本
+     - 再按 0-4k / 4k-8k / 8k+ 分桶
+     - 最后再扩大到全量 test split
+
+6. 评测方式
+   如果测性能：
+     重点看 request_2_elapsed_s、read_ms、poll_ms、get_ms、TTFT。
+   如果测正确性：
+     对 answers 做归一化 EM / token overlap。
+   如果测预取：
+     额外记录每个样本的 token 长度、chunk 数、是否能复用前缀。
+
+7. 和 SolidAttention 预取的衔接
+   LongBench-TriviaQA 适合先验证“长上下文 KV restore 是否正确且稳定”。
+   如果要进一步验证 block predictor / prefetch 策略，
+   后面再补 WikiText-2 sliced prompt 更合适，
+   因为它更容易人为控制长度和 block 命中模式。
+```

@@ -51,6 +51,18 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    """解析局部布尔开关。
+
+    这里用于 BaM cache 统计这类观察能力。它不应该进入热路径的状态机判断，
+    因此保持为本文件内的轻量 helper，而不是扩散到通用 envs 配置里。
+    """
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
 # 固定使用 128KB 物理页。
 # 在当前 Qwen2.5-7B、fp16、hidden_dim=512 的场景下：
 # - 每 token 向量大小 = 512 * 2B = 1024B
@@ -482,6 +494,12 @@ class LMCacheBaMStore:
 
         self._chunk_slots: "OrderedDict[str, int]" = OrderedDict()
         self._chunk_metadata: Dict[str, BaMChunkMetadata] = {}
+        # Python 侧 chunk slot LRU 的累计替换次数。
+        #
+        # 注意它不是底层 BaM page-cache 的 page eviction 计数；它只回答：
+        # “LMCache chunk -> BaM row 区间”这张映射表是否已经因为容量不足开始复用
+        # 旧 slot。底层 page cache 的 access/hit/miss 仍以 `print_stats()` 为准。
+        self._chunk_slot_evictions = 0
         self._slot_lock = threading.Lock()
         self._prefetch_pipeline: Optional[LMCacheBaMPagePipeline] = None
         # Direct placement 的 placer 需要跨请求复用，才能真正保留：
@@ -530,6 +548,72 @@ class LMCacheBaMStore:
         except Exception:
             logger.exception(
                 "[LMCACHE_BAM_RUNTIME_IDLE_STOP] failed during store.close")
+
+    def _maybe_print_cache_stats_after_iter(
+        self,
+        *,
+        pipeline_name: str,
+        request_chunks: int,
+        request_tokens: int,
+    ) -> None:
+        """按 request/iteration 输出 BaM cache 命中率。
+
+        底层 BaM 的 `print_stats()` 口径是“打印当前累计计数并清零”，所以这里
+        只在一次 direct placement finalize 完成后调用一次。这样每条日志对应
+        当前这轮 request 的 BaM cache access/hit/miss，不会把多个请求混在同一个
+        统计窗口里。
+
+        注意：这个函数只读并清零统计计数，不参与 request frontier、slot release、
+        KV scatter 或 ret_mask 生成，因此不会改变当前 one-copy 正确性。
+        """
+        if not _env_flag("VLLM_BAM_CACHE_STATS_EVERY_ITER", False):
+            return
+        if not hasattr(self.row_store, "print_stats"):
+            logger.warning(
+                "[LMCACHE_BAM_CACHE_STATS_ITER] row_store has no print_stats; "
+                "pipeline=%s chunks=%d tokens=%d",
+                pipeline_name,
+                int(request_chunks),
+                int(request_tokens),
+            )
+            return
+        with self._slot_lock:
+            active_chunk_slots = len(self._chunk_slots)
+            metadata_entries = len(self._chunk_metadata)
+            chunk_slot_evictions = int(self._chunk_slot_evictions)
+        # 固定格式的 Python 侧摘要，便于 grep/脚本解析。紧随其后的 native
+        # `print_stats()` 会输出本统计窗口的 #Accesses/#Misses/#Hits/Hit Rate。
+        logger.info(
+            "[LMCACHE_BAM_CACHE_STATS_ITER_SUMMARY] pipeline=%s "
+            "request_chunks=%d request_tokens=%d cache_size_mb=%d "
+            "active_chunk_slots=%d chunk_capacity=%d metadata_entries=%d "
+            "chunk_slot_evictions=%d native_fields=%s",
+            pipeline_name,
+            int(request_chunks),
+            int(request_tokens),
+            int(envs.VLLM_BAM_CACHE_SIZE_MB),
+            active_chunk_slots,
+            int(self.chunk_capacity),
+            metadata_entries,
+            chunk_slot_evictions,
+            "#READ_IOs,#Accesses,#Misses,Miss_Rate,#Hits,Hit_Rate",
+        )
+        try:
+            printed = bool(self.row_store.print_stats())
+        except Exception:
+            logger.exception(
+                "[LMCACHE_BAM_CACHE_STATS_ITER] print_stats failed "
+                "pipeline=%s chunks=%d tokens=%d",
+                pipeline_name,
+                int(request_chunks),
+                int(request_tokens),
+            )
+            return
+        logger.info(
+            "[LMCACHE_BAM_CACHE_STATS_ITER_DONE] pipeline=%s printed=%s",
+            pipeline_name,
+            str(printed).lower(),
+        )
 
     def _stop_kv_runtime_service_if_idle(
         self,
@@ -666,10 +750,13 @@ class LMCacheBaMStore:
                 evicted_chunk_hash, evicted_slot_id = self._chunk_slots.popitem(
                     last=False)
                 self._chunk_metadata.pop(evicted_chunk_hash, None)
+                self._chunk_slot_evictions += 1
                 logger.info(
-                    "[LMCACHE_BAM] evict oldest chunk slot chunk_hash=%s slot=%d",
+                    "[LMCACHE_BAM] evict oldest chunk slot chunk_hash=%s "
+                    "slot=%d chunk_slot_evictions=%d",
                     evicted_chunk_hash[:16],
                     evicted_slot_id,
+                    int(self._chunk_slot_evictions),
                 )
                 slot_id = evicted_slot_id
             else:
@@ -2148,7 +2235,7 @@ class LMCacheBaMStore:
         try:
             kv_read_handle = self.submit_chunk_pages_kv_fast_path_batch_request(
                 keys)
-        except Exception:
+        except Exception as exc:
             # runtime / persistent 主线不允许在 request 内部偷偷回退成 blocking
             # read。否则同一次 direct placement request 会同时混入：
             #
@@ -2159,10 +2246,16 @@ class LMCacheBaMStore:
             #
             # 只有在显式 legacy 路径里，才允许继续用 blocking read 兜底。
             if self._persistent_runtime_mainline_enabled():
+                logger.exception(
+                    "[LMCACHE_BAM_DIRECT_PLACEMENT_READ_SUBMIT_FAILED] "
+                    "batch_size=%d chunks=%s",
+                    len(keys),
+                    chunk_hashes,
+                )
                 raise RuntimeError(
                     "runtime direct placement requires native batch submit; "
                     "blocking fallback is disabled in persistent mode"
-                ) from None
+                ) from exc
             logger.exception(
                 "[LMCACHE_BAM_DIRECT_PLACEMENT_READ_SUBMIT] "
                 "async submit failed; fall back to blocking batch read")
@@ -3032,6 +3125,11 @@ class LMCacheBaMStore:
             ret_mask_ms,
             final_log_ms,
             direct_total_ms,
+        )
+        self._maybe_print_cache_stats_after_iter(
+            pipeline_name=pipeline_name,
+            request_chunks=in_flight_request.prefix_hit_chunks,
+            request_tokens=total_tokens,
         )
         return ret_mask
 

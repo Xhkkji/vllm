@@ -11,9 +11,10 @@ TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 #   request_1: 写入/建立 LMCache SSD 数据
 #   request_2: 复用同一 prompt，触发 SSD/GDS 读回
 #
-# 默认 manifest 选择 full/lt4k 小桶，原因是当前 Qwen2.5-7B 单卡 baseline
-# 默认 MAX_MODEL_LEN=4096。需要测更长 bucket 时，外部显式传 MANIFEST_PATH
-# 和 MAX_MODEL_LEN，避免脚本静默改变显存压力。
+# 默认 manifest 选择 qwen25/full/lt4k 小桶。这个小桶按 Qwen2.5 tokenizer
+# 的真实 prompt token 数分桶，并为 MAX_TOKENS=32 预留输出空间，所以能直接
+# 搭配默认 MAX_MODEL_LEN=4096。需要测更长 bucket 时，外部显式传
+# MANIFEST_PATH 和 MAX_MODEL_LEN，避免脚本静默改变显存压力。
 
 MODE="${1:-${LMCACHE_SSD_READ_PATH:-ssd_cpu_gpu}}"
 case "${MODE}" in
@@ -34,7 +35,7 @@ case "${MODE}" in
     ;;
 esac
 
-MANIFEST_PATH_VALUE="${MANIFEST_PATH:-/home/xhk/llm-inference/datasets/longbench/organized/triviaqa/full/buckets/lt4k.jsonl}"
+MANIFEST_PATH_VALUE="${MANIFEST_PATH:-/home/xhk/llm-inference/datasets/longbench/organized/triviaqa/qwen25/full/buckets/lt4k.jsonl}"
 MODEL_PATH_VALUE="${MODEL_PATH:-/home/xhk/llm-inference/models/Qwen2.5-7B-Instruct}"
 PYTHON_BIN_VALUE="${PYTHON_BIN:-/home/xhk/miniconda3/envs/pytorch-vllm/bin/python}"
 LMCACHE_REPO_PATH_VALUE="${LMCACHE_REPO_PATH:-/home/xhk/llm-inference/LMCache-v0-torch26}"
@@ -51,11 +52,12 @@ VLLM_GDS_LMCACHE_PATH_VALUE="${VLLM_GDS_LMCACHE_PATH:-${TEST_ROOT_VALUE}/lmcache
 MAX_MODEL_LEN_VALUE="${MAX_MODEL_LEN:-4096}"
 GPU_MEMORY_UTILIZATION_VALUE="${GPU_MEMORY_UTILIZATION:-0.60}"
 MAX_TOKENS_VALUE="${MAX_TOKENS:-32}"
-NUM_SAMPLES_VALUE="${NUM_SAMPLES:-4}"
+NUM_SAMPLES_VALUE="${NUM_SAMPLES:-25}"
 REPEAT_READ_VALUE="${REPEAT_READ:-1}"
 DTYPE_VALUE="${DTYPE:-half}"
 ENFORCE_EAGER_VALUE="${ENFORCE_EAGER:-true}"
 ENABLE_CHUNKED_PREFILL_VALUE="${ENABLE_CHUNKED_PREFILL:-false}"
+LONGBENCH_DEBUG_LOG_VALUE="${LONGBENCH_DEBUG_LOG:-0}"
 
 mkdir -p "${RUN_DIR_VALUE}"
 mkdir -p "${LMCACHE_LOCAL_DISK_VALUE}"
@@ -69,6 +71,7 @@ echo "[longbench-triviaqa-ssd] run_dir=${RUN_DIR_VALUE}"
 echo "[longbench-triviaqa-ssd] log_file=${LOG_FILE_VALUE}"
 echo "[longbench-triviaqa-ssd] metrics_jsonl=${METRICS_JSONL_VALUE}"
 echo "[longbench-triviaqa-ssd] lmcache_local_disk=${LMCACHE_LOCAL_DISK_VALUE}"
+echo "[longbench-triviaqa-ssd] debug_log=${LONGBENCH_DEBUG_LOG_VALUE}"
 if [[ "${MODE}" == "gds_gpu" ]]; then
   echo "[longbench-triviaqa-ssd] gds_path=${VLLM_GDS_LMCACHE_PATH_VALUE}"
 fi
@@ -82,6 +85,7 @@ export LMCACHE_LOCAL_CPU="${LMCACHE_LOCAL_CPU:-False}"
 export LMCACHE_MAX_LOCAL_CPU_SIZE="${LMCACHE_MAX_LOCAL_CPU_SIZE:-5.0}"
 export LMCACHE_LOCAL_DISK="${LMCACHE_LOCAL_DISK_VALUE}"
 export LMCACHE_MAX_LOCAL_DISK_SIZE="${LMCACHE_MAX_LOCAL_DISK_SIZE:-20}"
+export LONGBENCH_DEBUG_LOG="${LONGBENCH_DEBUG_LOG_VALUE}"
 
 # 关闭 BaM KV 路径，确保这里测的是 LMCache SSD/GDS baseline，不是 BaM one-copy。
 export VLLM_BAM_LMCACHE_SHADOW_ENABLE=0

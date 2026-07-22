@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import logging
 import os
 import time
 from pathlib import Path
@@ -38,8 +39,58 @@ except ImportError:  # pragma: no cover - 兼容不同 LMCache 版本
 DEFAULT_MODEL = "/home/xhk/llm-inference/models/Qwen2.5-7B-Instruct"
 DEFAULT_MANIFEST = (
     "/home/xhk/llm-inference/datasets/longbench/organized/triviaqa/"
-    "full/buckets/lt4k.jsonl"
+    "qwen25/full/buckets/lt4k.jsonl"
 )
+
+_LOGGER_HANDLE_PATCHED = False
+
+
+def env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def install_benchmark_log_filter(debug_log: bool) -> None:
+    """默认压掉底层调试 INFO，只保留性能/告警/错误相关日志。
+
+    这里故意放在 benchmark runner 层做过滤，而不是改 BaM/vLLM 的核心逻辑：
+    - 不影响实际调用链路和数据搬运正确性；
+    - 需要排错时设置 `LONGBENCH_DEBUG_LOG=1` 即可恢复完整日志；
+    - 默认保留每个请求的耗时、BaM cache 命中统计和 direct placement 汇总。
+    """
+    global _LOGGER_HANDLE_PATCHED
+    if debug_log or _LOGGER_HANDLE_PATCHED:
+        return
+
+    original_handle = logging.Logger.handle
+    perf_markers = (
+        "throughput",
+        "elapsed",
+        "tokens/s",
+        "[LMCACHE_BAM_CACHE_STATS_ITER_SUMMARY]",
+        "[LMCACHE_BAM_KV_REF_DEBUG_STATS]",
+        "[LMCACHE_BAM_CACHE_LIFECYCLE_STATS]",
+        "[LMCACHE_BAM_DIRECT_PLACEMENT]",
+        "[LMCACHE_BAM_DIRECT_PLACEMENT_READ]",
+        "[LMCACHE_BAM_KV_FAST_PATH_BATCH_READ]",
+    )
+
+    def filtered_handle(self: logging.Logger, record: logging.LogRecord) -> None:
+        if record.levelno >= logging.WARNING:
+            original_handle(self, record)
+            return
+        try:
+            message = record.getMessage()
+        except Exception:
+            message = str(record.msg)
+        lower_message = message.lower()
+        if any(marker.lower() in lower_message for marker in perf_markers):
+            original_handle(self, record)
+
+    logging.Logger.handle = filtered_handle
+    _LOGGER_HANDLE_PATCHED = True
 
 
 def load_manifest(path: Path, limit: int) -> list[dict]:
@@ -101,7 +152,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.60)
     parser.add_argument("--dtype", default="half")
     parser.add_argument("--max-tokens", type=int, default=32)
-    parser.add_argument("--num-samples", type=int, default=4)
+    # 默认跑完整 Qwen-tokenized lt4k bucket；传 0 表示不截断。
+    parser.add_argument("--num-samples", type=int, default=25)
     parser.add_argument("--repeat-read", type=int, default=1)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
@@ -111,11 +163,19 @@ def build_parser() -> argparse.ArgumentParser:
                         action=argparse.BooleanOptionalAction,
                         default=False)
     parser.add_argument("--print-output", action="store_true")
+    parser.add_argument(
+        "--debug-log",
+        action=argparse.BooleanOptionalAction,
+        default=env_flag("LONGBENCH_DEBUG_LOG", False),
+        help="print full backend debug logs instead of performance-only logs",
+    )
     return parser
 
 
 def main() -> None:
     args = build_parser().parse_args()
+    install_benchmark_log_filter(debug_log=args.debug_log)
+
     rows = load_manifest(args.manifest, limit=args.num_samples)
     if not rows:
         raise RuntimeError(f"empty manifest: {args.manifest}")
@@ -133,19 +193,29 @@ def main() -> None:
     print("[longbench-triviaqa] repeat_read=", args.repeat_read)
     print("[longbench-triviaqa] max_model_len=", args.max_model_len)
     print("[longbench-triviaqa] max_tokens=", args.max_tokens)
+    print("[longbench-triviaqa] debug_log=", args.debug_log)
     print("[longbench-triviaqa] lmcache_local_disk=", os.environ.get("LMCACHE_LOCAL_DISK"))
     print("[longbench-triviaqa] gds_path=", os.environ.get("VLLM_GDS_LMCACHE_PATH"))
 
     with args.metrics_jsonl.open("w", encoding="utf-8") as metrics_f:
         with build_llm(args) as llm:
             request_idx = 0
+            total_elapsed_s = 0.0
+            phase_elapsed_s: dict[str, float] = {"write": 0.0, "read": 0.0}
+            phase_counts: dict[str, int] = {"write": 0, "read": 0}
             for row, phase in iter_request_plan(rows, repeat_read=args.repeat_read):
                 request_idx += 1
                 sample_id = row["_id"]
                 prompt = row["prompt"]
                 start = time.perf_counter()
-                outputs = llm.generate([prompt], sampling_params=sampling_params)
+                # 使用 runner 自己的逐请求指标作为统一性能输出，避免 vLLM 每次
+                # generate 的 tqdm/progress bar 淹没底层 cache 统计。
+                outputs = llm.generate([prompt], sampling_params=sampling_params,
+                                       use_tqdm=False)
                 elapsed_s = time.perf_counter() - start
+                total_elapsed_s += elapsed_s
+                phase_elapsed_s[phase] = phase_elapsed_s.get(phase, 0.0) + elapsed_s
+                phase_counts[phase] = phase_counts.get(phase, 0) + 1
                 generated = outputs[0].outputs[0].text
                 output_tokens = len(outputs[0].outputs[0].token_ids)
                 record = {
@@ -174,6 +244,15 @@ def main() -> None:
                 )
                 if args.print_output:
                     print("[longbench-triviaqa-output]", generated)
+
+            print(
+                "[longbench-triviaqa-summary] "
+                f"requests={request_idx} samples={len(rows)} "
+                f"repeat_read={args.repeat_read} total_elapsed_s={total_elapsed_s:.4f} "
+                f"avg_request_s={total_elapsed_s / max(request_idx, 1):.4f} "
+                f"write_avg_s={phase_elapsed_s.get('write', 0.0) / max(phase_counts.get('write', 0), 1):.4f} "
+                f"read_avg_s={phase_elapsed_s.get('read', 0.0) / max(phase_counts.get('read', 0), 1):.4f}"
+            )
 
 
 if __name__ == "__main__":

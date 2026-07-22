@@ -598,6 +598,32 @@ class LMCacheBaMStore:
             chunk_slot_evictions,
             "#READ_IOs,#Accesses,#Misses,Miss_Rate,#Hits,Hit_Rate",
         )
+        debug_lifecycle = _env_flag(
+            "VLLM_BAM_DEBUG_STOP_SERVICE_FOR_LIFECYCLE_STATS", False)
+        if debug_lifecycle:
+            self._maybe_log_cache_lifecycle_stats(
+                source="iter",
+                pipeline_name=pipeline_name,
+                request_chunks=request_chunks,
+                request_tokens=request_tokens,
+            )
+            logger.info(
+                "[LMCACHE_BAM_CACHE_STATS_ITER_DONE] pipeline=%s "
+                "printed=false reason=debug_lifecycle_skip_native_print_stats",
+                pipeline_name,
+            )
+            return
+        service_running = bool(
+            hasattr(self.row_store, "kv_worker_runtime_service_running")
+            and self.row_store.kv_worker_runtime_service_running()
+        )
+        if service_running:
+            logger.info(
+                "[LMCACHE_BAM_CACHE_STATS_ITER_DONE] pipeline=%s printed=false "
+                "reason=persistent_service_running",
+                pipeline_name,
+            )
+            return
         try:
             printed = bool(self.row_store.print_stats())
         except Exception:
@@ -613,6 +639,160 @@ class LMCacheBaMStore:
             "[LMCACHE_BAM_CACHE_STATS_ITER_DONE] pipeline=%s printed=%s",
             pipeline_name,
             str(printed).lower(),
+        )
+
+    def _maybe_log_cache_lifecycle_stats(
+        self,
+        *,
+        source: str,
+        pipeline_name: str,
+        request_chunks: int,
+        request_tokens: int,
+    ) -> None:
+        """输出 BaM cache 生命周期 debug 信息。
+
+        debug 模式下只读 native host-side KV ref counter，不 launch CUDA
+        stats kernel，也不停止 persistent service。这样可以观察 one-copy
+        request 借用 page 是否被 cleanup 对称释放，同时避免观测路径卡住主线。
+        """
+        debug_lifecycle = _env_flag(
+            "VLLM_BAM_DEBUG_STOP_SERVICE_FOR_LIFECYCLE_STATS", False)
+        if debug_lifecycle:
+            stats_fn = getattr(self.row_store, "kv_worker_ref_debug_stats",
+                               None)
+            if stats_fn is None:
+                logger.warning(
+                    "[LMCACHE_BAM_KV_REF_DEBUG_STATS] skipped source=%s "
+                    "pipeline=%s reason=missing_kv_worker_ref_debug_stats",
+                    source,
+                    pipeline_name,
+                )
+                return
+            try:
+                stats = stats_fn()
+            except Exception:
+                logger.exception(
+                    "[LMCACHE_BAM_KV_REF_DEBUG_STATS] failed source=%s "
+                    "pipeline=%s chunks=%d tokens=%d",
+                    source,
+                    pipeline_name,
+                    int(request_chunks),
+                    int(request_tokens),
+                )
+                return
+            if not stats:
+                logger.warning(
+                    "[LMCACHE_BAM_KV_REF_DEBUG_STATS] skipped source=%s "
+                    "pipeline=%s reason=empty_stats",
+                    source,
+                    pipeline_name,
+                )
+                return
+            logger.info(
+                "[LMCACHE_BAM_KV_REF_DEBUG_STATS] source=%s pipeline=%s "
+                "request_chunks=%d request_tokens=%d total_cache_pages=%d "
+                "borrowed_pages_submitted=%d borrowed_pages_released=%d "
+                "borrowed_pages_outstanding=%d borrowed_pages_underflow=%d "
+                "submit_requests=%d release_requests=%d "
+                "active_runtime_slots=%d runtime_slot_capacity=%d "
+                "device_release_calls=%d device_release_already_done=%d "
+                "device_release_missing_ctx=%d device_release_ctx_seen=%d "
+                "device_release_ctx_zero_ref=%d device_release_ctx_bad_range=%d "
+                "device_release_ctx_bad_page=%d "
+                "device_release_ctx_releasable=%d device_release_ref_subs=%d",
+                source,
+                pipeline_name,
+                int(request_chunks),
+                int(request_tokens),
+                int(stats.get("total_cache_pages", 0)),
+                int(stats.get("borrowed_pages_submitted", 0)),
+                int(stats.get("borrowed_pages_released", 0)),
+                int(stats.get("borrowed_pages_outstanding", 0)),
+                int(stats.get("borrowed_pages_underflow", 0)),
+                int(stats.get("submit_requests", 0)),
+                int(stats.get("release_requests", 0)),
+                int(stats.get("active_runtime_slots", 0)),
+                int(stats.get("runtime_slot_capacity", 0)),
+                int(stats.get("device_release_calls", 0)),
+                int(stats.get("device_release_already_done", 0)),
+                int(stats.get("device_release_missing_ctx", 0)),
+                int(stats.get("device_release_ctx_seen", 0)),
+                int(stats.get("device_release_ctx_zero_ref", 0)),
+                int(stats.get("device_release_ctx_bad_range", 0)),
+                int(stats.get("device_release_ctx_bad_page", 0)),
+                int(stats.get("device_release_ctx_releasable", 0)),
+                int(stats.get("device_release_ref_subs", 0)),
+            )
+            return
+        has_service_running = hasattr(self.row_store,
+                                      "kv_worker_runtime_service_running")
+        has_lifecycle_stats = hasattr(self.row_store,
+                                      "get_page_cache_lifecycle_stats")
+        service_running = bool(
+            has_service_running
+            and self.row_store.kv_worker_runtime_service_running()
+        )
+        if service_running:
+            # lifecycle stats 需要 launch 额外 CUDA kernel；persistent service
+            # 常驻时这个统计 kernel 可能排不上或等待 resident kernel，不能让
+            # 观测路径卡住主线。
+            logger.info(
+                "[LMCACHE_BAM_CACHE_LIFECYCLE_STATS] skipped source=%s "
+                "pipeline=%s reason=persistent_service_running",
+                source,
+                pipeline_name,
+            )
+            return
+        if not has_lifecycle_stats:
+            return
+        try:
+            stats = self.row_store.get_page_cache_lifecycle_stats()
+        except Exception:
+            logger.exception(
+                "[LMCACHE_BAM_CACHE_LIFECYCLE_STATS] failed source=%s "
+                "pipeline=%s chunks=%d tokens=%d",
+                source,
+                pipeline_name,
+                int(request_chunks),
+                int(request_tokens),
+            )
+            return
+        if not stats:
+            if debug_lifecycle:
+                logger.warning(
+                    "[LMCACHE_BAM_CACHE_LIFECYCLE_STATS] skipped source=%s "
+                    "pipeline=%s reason=empty_stats",
+                    source,
+                    pipeline_name,
+                )
+            return
+        logger.info(
+            "[LMCACHE_BAM_CACHE_LIFECYCLE_STATS] source=%s pipeline=%s "
+            "request_chunks=%d request_tokens=%d total_cache_pages=%d "
+            "free_slots=%d assigned_slots=%d unlocked_slots=%d "
+            "locked_slots=%d other_lock_slots=%d valid_pages=%d "
+            "busy_pages=%d dirty_pages=%d ref_nonzero_pages=%d "
+            "state_count_nonzero_pages=%d evictable_pages=%d "
+            "invalid_translation_slots=%d ref_count_sum=%d ref_count_max=%d",
+            source,
+            pipeline_name,
+            int(request_chunks),
+            int(request_tokens),
+            int(stats.get("total_cache_pages", 0)),
+            int(stats.get("free_slots", 0)),
+            int(stats.get("assigned_slots", 0)),
+            int(stats.get("unlocked_slots", 0)),
+            int(stats.get("locked_slots", 0)),
+            int(stats.get("other_lock_slots", 0)),
+            int(stats.get("valid_pages", 0)),
+            int(stats.get("busy_pages", 0)),
+            int(stats.get("dirty_pages", 0)),
+            int(stats.get("ref_nonzero_pages", 0)),
+            int(stats.get("state_count_nonzero_pages", 0)),
+            int(stats.get("evictable_pages", 0)),
+            int(stats.get("invalid_translation_slots", 0)),
+            int(stats.get("ref_count_sum", 0)),
+            int(stats.get("ref_count_max", 0)),
         )
 
     def _stop_kv_runtime_service_if_idle(

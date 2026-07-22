@@ -55,11 +55,42 @@ LongBench-TriviaQA 用于把固定 prompt baseline 扩展到真实长上下文 Q
 默认使用：
 
 ```text
-/home/xhk/llm-inference/datasets/longbench/organized/triviaqa/full/buckets/lt4k.jsonl
+/home/xhk/llm-inference/datasets/longbench/organized/triviaqa/qwen25/full/buckets/lt4k.jsonl
 ```
 
-原因是当前 Qwen2.5-7B 单卡 baseline 默认 `MAX_MODEL_LEN=4096`。如果要测更长
-bucket，需要显式提高 `MAX_MODEL_LEN`，不要让脚本自动改变显存压力。
+这个 manifest 已经按 Qwen2.5 tokenizer 的真实 token 数重新分桶，并默认为
+`MAX_TOKENS=32` 预留输出空间。旧的 raw-length `full/` 和 `input/` manifest
+已经弃用并删除，避免后续误用 LongBench 原始 `length` 字段导致运行中超过
+`MAX_MODEL_LEN`。
+
+当前默认样本量是 `NUM_SAMPLES=25`，也就是完整跑 Qwen-tokenized `lt4k`
+bucket。这个 bucket 是当前默认配置下最稳的规模，适合先看通路性能和释放
+行为。
+
+如果要跑全量 LongBench-TriviaQA 200 条：
+
+```bash
+MANIFEST_PATH=/home/xhk/llm-inference/datasets/longbench/organized/triviaqa/qwen25/full/all.jsonl \
+NUM_SAMPLES=0 \
+MAX_MODEL_LEN=24576 \
+bash evaluation/lmcache_ssd_read_paths_baseline/run_longbench_triviaqa_bam_one_copy_qwen25.sh
+```
+
+这里 `NUM_SAMPLES=0` 表示不截断 manifest，直接按全量跑。
+
+默认日志模式只保留性能相关输出：
+
+- runner 配置和逐请求 `elapsed_s`；
+- 末尾 `longbench-triviaqa-summary` 汇总；
+- BaM cache 命中统计；
+- direct placement / read 的性能摘要；
+- warning 和 error。
+
+如果需要恢复底层完整调试日志：
+
+```bash
+LONGBENCH_DEBUG_LOG=1 bash evaluation/lmcache_ssd_read_paths_baseline/run_longbench_triviaqa_bam_one_copy_qwen25.sh
+```
 
 运行原生 LMCache SSD：
 
@@ -86,7 +117,7 @@ bash evaluation/lmcache_ssd_read_paths_baseline/run_longbench_triviaqa_bam_one_c
 
 ```bash
 cd /home/xhk/llm-inference/vllm-bam
-MANIFEST_PATH=/home/xhk/llm-inference/datasets/longbench/organized/triviaqa/full/buckets/4k_8k.jsonl \
+MANIFEST_PATH=/home/xhk/llm-inference/datasets/longbench/organized/triviaqa/qwen25/full/buckets/4k_8k.jsonl \
 MAX_MODEL_LEN=8192 \
 NUM_SAMPLES=4 \
 bash evaluation/lmcache_ssd_read_paths_baseline/run_longbench_triviaqa_ssd_read_paths_qwen25.sh ssd_cpu_gpu

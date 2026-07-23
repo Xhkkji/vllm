@@ -1,7 +1,7 @@
 # GPU-initiated BaM 实现思路
 
 日期：2026-06-25
-最近整理：2026-07-19
+最近整理：2026-07-23
 
 本文只保留当前 `vllm-bam` 中与 LMCache / vLLM KVCache 主线直接相关、并且仍有工程价值的实现思路。
 目标不是记录所有历史尝试，而是回答下面四个问题：
@@ -19,44 +19,65 @@
 1. 先看“1. 当前主线结论”
 2. 再看“3. 当前真实数据通路”
 3. 再看“4. 当前异步/轮询逻辑到底是什么”
-4. 最后看“8. 下一步主线”
+4. 再看“14. 相关 SSD/KVCache 工作的评测数据集与后续 baseline 选择”
+5. 最后看“15. 2026-07-23 当前收束结论与后续创新点”
 ```
 
 ---
 
 ## 1. 当前主线结论
 
-截至 2026-07-19，当前主线可以概括成一句话：
+截至 2026-07-23，当前主线可以概括成一句话：
 
 ```text
 BaM 读回、direct placement 和现有 attention 消费链路已经基本打通；
-当前 one-copy 已经恢复到可正确跑通的 cta=4 性能基线；
-下一步不应再堆临时 repair / rescue 分支，
-而应在保持三条 KV 链路解耦的前提下，
-继续把 control service 和 data mover worker 的职责拆清楚。
+当前 cta=4 one-copy 已经固定为可正确跑通的稳定基线；
+request-scoped ref_count release 已经验证正常；
+512MB BaM cache 压力下，正常后台常驻模式可以稳定跑完；
+下一步策略应收敛在 vLLM / LMCache 上层，
+存储后端只作为 LMCache I/O 数据面和可选预取缓存区；
+不应继续堆临时 rescue / fallback 分支。
 ```
 
-当前最新可跑通的一次稳定 one-copy 日志：
+当前最新可跑通的 LongBench-TriviaQA one-copy 日志：
 
 ```text
-evaluation/logs/single_gpu_lmcache_no_prefix_reuse_qwen25/20260719_023812/run.log
+evaluation/lmcache_ssd_read_paths_baseline/logs_longbench_triviaqa/bam_one_copy/20260722_231109/run.log
 
-request_2_elapsed_s=1.5297
 pipeline=gpu_worker_persistent_one_copy
 worker_backend=kv_persistent_service_v0
 finalize_mode=runtime_direct
-read_ms=22.154
-poll_iters=4
-runtime_row=(1, 4, 3, 2, ...)
+cache_size_mb=512
+chunk_capacity=64
+chunk_slot_evictions=169
+requests=24
+samples=12
+read_avg_s=0.9472
 ```
 
 这次结果说明：
 
 ```text
 1. 当前不是路径回退；
-2. request_2 已经从 SUBMITTED 正常推进到 CONSUMED；
+2. normal persistent service 模式下没有打开 ref debug / stop-service 路径；
 3. BaM cache page -> vLLM paged KV cache 的 one-copy scatter 正确性已经恢复；
-4. 性能回到之前约 1.55s/request 的口径。
+4. 512MB BaM cache 压力下没有 submit failure / runtime hang；
+5. LongBench-TriviaQA 4k_8k bucket 的 read 平均约 0.95s/request。
+```
+
+ref_count 生命周期已经通过 debug 路径单独验证：
+
+```text
+evaluation/lmcache_ssd_read_paths_baseline/logs_longbench_triviaqa/bam_one_copy/20260722_225047/run.log
+
+total_cache_pages=4096
+borrowed_pages_submitted=23408
+borrowed_pages_released=23408
+borrowed_pages_outstanding=0
+borrowed_pages_underflow=0
+submit_requests=12
+release_requests=12
+active_runtime_slots=0
 ```
 
 当前已经明确跑通的真实链路：
@@ -3875,7 +3896,8 @@ ShareGPT / ShareGPT4：
 evaluation/lmcache_ssd_read_paths_baseline/
 ```
 
-这组 baseline 现在只覆盖第一层固定 prompt 双请求样例：
+这组 baseline 最初用于第一层固定 prompt 双请求样例，现在已经扩展到
+LongBench-TriviaQA bucket 化 manifest：
 
 ```text
 ssd_cpu_gpu:
@@ -3893,6 +3915,26 @@ bam one-copy:
   当前 cta=4 稳定基线
   数据路径：
     BaM cache -> vLLM paged KV cache
+```
+
+当前 LongBench 侧已经新增并使用的主要脚本：
+
+```text
+evaluation/lmcache_ssd_read_paths_baseline/
+  run_longbench_triviaqa_ssd_read_paths_qwen25.sh
+    测原生 LMCache local_disk / GDS wrapper 路径
+
+  run_longbench_triviaqa_bam_one_copy_qwen25.sh
+    测 BaM one-copy 主路径
+
+  run_longbench_triviaqa_bam_one_copy_eviction_qwen25.sh
+    normal persistent service + 512MB BaM cache 压力测试
+
+  run_longbench_triviaqa_bam_one_copy_refcount_debug_qwen25.sh
+    ref_count debug 专用，允许 stop service / 打 debug stats
+
+  run_longbench_triviaqa_bam_one_copy_refcount_eviction_debug_qwen25.sh
+    压 cache + ref_count debug 专用，不作为正式性能口径
 ```
 
 截至 2026-07-19 的固定 prompt request 2 对比：
@@ -3925,10 +3967,10 @@ BaM one-copy cta=4:
 
 ```text
 evaluation/lmcache_ssd_read_paths_baseline/
-  run_single_gpu_lmcache_ssd_read_paths_qwen25.sh
-  logs/
+  logs_longbench_triviaqa/
     ssd_cpu_gpu/
     gds_gpu/
+    bam_one_copy/
   RESULT_20260719.md
 ```
 
@@ -4081,4 +4123,373 @@ LongBench-TriviaQA 建议按下面方式落地：
    如果要进一步验证 block predictor / prefetch 策略，
    后面再补 WikiText-2 sliced prompt 更合适，
    因为它更容易人为控制长度和 block 命中模式。
+```
+
+---
+
+## 15. 2026-07-23 当前收束结论与后续创新点
+
+这一节只记录当前已经完成并应固定下来的事实，以及下一阶段围绕
+GPU-initiated / SSD-backed KV cache prefetch 的判断。它不覆盖前面历史排查，
+也不要求立即改代码。
+
+### 15.1 当前已经完成的工程状态
+
+当前已经可以固定下来的部分：
+
+```text
+1. cta=4 one-copy 作为稳定基线
+   链路：
+     LMCache prefer-load
+       -> BaM KV fast path
+       -> GPU persistent service
+       -> mover CTA one-copy scatter
+       -> vLLM paged KV cache
+
+2. request-scoped ref_count release
+   submit 阶段借用 BaM page；
+   GPU service 在 one-copy scatter 完成后 release；
+   host cleanup 只负责 runtime slot / ctx buffer 生命周期。
+
+3. LongBench-TriviaQA baseline
+   数据集已经按 Qwen2.5 tokenizer token 数组织成 bucket manifest；
+   当前主测 bucket 是 4k_8k；
+   固定 prompt baseline 和 LongBench baseline 不再混在同一个目录层次里。
+
+4. 正常后台常驻 eviction pressure 测试
+   使用 512MB BaM cache、64 shadow chunks、12 samples；
+   不打开 ref debug / stop-service；
+   能稳定跑完 24 requests。
+```
+
+关键日志口径：
+
+```text
+ref_count debug:
+  logs_longbench_triviaqa/bam_one_copy/20260722_225047/run.log
+  borrowed_pages_submitted=23408
+  borrowed_pages_released=23408
+  borrowed_pages_outstanding=0
+
+normal persistent eviction pressure:
+  logs_longbench_triviaqa/bam_one_copy/20260722_231109/run.log
+  cache_size_mb=512
+  chunk_capacity=64
+  chunk_slot_evictions=169
+  requests=24
+  samples=12
+  read_avg_s=0.9472
+```
+
+因此当前不应再引入：
+
+```text
+1. one-copy 正常路径里的 fallback ref decrement；
+2. submit failure 后的 host 兜底 release；
+3. 正常性能脚本里的 stop-service lifecycle stats；
+4. 为观察 ref_count 而长期保留的同步 debug kernel。
+```
+
+### 15.2 LMCache 淘汰与 BaM 淘汰是否对齐
+
+当前两层淘汰机制是正确性兼容，但不是同一个策略状态机。
+
+```text
+LMCache 层：
+  管逻辑 KV chunk。
+  维护 chunk_hash -> page_offset / metadata。
+  VLLM_BAM_LMCACHE_SHADOW_CHUNKS=64 时会触发 chunk slot eviction。
+  日志里的 chunk_slot_evictions 属于这一层。
+
+BaM 层：
+  管 SSD page -> GPU page cache 的物理缓存。
+  victim 条件是：
+    UNLOCKED && ref_count == 0 && !BUSY
+  BaM 不理解 LMCache chunk / prompt / request 语义。
+```
+
+因此：
+
+```text
+LMCache chunk 被淘汰：
+  不代表 BaM page 立即失效；
+  只代表逻辑 metadata 不再命中。
+
+BaM page 被替换：
+  不代表 LMCache chunk metadata 失效；
+  数据仍然在 SSD / BaM store 中，后续 miss 后可以重新读取。
+```
+
+当前合理定位是：
+
+```text
+LMCache:
+  逻辑 KV cache 控制面
+  prefix / chunk / request reuse / metadata eviction
+
+BaM:
+  SSD-backed 数据面
+  GPU page cache / I/O / one-copy scatter / ref_count lifecycle
+```
+
+后续如果要做策略对齐，不建议把两层 cache 合并，而应补 hint 接口：
+
+```text
+LMCache evict chunk metadata
+  -> BaM mark_cold(page_offset, page_count)
+
+LMCache predict future chunk
+  -> BaM prefetch_pages(page_offset, page_count, priority, deadline)
+
+BaM victim selection
+  -> 在 ref_count==0 && !BUSY 的候选里优先替换 cold page
+```
+
+### 15.3 BaM 直接接 vLLM 还是接 LMCache
+
+如果只做 vLLM swap / block-level paging，BaM 直接接 vLLM 更短：
+
+```text
+vLLM scheduler / block manager
+  -> BaM SSD backend
+  -> vLLM paged KV cache
+```
+
+适合：
+
+```text
+1. vLLM 内部 swap out / swap in；
+2. preemption block restore；
+3. 单 engine 内部 block 生命周期；
+4. 极限性能数据面优化。
+```
+
+但当前项目目标更接近 SSD-backed KV cache reuse 和后续 prefetch 策略，
+因此继续接在 LMCache 上更合理：
+
+```text
+vLLM
+  -> LMCache connector / token database / chunk metadata
+  -> BaM backend
+  -> SSD / GPU page cache
+```
+
+原因：
+
+```text
+1. LMCache 已经有 chunk_hash / prefix reuse / store-retrieve 语义；
+2. 预取策略需要知道未来 request / token range / chunk；
+3. 多级流水线更像 LMCache 的控制面职责；
+4. BaM 不应理解 prompt / request / prefix 语义。
+```
+
+当前建议：
+
+```text
+短期主线：
+  vLLM -> LMCache -> BaM
+  用于 SSD-backed KV reuse、LongBench baseline、prefetch 策略实验。
+
+长期性能线：
+  vLLM block manager -> BaM
+  用于 vLLM swap / preemption / block-level SSD paging。
+```
+
+### 15.4 SolidAttention 式预取是否是常规方向
+
+结论：
+
+```text
+SSD-backed KV cache 上做流水线预取是常规且必要的方向；
+创新点不在“有没有 prefetch”，而在：
+  预测什么；
+  以什么粒度预取；
+  如何和 attention / layer compute overlap；
+  如何减少 CPU 在细粒度 I/O submit/poll 上的参与。
+```
+
+SolidAttention 的可借鉴点：
+
+```text
+1. KV Consolidator
+   把小粒度 KV entry 合并，增大 SSD transfer unit。
+
+2. Speculative Prefetcher
+   利用相邻 iteration 的重要 KV 选择局部性提前预取。
+
+3. SSD-aware Scheduler
+   把 computation / I/O 组织成能 overlap 的细粒度任务。
+```
+
+但对当前 LMCache-backed SSD KV 主线来说，不能只照搬 sparse-attention 语义。
+更合适的落点是：
+
+```text
+vLLM:
+  负责 request 调度、attention 执行语义、layer / token frontier。
+
+LMCache:
+  负责 chunk/block 生命周期、命中判断、淘汰策略、预取计划。
+
+存储后端:
+  按 LMCache 请求执行 page/chunk I/O；
+  后端 cache 可以作为预取缓存区；
+  不决定哪些 KV 应该被预取、淘汰或参与 attention。
+
+接口之间：
+  只传 compact prefetch plan / priority / deadline / hint；
+  不共享完整 cache 状态机；
+  不把上层策略下沉到 I/O 后端。
+```
+
+### 15.5 其他相关最新成果的定位
+
+当前应这样理解几类工作：
+
+```text
+Tutti:
+  方向最接近 GPU-initiated SSD-backed KV cache。
+  核心是 GPU-native object store、GPU I/O control path、
+  slack-aware I/O scheduling。
+  公开 vLLM main 中能看到 multi-tier KV offload / objectstore tier PR，
+  但当前没有明确找到 Tutti 本体的 GPU-initiated SSD data path 实现。
+
+TARDIS:
+  更偏 GPU-centric KV cache service。
+  可以作为“GPU service 管理 KV cache / I/O”的系统设计参考，
+  不把它的 dataset 口径作为当前实验主依据。
+
+LMCache:
+  适合做语义控制层。
+  当前 BaM 接在 LMCache 上，是为了复用 chunk metadata、
+  prefix reuse、backend abstraction 和后续 prefetch policy。
+
+DualPath:
+  更偏分布式 / 多轮 agentic workload 的 KV loading。
+  对后续跨节点或 decode-side bandwidth 复用有参考价值，
+  但不是当前单机 BaM page-cache 主线。
+
+Asynchronous KV Cache Prefetching:
+  目标层级是 GPU 内部 L2 / cache hierarchy。
+  它说明 KV prefetch 是跨层通用优化，但和 SSD-backed page prefetch
+  是不同层级的问题。
+```
+
+### 15.6 值得尝试的 GPU-initiated 小创新点
+
+当前不要追求“整个推理过程完全 GPU-only”。vLLM scheduler 仍然更适合在 CPU
+侧做全局 request admission、continuous batching、block allocation 和 prefix
+lookup。更合理的目标是：
+
+```text
+CPU off critical path for KV restore / prefetch.
+```
+
+优先级建议：
+
+```text
+1. GPU-initiated layer-wise KV prefetch
+   CPU/LMCache 生成 coarse plan；
+   后端执行层按 layer frontier 预取后续 layer / chunk pages；
+   目标是把 SSD I/O 藏进 attention compute slack。
+
+2. GPU-side request expansion
+   CPU 只写 compact descriptor：
+     chunk_id, page_offset, page_count, layer range, priority
+   后端执行层展开成 per-page / per-layer I/O requests。
+
+3. GPU-side I/O coalescing
+   后端执行层对多个 chunk/page request 按 LBA 或 page_offset 合并；
+   减少 tiny random I/O 和 CPU submit 开销。
+
+4. LMCache -> storage backend cache hint
+   LMCache 负责 hot/cold/prefetch-candidate 语义；
+   后端只把 hint 用到 victim selection / prefetch priority。
+
+5. Frontier-driven partial readiness
+   后端执行层持续更新 chunk/layer readiness；
+   上层只消费已经 ready 的 frontier，
+   后续再考虑和 attention pipeline 做更细粒度 overlap。
+```
+
+推荐下一阶段主线：
+
+```text
+先不动 vLLM scheduler 主体；
+先在 LMCache 与存储后端之间增加 prefetch plan 和 page hint；
+先让后端执行层承担更多细粒度 I/O 控制；
+再评估是否需要把 layer-wise readiness 暴露给 attention consume。
+```
+
+### 15.7 类 SolidAttention 预取机制的落地边界
+
+这里的预取机制应先按“透明优化”理解，而不是一开始就改变模型
+attention 语义。
+
+当前 dense attention 语义：
+
+```text
+每个 decode token 会 attend 到它可见范围内的完整历史 KV；
+LMCache / 存储后端只改变 KV 如何提前读回，
+不改变 attention kernel 会消费哪些 KV。
+```
+
+对应实现边界：
+
+```text
+vLLM:
+  提供 request / layer / token frontier；
+  保持原有 dense attention 正确性；
+  必要时暴露 query、block table、layer id 作为预测输入。
+
+LMCache:
+  生成 chunk/block 级 prefetch plan；
+  管理 prefetch 命中、失效、淘汰和正式 retrieve 兜底；
+  统计 prefetch hit、late prefetch、wasted prefetch、retrieve wait time。
+
+存储后端:
+  执行预取读写；
+  提供缓存区；
+  返回 readiness / stats；
+  不负责策略判断。
+```
+
+是否需要修改推理模型，取决于目标：
+
+```text
+1. 只做访问预测和预取
+   不需要修改模型。
+   Qwen2.5 可以继续作为主测模型；
+   attention 仍然按 dense 语义计算完整可见 KV。
+
+2. 用 query / attention score 辅助预测
+   通常也不需要修改模型结构。
+   需要改的是 vLLM 执行链路：
+     在 attention 或 model runner 附近拿到 query / layer id / block table；
+     把预测结果传给 LMCache prefetch planner。
+
+3. 真正启用 sparse attention
+   这会改变计算语义。
+   需要适配 attention metadata、selected block table、kernel、mask、
+   prefix cache 和正确性评测；
+   对普通 dense 模型可能带来准确率下降，
+   必要时才考虑蒸馏、微调或使用原生支持 sparse pattern 的模型。
+```
+
+因此推荐阶段划分：
+
+```text
+第一阶段：
+  dense attention 不变；
+  只做 LMCache 层 prefetch plan 和正式 retrieve 兜底；
+  目标是证明 SSD wait time / TTFT / TPOT 有收益。
+
+第二阶段：
+  引入 query-aware 或 layer-aware predictor；
+  predictor 只作为 prefetch hint；
+  错误预测不影响输出正确性。
+
+第三阶段：
+  如果透明预取收益不足，
+  再评估是否改 vLLM attention backend 做真正 sparse attention。
 ```

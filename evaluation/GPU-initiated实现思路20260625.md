@@ -1,7 +1,7 @@
 # GPU-initiated BaM 实现思路
 
 日期：2026-06-25
-最近整理：2026-07-23
+最近整理：2026-07-26
 
 本文只保留当前 `vllm-bam` 中与 LMCache / vLLM KVCache 主线直接相关、并且仍有工程价值的实现思路。
 目标不是记录所有历史尝试，而是回答下面四个问题：
@@ -4127,7 +4127,7 @@ LongBench-TriviaQA 建议按下面方式落地：
 
 ---
 
-## 15. 2026-07-23 当前收束结论与后续创新点
+## 15. 2026-07-26 当前收束结论与后续创新点
 
 这一节只记录当前已经完成并应固定下来的事实，以及下一阶段围绕
 GPU-initiated / SSD-backed KV cache prefetch 的判断。它不覆盖前面历史排查，
@@ -4160,6 +4160,18 @@ GPU-initiated / SSD-backed KV cache prefetch 的判断。它不覆盖前面历�
    使用 512MB BaM cache、64 shadow chunks、12 samples；
    不打开 ref debug / stop-service；
    能稳定跑完 24 requests。
+
+5. GPU-initiated descriptor prefetch 主线
+   CPU early-submit 原型已经收束掉：
+     不再在 connector/storage 预取阶段调用 BaM native submit；
+     不再保存 `_kv_batch_submitted_requests` 这种已提交 handle 表；
+     connector 只提前生成 retrieve plan；
+     BaM store 只把 plan 准备成 compact KV descriptor；
+     direct placement start 在统一 read 边界消费 descriptor，再 submit/poll/finalize。
+   这保留了“上层提前规划，下层 request 生命周期接管”的接口，
+   但避免把 CPU early-submit 误称为 GPU-initiated。
+   后续真正 GPU-initiated 化时，应把这份 descriptor 写入 GPU-side ring，
+   由 GPU persistent service 消费 descriptor 并发起 SSD read。
 ```
 
 关键日志口径：
@@ -4188,6 +4200,9 @@ normal persistent eviction pressure:
 2. submit failure 后的 host 兜底 release；
 3. 正常性能脚本里的 stop-service lifecycle stats；
 4. 为观察 ref_count 而长期保留的同步 debug kernel。
+5. connector-level `engine.prefetch()` 作为 one-copy GPU-initiated 主线；
+   它不能覆盖当前 deferred one-copy read 主线，且容易在 write / miss 阶段
+   生成不可消费的 prefetch 日志。
 ```
 
 ### 15.2 LMCache 淘汰与 BaM 淘汰是否对齐
@@ -4492,4 +4507,241 @@ LMCache:
 第三阶段：
   如果透明预取收益不足，
   再评估是否改 vLLM attention backend 做真正 sparse attention。
+```
+
+### 15.8 已收束：从 CPU early-submit 到 descriptor-plan
+
+上一版最小原型不是最终 GPU-initiated submit，而是 CPU early-submit +
+direct placement handle reuse：
+
+```text
+connector receive 入口:
+  1. 根据 model_input / retrieve_status 构造 retrieve tokens/mask；
+  2. 通过 storage_manager.submit_bam_gpu_initiated_prefetch_plan()
+     把本轮可能 retrieve 的 prefix chunks 提前规划出来；
+  3. BaM store 复用 direct placement 同源 key 规则收集 entries；
+  4. CPU 调 submit_chunk_pages_batch_request()；
+  5. 把已经提交的 native handle 存入 `_kv_batch_submitted_requests`。
+
+direct placement start:
+  1. 再次按正式 direct placement 语义收集同一批 keys；
+  2. submit_chunk_pages_kv_fast_path_batch_request(keys)
+     先查 `_kv_batch_submitted_requests`；
+  3. batch_key 匹配时 pop 出已提交 handle；
+  4. 后续 attach / poll / cleanup 继续走 one-copy 主线。
+```
+
+代码落点：
+
+```text
+vllm/distributed/kv_transfer/kv_connector/lmcache_connector.py
+  _maybe_submit_lmcache_bam_gpu_initiated_prefetch_plan()
+  LMCacheConnector.recv_kv_caches_and_hidden_states()
+  LMCacheConnector._maybe_submit_gpu_initiated_prefetch_plan()
+
+vllm/bam/lmcache_bam_storage.py
+  LMCacheBaMStore.submit_kv_fast_path_prefetch_plan()
+  LMCacheBaMStore.submit_kv_fast_path_prefetch_keys()
+  LMCacheBaMStore.submit_chunk_pages_kv_fast_path_batch_request()
+  LMCacheBaMStorageManager.submit_bam_gpu_initiated_prefetch_plan()
+```
+
+这个原型的意义：
+
+```text
+1. 证明 direct placement 不必现场 submit；
+2. 证明上层提前准备的 handle 可以被下层 request 生命周期接管；
+3. 给后续“CPU 写 descriptor，GPU service 发起 read”留下接口替换点。
+```
+
+这个原型的边界：
+
+```text
+1. submit 仍然由 CPU 发起；
+2. `_kv_batch_submitted_requests` 存的是已提交 native handle，
+   不是 GPU 待消费 descriptor；
+3. connector 和 direct placement 仍会各做一次 key / entries 收集；
+4. 当前单请求串行 LongBench 测试里，可重叠窗口较小，
+   很难产生明显性能收益。
+```
+
+因此它应作为生命周期原型保留，但不应被包装成最终创新点。
+后续论文/实验叙事应明确写成：
+
+```text
+CPU early-submit prototype:
+  validates cross-layer request-handle ownership.
+
+GPU-initiated async prefetch target:
+  moves fine-grained submit / poll / readiness update to GPU resident service.
+```
+
+当前代码已经把这条原型收束为 descriptor-plan 主线：
+
+```text
+connector receive 入口:
+  1. 根据 model_input / retrieve_status 构造 retrieve tokens/mask；
+  2. 调 storage_manager.stage_bam_gpu_initiated_prefetch_plan()；
+  3. BaM store 复用 direct placement 同源 key 规则收集 prefix hit entries；
+  4. 只调用 prepare_chunk_pages_batch_request() 生成 KV descriptor；
+  5. 把 descriptor plan 存入 `_kv_batch_prefetch_plans`。
+
+direct placement start:
+  1. 按正式 direct placement 语义收集同一批 keys；
+  2. 用 batch_key 取走 `_kv_batch_prefetch_plans` 中的 prepared descriptor；
+  3. 当前兼容执行层在统一 read-submit 边界调用
+     submit_prepared_chunk_pages_batch_request()；
+  4. 后续 attach / poll / cleanup 继续走 one-copy 主线。
+```
+
+代码落点更新：
+
+```text
+vllm/distributed/kv_transfer/kv_connector/lmcache_connector.py
+  _maybe_stage_lmcache_bam_gpu_initiated_prefetch_plan()
+  LMCacheConnector.recv_kv_caches_and_hidden_states()
+  LMCacheConnector._maybe_stage_gpu_initiated_prefetch_plan()
+
+vllm/bam/lmcache_bam_kv_fast_path.py
+  LMCacheBaMKVPreparedBatchRead
+  LMCacheBaMKVFastPath.prepare_chunk_pages_batch_request()
+  LMCacheBaMKVFastPath.submit_prepared_chunk_pages_batch_request()
+
+vllm/bam/lmcache_bam_storage.py
+  LMCacheBaMStore.stage_kv_fast_path_prefetch_plan()
+  LMCacheBaMStore.stage_kv_fast_path_prefetch_keys()
+  LMCacheBaMStore._take_prepared_kv_prefetch_plan()
+  LMCacheBaMStorageManager.stage_bam_gpu_initiated_prefetch_plan()
+```
+
+当前边界：
+
+```text
+1. connector/storage 阶段不再 CPU submit；
+2. prepared descriptor 仍由 CPU/Python 构造；
+3. 当前底层 Python native API 尚未暴露 GPU-side descriptor ring，
+   所以正式 submit 仍发生在 direct placement start 的兼容执行点；
+4. 这一步主要是清理语义和接口，为下一步 GPU persistent service 消费
+   descriptor 后发起 SSD read 铺路，不应期待单独产生明显性能收益。
+```
+
+### 15.9 下一步：异步 demand-load / GPU-side descriptor 主线
+
+下一步真正要做的是把当前“已提交 handle 表”升级成
+“GPU-visible descriptor / readiness 表”。目标链路不是：
+
+```text
+CPU submit native read
+  -> 保存 handle
+  -> direct placement 复用 handle
+```
+
+而是：
+
+```text
+CPU / LMCache:
+  生成 coarse prefetch plan；
+  写入 GPU-visible descriptor ring；
+  不再 per request 调 native submit。
+
+GPU persistent service:
+  从 descriptor ring 取任务；
+  查 BaM cache / page metadata；
+  miss 时发起 SSD read；
+  完成后把 KV 写入 HBM / vLLM paged KV cache；
+  更新 readiness / frontier table。
+
+vLLM / LMCache consume:
+  查询 ready frontier；
+  ready 则直接走 direct placement / attention；
+  not ready 则 defer / poll / 正式 retrieve 兜底。
+```
+
+这条链路对应用户层直觉：
+
+```text
+Attention / pre-attention planner 需要 block
+  -> 查 resident / readiness table
+  -> hit:
+       直接消费 HBM / vLLM paged KV cache 中的 block
+  -> miss:
+       写入 async load descriptor
+       GPU service 发起 SSD read
+       KV block 进入 HBM / paged KV cache
+       更新 ready frontier
+  -> 后续 attention 消费 ready block
+```
+
+dense attention 下需要注意：
+
+```text
+1. 不能因为 block miss 就跳过该 block；
+2. miss block 必须 ready 后才能执行完整 dense attention；
+3. 因此第一版应把 readiness gate 放在 attention 前，
+   不建议直接改 flash-attn kernel 做同步 SSD wait；
+4. 后续若引入 sparse/block attention，才适合让 attention 只消费 selected blocks。
+```
+
+建议新增或收束的代码组织：
+
+```text
+vllm/bam/lmcache_bam_prefetch.py
+  新增：
+    BaMPrefetchPlan
+    BaMPrefetchDescriptor
+    BaMPrefetchState
+    BaMPrefetchStats
+  职责：
+    把 chunk-level plan 翻译成 page-level descriptor；
+    记录 prefetch hit / late / wasted / wait time；
+    不做策略判断，不直接理解 prompt 语义。
+
+vllm/bam/lmcache_bam_storage.py
+  保持总入口和状态 owner：
+    接收 connector / LMCache 的 plan；
+    维护 chunk metadata / resident state；
+    管理 async prefetch request 与 direct placement request 的绑定；
+    发布 request frontier。
+
+vllm/bam/lmcache_bam_kv_fast_path.py
+  新增异步执行接口：
+    enqueue_prefetch_descriptors()
+    poll_prefetch_request()
+    attach_prefetch_to_direct_placement()
+    cancel_or_release_prefetch()
+
+native BaM runtime / persistent service
+  新增：
+    GPU-visible descriptor ring
+    resident / readiness table
+    GPU-side descriptor consumer
+    completion / frontier update path
+
+vllm/vllm_flash_attn/flash_attn_interface.py
+  第一阶段不改；
+  attention 仍假设 block_table 指向 ready 的 paged KV cache。
+```
+
+阶段划分：
+
+```text
+第一阶段：
+  dense attention 不变；
+  CPU 写 descriptor ring；
+  GPU persistent service 消费 descriptor 并发起 read；
+  direct placement / retrieve 通过 ready frontier 兜底。
+
+第二阶段：
+  layer-wise prefetch；
+  Layer i compute 时，GPU service 预取 Layer i+1 / 后续 chunk pages；
+  目标是把 SSD wait 藏进 attention / MLP compute slack。
+
+第三阶段：
+  query-aware / block-aware predictor；
+  predictor 只作为 prefetch hint；
+  错误预测不影响 dense attention 正确性。
+
+第四阶段：
+  如果透明预取收益不足，再评估 sparse/block attention；
+  这时才考虑修改 attention backend / selected block table / mask 语义。
 ```

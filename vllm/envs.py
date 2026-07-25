@@ -52,6 +52,7 @@ if TYPE_CHECKING:
     VLLM_BAM_LMCACHE_READ_MODE: str = "sync"
     VLLM_BAM_LMCACHE_BASE_ROW_OFFSET: int = 0
     VLLM_BAM_KV_FAST_PATH: bool = False
+    VLLM_BAM_GPU_INITIATED_PREFETCH: bool = False
     VLLM_BAM_DIRECT_PLACEMENT: bool = False
     VLLM_BAM_DIRECT_PLACEMENT_IMPL: str = "lmcache"
     VLLM_BAM_DIRECT_PLACEMENT_RUNTIME_ONE_COPY: bool = False
@@ -450,6 +451,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 第一阶段内部仍复用 BaM rowctx，但接口已经从通用 feature path 中拆出。
     "VLLM_BAM_KV_FAST_PATH":
     lambda: bool(int(os.getenv("VLLM_BAM_KV_FAST_PATH", "0"))),
+
+    # 是否启用最轻量 GPU-initiated descriptor prefetch 分支。
+    #
+    # 默认关闭，避免改变已经验证稳定的 one-copy 主线。
+    # 打开后，LMCache connector 会在 retrieve 前按同一套 LMCache token/mask
+    # 规则推导本轮连续 prefix hit chunks，并把它们准备成 compact KV descriptor：
+    #
+    #   connector/scheduler plan
+    #     -> storage_manager.stage_bam_gpu_initiated_prefetch_plan()
+    #     -> prepare KV descriptor only
+    #     -> direct placement start 消费 descriptor，并进入统一 submit/poll/finalize
+    #
+    # 注意：当前 Python/native 入口尚未提供 GPU-side descriptor ring，所以这里
+    # 不提前 CPU submit；这样能避免把旧的 CPU early-submit 误称为真正
+    # GPU-initiated，同时为后续 GPU 消费 descriptor 后发起 SSD read 留出干净
+    # 接口。
+    "VLLM_BAM_GPU_INITIATED_PREFETCH":
+    lambda: bool(int(os.getenv("VLLM_BAM_GPU_INITIATED_PREFETCH", "0"))),
 
     # 是否启用 Direct Placement v0。
     # 开启后 LMCache retrieve 会优先尝试：

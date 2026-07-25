@@ -58,7 +58,7 @@ def install_benchmark_log_filter(debug_log: bool) -> None:
     这里故意放在 benchmark runner 层做过滤，而不是改 BaM/vLLM 的核心逻辑：
     - 不影响实际调用链路和数据搬运正确性；
     - 需要排错时设置 `LONGBENCH_DEBUG_LOG=1` 即可恢复完整日志；
-    - 默认保留每个请求的耗时、BaM cache 命中统计和 direct placement 汇总。
+    - 默认只保留每个 request/iter 的端到端耗时，以及 BaM 侧单行性能摘要。
     """
     global _LOGGER_HANDLE_PATCHED
     if debug_log or _LOGGER_HANDLE_PATCHED:
@@ -66,15 +66,15 @@ def install_benchmark_log_filter(debug_log: bool) -> None:
 
     original_handle = logging.Logger.handle
     perf_markers = (
-        "throughput",
-        "elapsed",
-        "tokens/s",
-        "[LMCACHE_BAM_CACHE_STATS_ITER_SUMMARY]",
+        # BaM/vLLM 侧每个 retrieve iter 的单行性能摘要。
+        "[LMCACHE_BAM_ITER_PERF]",
+        # GPU-initiated 分支的关键事件必须默认可见，否则无法判断新逻辑是否命中。
+        "GPU_INITIATED_PREFETCH",
+        "[LMCACHE_BAM_KV_FAST_PATH_PREFETCH_ENQUEUE]",
+        "[LMCACHE_BAM_EARLY_PREFETCH]",
+        # ref/lifecycle 只有在对应 debug 开关打开时才会产生，这里允许透出。
         "[LMCACHE_BAM_KV_REF_DEBUG_STATS]",
         "[LMCACHE_BAM_CACHE_LIFECYCLE_STATS]",
-        "[LMCACHE_BAM_DIRECT_PLACEMENT]",
-        "[LMCACHE_BAM_DIRECT_PLACEMENT_READ]",
-        "[LMCACHE_BAM_KV_FAST_PATH_BATCH_READ]",
     )
 
     def filtered_handle(self: logging.Logger, record: logging.LogRecord) -> None:
@@ -216,6 +216,15 @@ def main() -> None:
                 total_elapsed_s += elapsed_s
                 phase_elapsed_s[phase] = phase_elapsed_s.get(phase, 0.0) + elapsed_s
                 phase_counts[phase] = phase_counts.get(phase, 0) + 1
+                total_avg_s = total_elapsed_s / max(request_idx, 1)
+                phase_avg_s = (
+                    phase_elapsed_s[phase] / max(phase_counts[phase], 1))
+                write_avg_s = (
+                    phase_elapsed_s.get("write", 0.0) /
+                    max(phase_counts.get("write", 0), 1))
+                read_avg_s = (
+                    phase_elapsed_s.get("read", 0.0) /
+                    max(phase_counts.get("read", 0), 1))
                 generated = outputs[0].outputs[0].text
                 output_tokens = len(outputs[0].outputs[0].token_ids)
                 record = {
@@ -236,11 +245,13 @@ def main() -> None:
                 metrics_f.flush()
 
                 print(
-                    "[longbench-triviaqa] "
-                    f"request_idx={request_idx} sample_id={sample_id} "
-                    f"phase={phase} length={row.get('length')} "
-                    f"bucket={row.get('length_bucket')} elapsed_s={elapsed_s:.4f} "
-                    f"output_tokens={output_tokens}"
+                    "[longbench-triviaqa-iter] "
+                    f"iter={request_idx} sample_id={sample_id} phase={phase} "
+                    f"length={row.get('length')} bucket={row.get('length_bucket')} "
+                    f"elapsed_s={elapsed_s:.4f} phase_avg_s={phase_avg_s:.4f} "
+                    f"write_avg_s={write_avg_s:.4f} read_avg_s={read_avg_s:.4f} "
+                    f"total_avg_s={total_avg_s:.4f} output_tokens={output_tokens}",
+                    flush=True,
                 )
                 if args.print_output:
                     print("[longbench-triviaqa-output]", generated)

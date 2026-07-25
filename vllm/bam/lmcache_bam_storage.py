@@ -41,7 +41,8 @@ from vllm.bam.lmcache_bam_direct_placement import (
     BaMDirectPlacementExecution, BaMDirectPlacementFrontierSnapshot,
     BaMDirectPlacementStateTracker,
     prepare_bam_results_for_vllm_kvcache)
-from vllm.bam.lmcache_bam_kv_fast_path import LMCacheBaMKVFastPath
+from vllm.bam.lmcache_bam_kv_fast_path import (
+    LMCacheBaMKVFastPath, LMCacheBaMKVPreparedBatchRead)
 from vllm.bam.lmcache_bam_prefetch import (LMCacheBaMChunkReadRequest,
                                            LMCacheBaMPagePipeline)
 from vllm.bam.row_store_loader import (import_bam_row_store,
@@ -520,6 +521,21 @@ class LMCacheBaMStore:
         self._prefetch_requests: Dict[str, LMCacheBaMChunkReadRequest] = {}
         self._kv_batch_pending_keys: "OrderedDict[str, Any]" = OrderedDict()
         self._kv_batch_loaded_tensors: Dict[str, torch.Tensor] = {}
+        # GPU-initiated descriptor 分支的核心状态：
+        #
+        # - `_kv_batch_pending_keys` 仍只表示 LMCache prefetch 阶段看到的 key；
+        # - `_kv_batch_prefetch_plans` 表示这些 key 已经被整理成紧凑 KV
+        #   descriptor，但**还没有**调用 native submit；
+        # - key 使用 chunk_hash tuple，必须保持顺序，避免把已经提交的 pages
+        #   descriptor 绑定到另一组 placement chunk_starts 上。
+        #
+        # 这一步专门清理掉旧的 CPU early-submit 语义：开关打开时，上层只提前
+        # 生成 descriptor，不提前发 I/O。真正 submit 仍由 direct placement
+        # request 的统一 start 边界负责；未来接 GPU-side ring 时，也只替换这里
+        # 的 descriptor consumer，不需要再改 connector。
+        self._kv_batch_prefetch_plans: (
+            "OrderedDict[tuple[str, ...], LMCacheBaMKVPreparedBatchRead]") = (
+            OrderedDict())
         self._closed = False
 
     def close(self) -> None:
@@ -1167,6 +1183,232 @@ class LMCacheBaMStore:
             )
         return self._kv_fast_path
 
+    def _build_kv_fast_path_items(
+        self,
+        keys: list[Any],
+    ) -> list[tuple[str, BaMChunkMetadata]]:
+        """把 LMCache key 列表转换成 KV fast path 使用的稳定 item 列表。
+
+        这个 helper 只做 key -> metadata 的控制面解析，不发起 I/O。
+        单 chunk、batch read、direct placement 和 GPU-initiated prefetch 都复用
+        同一份解析逻辑，可以避免后续不同分支对 chunk 顺序或缺失 metadata 的
+        处理不一致。
+        """
+        items: list[tuple[str, BaMChunkMetadata]] = []
+        for key in keys:
+            chunk_hash = _extract_chunk_hash(key)
+            metadata = self._lookup_metadata(chunk_hash)
+            if metadata is None:
+                raise KeyError(f"BaM chunk not found: {chunk_hash}")
+            items.append((chunk_hash, metadata))
+        return items
+
+    @staticmethod
+    def _kv_prefetch_batch_key_from_items(
+        items: list[tuple[str, BaMChunkMetadata]] | tuple[tuple[str, Any], ...],
+    ) -> tuple[str, ...]:
+        """为一个 native KV batch 构造可匹配的顺序键。"""
+        return tuple(chunk_hash for chunk_hash, _ in items)
+
+    def _take_prepared_kv_prefetch_plan(
+        self,
+        batch_key: tuple[str, ...],
+    ) -> Optional[LMCacheBaMKVPreparedBatchRead]:
+        """取走一个已准备但尚未 submit 的 KV descriptor plan。
+
+        这是“上层调度阶段准备 descriptor、direct placement 阶段正式提交”的
+        连接点。plan 一旦被取走，就由当前 direct placement request 消费；
+        storage 侧不再持有它，避免同一份 descriptor 被错误复用到下一轮请求。
+        """
+        if not envs.VLLM_BAM_GPU_INITIATED_PREFETCH:
+            return None
+        with self._prefetch_lock:
+            plan = self._kv_batch_prefetch_plans.pop(batch_key, None)
+        if plan is not None:
+            logger.info(
+                "[LMCACHE_BAM_GPU_INITIATED_PREFETCH_PLAN_REUSE] "
+                "chunks=%d age_ms=%.3f source=%s chunk_hashes=%s",
+                len(batch_key),
+                (time.perf_counter() - plan.created_at_s) * 1000.0,
+                plan.source,
+                ",".join(chunk_hash[:16] for chunk_hash in batch_key),
+            )
+        return plan
+
+    def flush_kv_fast_path_prefetch_batch(self) -> int:
+        """把 LMCache prefetch 阶段收集的 key flush 成 prepared descriptor。
+
+        这个接口保留给旧的 `engine.prefetch()` 兼容路径，但语义已经收束：
+
+        ```text
+        LMCache engine.prefetch()
+          -> storage_manager.prefetch(key)
+          -> enqueue key
+          -> flush_kv_fast_path_prefetch_batch()
+          -> prepare descriptor only
+        ```
+
+        注意这里不再调用 `submit_native_batch()`。旧的 CPU early-submit 会把
+        submit 时间点前移，但没有改变 CPU 发起 submit 的事实；现在先把分支
+        收束到“只提前准备 descriptor”，为后续 GPU-side descriptor ring 留出
+        干净接口。
+        """
+        if not (envs.VLLM_BAM_GPU_INITIATED_PREFETCH
+                and envs.VLLM_BAM_KV_FAST_PATH):
+            return 0
+
+        with self._prefetch_lock:
+            pending_items = list(self._kv_batch_pending_keys.items())
+            self._kv_batch_pending_keys.clear()
+
+        if not pending_items:
+            return 0
+
+        keys = [item_key for _, item_key in pending_items]
+        items = self._build_kv_fast_path_items(keys)
+        batch_key = self._kv_prefetch_batch_key_from_items(items)
+        if not batch_key:
+            return 0
+
+        # 如果同一批 key 已经准备过，不重复生成 descriptor。正常 LMCache
+        # retrieve 中不应该发生这种情况，但保留这个检查可以防止 connector 被
+        # 重复调用时让同一个 batch 的控制面出现两份计划。
+        with self._prefetch_lock:
+            if batch_key in self._kv_batch_prefetch_plans:
+                logger.info(
+                    "[LMCACHE_BAM_GPU_INITIATED_PREFETCH_PLAN_SKIP] "
+                    "reason=already_prepared chunks=%d chunk_hashes=%s",
+                    len(batch_key),
+                    ",".join(chunk_hash[:16] for chunk_hash in batch_key),
+                )
+                return len(batch_key)
+
+        prepare_start = time.perf_counter()
+        plan = self._ensure_kv_fast_path().prepare_chunk_pages_batch_request(
+            items,
+            source="lmcache_engine_prefetch",
+        )
+        prepare_ms = (time.perf_counter() - prepare_start) * 1000.0
+        with self._prefetch_lock:
+            self._kv_batch_prefetch_plans[batch_key] = plan
+        logger.info(
+            "[LMCACHE_BAM_GPU_INITIATED_PREFETCH_PLAN_PREPARE] chunks=%d "
+            "prepare_ms=%.3f total_bytes=%d source=%s chunk_hashes=%s",
+            len(batch_key),
+            prepare_ms,
+            int(plan.total_bytes),
+            plan.source,
+            ",".join(chunk_hash[:16] for chunk_hash in batch_key),
+        )
+        return len(batch_key)
+
+    def stage_kv_fast_path_prefetch_keys(
+        self,
+        keys: list[Any],
+        *,
+        source: str,
+    ) -> int:
+        """把上层已经规划好的 direct-placement keys 准备成 descriptor。
+
+        这个接口服务 scheduler/connector-level 的新主线。它不依赖 LMCache
+        `engine.prefetch()` 逐 key 登记，而是直接消费上层 plan 里已经确定的
+        key 顺序，但它**不发起 I/O**：
+
+        ```text
+        connector plan -> token_database/process_tokens -> keys
+          -> prepare KV descriptor
+          -> direct placement start 通过 batch_key 取走 descriptor
+          -> 当前兼容执行层再提交 native read
+        ```
+
+        这里不做 placement，也不 attach vLLM KV cache；request 生命周期仍由
+        后续 direct placement start/poll/finalize 负责，避免把调度预取和数据面
+        收口揉在一起。
+        """
+        if not (envs.VLLM_BAM_GPU_INITIATED_PREFETCH
+                and envs.VLLM_BAM_KV_FAST_PATH):
+            return 0
+        if not keys:
+            return 0
+
+        items = self._build_kv_fast_path_items(keys)
+        batch_key = self._kv_prefetch_batch_key_from_items(items)
+        if not batch_key:
+            return 0
+
+        with self._prefetch_lock:
+            if batch_key in self._kv_batch_prefetch_plans:
+                logger.info(
+                    "[LMCACHE_BAM_GPU_INITIATED_PREFETCH_PLAN_SKIP] "
+                    "reason=already_prepared source=%s chunks=%d "
+                    "chunk_hashes=%s",
+                    source,
+                    len(batch_key),
+                    ",".join(chunk_hash[:16] for chunk_hash in batch_key),
+                )
+                return len(batch_key)
+
+        prepare_start = time.perf_counter()
+        plan = self._ensure_kv_fast_path().prepare_chunk_pages_batch_request(
+            items,
+            source=source,
+        )
+        prepare_ms = (time.perf_counter() - prepare_start) * 1000.0
+        with self._prefetch_lock:
+            # connector 在同一个 Python engine 线程内规划/消费 prefetch plan，
+            # 正常不会并发准备同一批 key。这里保持单一 owner 语义，避免额外
+            # race 兜底引入第二套 descriptor 生命周期。
+            self._kv_batch_prefetch_plans[batch_key] = plan
+        logger.info(
+            "[LMCACHE_BAM_GPU_INITIATED_PREFETCH_PLAN_PREPARE] "
+            "source=%s chunks=%d prepare_ms=%.3f total_bytes=%d "
+            "chunk_hashes=%s",
+            source,
+            len(batch_key),
+            prepare_ms,
+            int(plan.total_bytes),
+            ",".join(chunk_hash[:16] for chunk_hash in batch_key),
+        )
+        return len(batch_key)
+
+    def stage_kv_fast_path_prefetch_plan(
+        self,
+        *,
+        token_database: Any,
+        tokens: torch.Tensor,
+        mask: Optional[torch.Tensor],
+        source: str,
+    ) -> int:
+        """用 direct-placement 同源规则把上层预取 plan 准备成 descriptor。
+
+        这里刻意复用 `_collect_direct_placement_entries()`：
+
+        - key/hash 生成和正式 direct placement 完全一致；
+        - 遇到第一个 prefix miss 就停止，保持 LMCache 连续前缀语义；
+        - 不在 connector 里重新实现 BaM metadata 判定。
+        """
+        if not (envs.VLLM_BAM_GPU_INITIATED_PREFETCH
+                and envs.VLLM_BAM_KV_FAST_PATH):
+            return 0
+
+        entries = self._collect_direct_placement_entries(
+            token_database=token_database,
+            tokens=tokens,
+            mask=mask,
+        )
+        if not entries:
+            logger.info(
+                "[LMCACHE_BAM_GPU_INITIATED_PREFETCH_PLAN_NO_PREFIX_HIT] "
+                "source=%s tokens=%d masked_tokens=%d",
+                source,
+                int(len(tokens)),
+                int(mask.sum().item()) if mask is not None else int(len(tokens)),
+            )
+            return 0
+
+        keys = [key for _, _, key in entries]
+        return self.stage_kv_fast_path_prefetch_keys(keys, source=source)
+
     def prefetch_chunk(self, key: Any) -> bool:
         """提前提交一个 chunk 的 BaM page read 请求。
 
@@ -1302,13 +1544,7 @@ class LMCacheBaMStore:
           -> {chunk_hash: KV tensor}
         ```
         """
-        items: list[tuple[str, BaMChunkMetadata]] = []
-        for key in keys:
-            chunk_hash = _extract_chunk_hash(key)
-            metadata = self._lookup_metadata(chunk_hash)
-            if metadata is None:
-                raise KeyError(f"BaM chunk not found: {chunk_hash}")
-            items.append((chunk_hash, metadata))
+        items = self._build_kv_fast_path_items(keys)
 
         if not items:
             return {}
@@ -1329,13 +1565,7 @@ class LMCacheBaMStore:
 
         这正是 Tutti/TARDIS 路线里“减少中间 tensor/rebuild”的第一步。
         """
-        items: list[tuple[str, BaMChunkMetadata]] = []
-        for key in keys:
-            chunk_hash = _extract_chunk_hash(key)
-            metadata = self._lookup_metadata(chunk_hash)
-            if metadata is None:
-                raise KeyError(f"BaM chunk not found: {chunk_hash}")
-            items.append((chunk_hash, metadata))
+        items = self._build_kv_fast_path_items(keys)
 
         if not items:
             return []
@@ -1346,18 +1576,24 @@ class LMCacheBaMStore:
         self,
         keys: list[Any],
     ) -> Any:
-        """显式提交一批 KV page read，并返回后续可 poll/consume 的句柄。"""
-        items: list[tuple[str, BaMChunkMetadata]] = []
-        for key in keys:
-            chunk_hash = _extract_chunk_hash(key)
-            metadata = self._lookup_metadata(chunk_hash)
-            if metadata is None:
-                raise KeyError(f"BaM chunk not found: {chunk_hash}")
-            items.append((chunk_hash, metadata))
+        """显式提交一批 KV page read，并返回后续可 poll/consume 的句柄。
+
+        如果上层已经通过 GPU-initiated descriptor 分支准备过同一批 key，这里
+        只消费那份 descriptor 再 submit；否则保持原来的 inline
+        descriptor+submit。两种情况都会在这里形成 native handle，避免回到旧的
+        connector/storage 阶段提前 CPU submit。
+        """
+        items = self._build_kv_fast_path_items(keys)
 
         if not items:
             raise ValueError(
                 "submit_chunk_pages_kv_fast_path_batch_request requires keys")
+
+        batch_key = self._kv_prefetch_batch_key_from_items(items)
+        prepared_plan = self._take_prepared_kv_prefetch_plan(batch_key)
+        if prepared_plan is not None:
+            return self._ensure_kv_fast_path(
+            ).submit_prepared_chunk_pages_batch_request(prepared_plan)
 
         return self._ensure_kv_fast_path().submit_chunk_pages_batch_request(
             items)
@@ -2385,6 +2621,14 @@ class LMCacheBaMStore:
             chunk_ranges,
             chunk_hashes,
         )
+
+        items = self._build_kv_fast_path_items(keys)
+        kv_read_handle: Any | None = None
+        blocking_results: list[Any] | None = None
+        read_submit_ms = 0.0
+        batch_key = self._kv_prefetch_batch_key_from_items(items)
+        prepared_prefetch_plan = self._take_prepared_kv_prefetch_plan(batch_key)
+
         direct_placer = self._ensure_direct_kv_placer(
             kv_cache_dtype=kv_cache_dtype)
         logger.info(
@@ -2404,20 +2648,27 @@ class LMCacheBaMStore:
         )
 
         read_submit_start = time.perf_counter()
-        kv_read_handle: Any | None = None
-        blocking_results: list[Any] | None = None
         logger.info(
-            "[LMCACHE_BAM_DIRECT_PLACEMENT_READ_SUBMIT_BEGIN] batch_size=%d "
-            "chunk_hashes=%s",
+            "[LMCACHE_BAM_DIRECT_PLACEMENT_READ_SUBMIT_BEGIN] "
+            "batch_size=%d descriptor_source=%s chunk_hashes=%s",
             len(keys),
+            ("prepared_prefetch"
+             if prepared_prefetch_plan is not None else "start_inline"),
             chunk_hashes,
         )
         try:
-            kv_read_handle = self.submit_chunk_pages_kv_fast_path_batch_request(
-                keys)
+            if prepared_prefetch_plan is not None:
+                kv_read_handle = (
+                    self._ensure_kv_fast_path().
+                    submit_prepared_chunk_pages_batch_request(
+                        prepared_prefetch_plan))
+            else:
+                kv_read_handle = (
+                    self._ensure_kv_fast_path().
+                    submit_chunk_pages_batch_request(items))
         except Exception as exc:
-            # runtime / persistent 主线不允许在 request 内部偷偷回退成 blocking
-            # read。否则同一次 direct placement request 会同时混入：
+            # runtime / persistent 主线不允许在 request 内部偷偷回退成
+            # blocking read。否则同一次 direct placement request 会同时混入：
             #
             # - GPU persistent service 语义
             # - host materialize 语义
@@ -2428,19 +2679,31 @@ class LMCacheBaMStore:
             if self._persistent_runtime_mainline_enabled():
                 logger.exception(
                     "[LMCACHE_BAM_DIRECT_PLACEMENT_READ_SUBMIT_FAILED] "
-                    "batch_size=%d chunks=%s",
+                    "batch_size=%d descriptor_source=%s chunks=%s",
                     len(keys),
+                    ("prepared_prefetch"
+                     if prepared_prefetch_plan is not None else "start_inline"),
                     chunk_hashes,
                 )
                 raise RuntimeError(
-                    "runtime direct placement requires native batch submit; "
-                    "blocking fallback is disabled in persistent mode"
+                    "runtime direct placement requires native batch "
+                    "submit; blocking fallback is disabled in persistent "
+                    "mode"
                 ) from exc
             logger.exception(
                 "[LMCACHE_BAM_DIRECT_PLACEMENT_READ_SUBMIT] "
                 "async submit failed; fall back to blocking batch read")
             blocking_results = self.read_chunk_pages_kv_fast_path_batch(keys)
         read_submit_ms = (time.perf_counter() - read_submit_start) * 1000.0
+        logger.info(
+            "[LMCACHE_BAM_DIRECT_PLACEMENT_READ_SUBMIT_DONE] "
+            "batch_size=%d descriptor_source=%s submit_ms=%.3f blocking=%s",
+            len(keys),
+            ("prepared_prefetch"
+             if prepared_prefetch_plan is not None else "start_inline"),
+            read_submit_ms,
+            str(blocking_results is not None).lower(),
+        )
 
         # token_database 和 slot_mapping 使用同一段 tokens 的局部坐标系。
         # 例如 mask 前缀有 False 时，第一条可 retrieve 的 chunk 起点可能不是 0。
@@ -2449,8 +2712,7 @@ class LMCacheBaMStore:
         chunk_starts = [start for start, _, _ in entries]
         prefix_hit_chunks = len(entries)
         prefix_hit_tokens = sum(
-            int(self.get_chunk_metadata(key).actual_tokens)  # type: ignore[union-attr]
-            for key in keys)
+            int(metadata.actual_tokens) for _, metadata in items)
         descriptor_start = time.perf_counter()
         batch_descriptor = self._build_direct_placement_descriptor_from_metadata(
             entries=entries)
@@ -3283,6 +3545,41 @@ class LMCacheBaMStore:
             read_total_ms + place_stats.place_ms,
             pipeline_name,
         )
+        with self._slot_lock:
+            active_chunk_slots = len(self._chunk_slots)
+            metadata_entries = len(self._chunk_metadata)
+            chunk_slot_evictions = int(self._chunk_slot_evictions)
+        # 默认性能日志只需要这一行：它把当前 retrieve iter 的 BaM I/O、
+        # direct-placement 和 cache 状态压缩到一个稳定格式里。更细的
+        # READ/PROFILE/FRONTIER 日志仍保留在代码里，运行时通过
+        # `LONGBENCH_DEBUG_LOG=1` 放开 runner 过滤器即可查看。
+        logger.info(
+            "[LMCACHE_BAM_ITER_PERF] pipeline=%s chunks=%d tokens=%d "
+            "total_bytes=%d submit_ms=%.3f poll_ms=%.3f poll_iters=%d "
+            "get_ms=%.3f read_ms=%.3f place_ms=%.3f total_ms=%.3f "
+            "executor=%s worker_backend=%s finalize_mode=%s "
+            "cache_size_mb=%d active_chunk_slots=%d chunk_capacity=%d "
+            "metadata_entries=%d chunk_slot_evictions=%d",
+            pipeline_name,
+            in_flight_request.prefix_hit_chunks,
+            total_tokens,
+            total_bytes,
+            read_submit_ms,
+            read_poll_ms,
+            read_poll_iters,
+            read_get_ms,
+            read_total_ms,
+            place_stats.place_ms,
+            read_total_ms + place_stats.place_ms,
+            read_executor_name,
+            read_worker_backend,
+            read_finalize_mode,
+            int(envs.VLLM_BAM_CACHE_SIZE_MB),
+            active_chunk_slots,
+            int(self.chunk_capacity),
+            metadata_entries,
+            chunk_slot_evictions,
+        )
         final_log_ms = (time.perf_counter() - final_log_start) * 1000.0
         direct_total_ms = (
             time.perf_counter() - bootstrap_profile.direct_total_start_time
@@ -3787,6 +4084,11 @@ class LMCacheBaMStore:
         这里不立即 submit BaM IO，而是把同一轮 retrieve 的 key 收集起来。
         第一次 `get(key)` 进来时，再把这批 key 一次性走
         `load_chunk_tensors_kv_fast_path_batch()`，避免逐 key 串行 read/refill。
+
+        如果打开 `VLLM_BAM_GPU_INITIATED_PREFETCH=1`，这个函数仍然只负责登记；
+        后续 `flush_kv_fast_path_prefetch_batch()` 也只会把 pending key 整理成
+        prepared descriptor，不会提前 CPU submit。真正 native submit 仍保留在
+        direct placement request start 的统一边界上。
         """
         chunk_hash = _extract_chunk_hash(key)
         metadata = self._lookup_metadata(chunk_hash)
@@ -3797,9 +4099,10 @@ class LMCacheBaMStore:
             self._kv_batch_pending_keys[chunk_hash] = key
             logger.info(
                 "[LMCACHE_BAM_KV_FAST_PATH_PREFETCH_ENQUEUE] "
-                "chunk_hash=%s pending=%d",
+                "chunk_hash=%s pending=%d gpu_initiated_prefetch=%s",
                 chunk_hash[:16],
                 len(self._kv_batch_pending_keys),
+                str(bool(envs.VLLM_BAM_GPU_INITIATED_PREFETCH)).lower(),
             )
         return True
 
@@ -3814,6 +4117,12 @@ class LMCacheBaMStore:
 
         这保持了正确性：即使某个 key 没被 prefetch 阶段收集，也仍能在 get
         阶段用单 chunk fast path 读取。
+
+        注意：旧 GPU-initiated early-submit 原型会在这里寻找“已提交 native
+        handle”并消费。那条路已经被清理掉，因为它仍是 CPU submit，只是把
+        submit 提前了。现在 `get()` 侧只处理 LMCache tensor batch 读取；
+        one-copy direct placement 的 descriptor plan 由 direct placement start
+        自己消费，两个数据面不再混用同一张状态表。
         """
         chunk_hash = _extract_chunk_hash(key)
         with self._prefetch_lock:
@@ -3831,6 +4140,7 @@ class LMCacheBaMStore:
         # Python lock 额外阻塞。
         keys = [item_key for _, item_key in pending_items]
         tensors = self.load_chunk_tensors_kv_fast_path_batch(keys)
+        pending_count = len(pending_items)
 
         with self._prefetch_lock:
             for loaded_hash, loaded_tensor in tensors.items():
@@ -3839,10 +4149,11 @@ class LMCacheBaMStore:
 
         logger.info(
             "[LMCACHE_BAM_KV_FAST_PATH_BATCH_CONSUME] requested=%s "
-            "batch_size=%d hit=%s",
+            "batch_size=%d hit=%s descriptor_prefetch=%s",
             chunk_hash[:16],
-            len(pending_items),
+            pending_count,
             tensor is not None,
+            "false",
         )
         return tensor
 
@@ -4119,6 +4430,52 @@ class LMCacheBaMStorageManager:
         prefetch = getattr(self._storage_manager, "prefetch", None)
         if prefetch is not None:
             prefetch(key)
+
+    def flush_bam_gpu_initiated_prefetch(self) -> int:
+        """把本轮 LMCache prefetch key flush 成 KV descriptor plan。
+
+        这个方法是 connector 层唯一需要知道的新接口。它刻意放在
+        storage-manager wrapper 上，而不是让 connector 直接访问
+        `LMCacheBaMStore`：
+
+        - connector 只负责在合适的时机触发“prefetch 阶段结束”；
+        - BaM wrapper 自己决定是否已启用 descriptor prefetch 分支；
+        - 未启用或 BaM store 尚未初始化时直接 no-op。
+        """
+        if not (envs.VLLM_BAM_LMCACHE_PREFER_LOAD_ENABLE
+                and envs.VLLM_BAM_KV_FAST_PATH
+                and envs.VLLM_BAM_GPU_INITIATED_PREFETCH
+                and not self._bam_prefer_load_disabled
+                and self._bam_store is not None):
+            return 0
+        return self._bam_store.flush_kv_fast_path_prefetch_batch()
+
+    def stage_bam_gpu_initiated_prefetch_plan(
+        self,
+        *,
+        token_database: Any,
+        tokens: torch.Tensor,
+        mask: Optional[torch.Tensor],
+        source: str,
+    ) -> int:
+        """登记 connector/scheduler-level 的 BaM KV descriptor 计划。
+
+        这个入口是上层唯一需要调用的薄接口。它不暴露 BaM store 内部结构，只把
+        “本轮预计会 retrieve 的 tokens/mask”交给 store，用 direct placement
+        同源规则生成 key 并准备 descriptor。这里不会发起 native submit。
+        """
+        if not (envs.VLLM_BAM_LMCACHE_PREFER_LOAD_ENABLE
+                and envs.VLLM_BAM_KV_FAST_PATH
+                and envs.VLLM_BAM_GPU_INITIATED_PREFETCH
+                and not self._bam_prefer_load_disabled
+                and self._bam_store is not None):
+            return 0
+        return self._bam_store.stage_kv_fast_path_prefetch_plan(
+            token_database=token_database,
+            tokens=tokens,
+            mask=mask,
+            source=source,
+        )
 
     def _maybe_verify_prefer_load_tensor(self, key: Any,
                                          bam_tensor: torch.Tensor) -> None:

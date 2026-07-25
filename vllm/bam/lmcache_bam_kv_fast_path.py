@@ -159,6 +159,40 @@ class LMCacheBaMKVBatchReadRequestHandle:
 
 
 @dataclass(frozen=True)
+class LMCacheBaMKVPreparedBatchRead:
+    """一批尚未 submit 的 KV read descriptor。
+
+    这层对象是接下来 GPU-initiated demand-load 的干净边界：
+
+    - CPU/上层调度只负责提前把“可能要读哪些 chunk”整理成紧凑 descriptor；
+    - 这里不调用 `submit_native_batch()`，因此不会提前发起 CPU submit；
+    - 当前 Python 版本在真正 direct placement start 时消费这份 descriptor；
+    - 后续如果底层增加 GPU-side descriptor ring，可以把同样字段写入 ring，
+      由 GPU persistent service 自己取 descriptor 并发起 SSD read。
+
+    换句话说，它是“计划/描述符”，不是“已经在飞的 I/O handle”。
+    """
+
+    items: tuple[tuple[str, Any], ...]
+    requests: tuple[Any, ...]
+    source: str
+    created_at_s: float
+
+    @property
+    def batch_key(self) -> tuple[str, ...]:
+        """按 chunk 顺序生成稳定 key，避免 descriptor 绑定错 batch。"""
+        return tuple(chunk_hash for chunk_hash, _ in self.items)
+
+    @property
+    def total_bytes(self) -> int:
+        """本 batch 预计读取的总字节数，只用于日志/调试。"""
+        return sum(
+            int(getattr(request, "total_bytes", 0))
+            for request in self.requests
+        )
+
+
+@dataclass(frozen=True)
 class LMCacheBaMKVBatchReadRuntimeSnapshot:
     """KV batch read request 当前对应的 runtime 观察快照。
 
@@ -456,6 +490,59 @@ class LMCacheBaMKVFastPath:
         native_handle = self.kv_store.submit_native_batch(requests)
         return LMCacheBaMKVBatchReadRequestHandle(
             items=tuple(items),
+            native_handle=native_handle,
+        )
+
+    def prepare_chunk_pages_batch_request(
+        self,
+        items: Sequence[tuple[str, Any]],
+        *,
+        source: str,
+    ) -> LMCacheBaMKVPreparedBatchRead:
+        """只构造 KV read descriptor，不发起底层 submit。
+
+        这是把“上层预取策略”和“底层 I/O 发起”解耦的核心接口。之前的
+        early-submit 原型会在 connector/storage 阶段直接调用 native submit，
+        本质仍是 CPU submit。现在这里明确只做 descriptor 准备：
+
+        ```text
+        chunk metadata -> BaMKVRequest[] -> prepared batch
+        ```
+
+        真正 read 什么时候启动，由后续 direct placement request 或未来的
+        GPU-side descriptor consumer 决定。
+        """
+        if not items:
+            raise ValueError(
+                "prepare_chunk_pages_batch_request requires non-empty items")
+        requests = self._make_requests_for_items(items)
+        return LMCacheBaMKVPreparedBatchRead(
+            items=tuple(items),
+            requests=tuple(requests),
+            source=str(source),
+            created_at_s=time.perf_counter(),
+        )
+
+    def submit_prepared_chunk_pages_batch_request(
+        self,
+        prepared: LMCacheBaMKVPreparedBatchRead,
+    ) -> LMCacheBaMKVBatchReadRequestHandle:
+        """消费已准备好的 descriptor，并在当前 CPU 入口提交 native read。
+
+        当前底层还没有暴露“GPU 消费 descriptor ring 并自行 submit”的 Python
+        入口，所以这里仍然是兼容执行点。但它和旧逻辑的关键区别是：
+
+        - submit 没有再提前发生在 connector/storage 预取阶段；
+        - descriptor 生命周期已经独立出来，后续替换成 GPU-side submit 时，
+          上层只需要把 `prepared.requests/items` 写入设备 ring。
+        """
+        if not prepared.items or not prepared.requests:
+            raise ValueError(
+                "submit_prepared_chunk_pages_batch_request requires "
+                "non-empty prepared descriptor")
+        native_handle = self.kv_store.submit_native_batch(prepared.requests)
+        return LMCacheBaMKVBatchReadRequestHandle(
+            items=prepared.items,
             native_handle=native_handle,
         )
 

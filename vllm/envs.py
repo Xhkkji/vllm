@@ -59,6 +59,7 @@ if TYPE_CHECKING:
     VLLM_BAM_DIRECT_PLACEMENT_REQUIRE_RUNTIME_ONE_COPY: bool = False
     VLLM_BAM_DIRECT_PLACEMENT_DEFER_RUNTIME: bool = False
     VLLM_BAM_DIRECT_PLACEMENT_DEFER_MIN_POLLS: int = 0
+    VLLM_BAM_RUNTIME_IDLE_STOP_SECONDS: float = 0.0
     VLLM_BAM_XFORMERS_PREFIX_FALLBACK_PROFILE: bool = False
     VLLM_BAM_XFORMERS_PREFIX_BACKEND: str = "auto"
     VLLM_BAM_XFORMERS_QUERY_BACKEND: str = "auto"
@@ -452,21 +453,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_BAM_KV_FAST_PATH":
     lambda: bool(int(os.getenv("VLLM_BAM_KV_FAST_PATH", "0"))),
 
-    # 是否启用最轻量 GPU-initiated descriptor prefetch 分支。
+    # 是否启用 GPU-initiated demand/frontier 实验分支。
     #
     # 默认关闭，避免改变已经验证稳定的 one-copy 主线。
-    # 打开后，LMCache connector 会在 retrieve 前按同一套 LMCache token/mask
-    # 规则推导本轮连续 prefix hit chunks，并把它们准备成 compact KV descriptor：
+    # 打开后，不再在 LMCache connector 层提前 stage descriptor，也不提前
+    # CPU submit。connector 只推进 retrieve/deferred 生命周期；真正的 request
+    # 计划在 direct-placement start 边界由 storage 根据真实 prefix hit 现场生成：
     #
-    #   connector/scheduler plan
-    #     -> storage_manager.stage_bam_gpu_initiated_prefetch_plan()
-    #     -> prepare KV descriptor only
-    #     -> direct placement start 消费 descriptor，并进入统一 submit/poll/finalize
+    #   LMCache retrieve 到达 demand start
+    #     -> storage 收集连续 prefix hit chunks
+    #     -> 生成 context-chunk frontier/metadata
+    #     -> 进入统一 submit/poll/finalize request 生命周期
     #
-    # 注意：当前 Python/native 入口尚未提供 GPU-side descriptor ring，所以这里
-    # 不提前 CPU submit；这样能避免把旧的 CPU early-submit 误称为真正
-    # GPU-initiated，同时为后续 GPU 消费 descriptor 后发起 SSD read 留出干净
-    # 接口。
+    # 当前 frontier 只描述“哪些连续 context chunk 已 ready / consumable”，不改
+    # dense attention 语义，也不改 flash-attn kernel。后续真正把 submit 下沉到
+    # GPU 时，应在这个 demand-start/request frontier 边界后面接 GPU-side
+    # descriptor ring，而不是恢复 connector-stage 预提交支线。
     "VLLM_BAM_GPU_INITIATED_PREFETCH":
     lambda: bool(int(os.getenv("VLLM_BAM_GPU_INITIATED_PREFETCH", "0"))),
 
@@ -534,6 +536,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_BAM_DIRECT_PLACEMENT_DEFER_MIN_POLLS":
     lambda: int(
         os.getenv("VLLM_BAM_DIRECT_PLACEMENT_DEFER_MIN_POLLS", "0")),
+
+    # 测试/benchmark 用的临时 idle-stop 开关。
+    #
+    # 默认 0 表示保持 persistent service 常驻，不改变正常服务模式。
+    # 设置为 N>0 时，KV direct placement 每完成一次 IO 后会启动一个轻量
+    # watchdog；如果接下来 N 秒没有新的 KV IO request，就在 runtime idle
+    # 时尝试停止后台 persistent service。这样一次性跑分脚本可以在所有 iter
+    # 完成后释放 resident kernel，避免进程退出时被后台 service 拖住。
+    "VLLM_BAM_RUNTIME_IDLE_STOP_SECONDS":
+    lambda: float(os.getenv("VLLM_BAM_RUNTIME_IDLE_STOP_SECONDS", "0")),
 
     # 是否为 xformers prefix fallback 打开细粒度阶段计时。
     # 默认关闭，避免在正常跑分时引入额外 synchronize 干扰口径。

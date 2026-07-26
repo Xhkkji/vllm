@@ -131,11 +131,12 @@ def _maybe_prefetch_lmcache_bam_chunks(
     if (envs.VLLM_BAM_GPU_INITIATED_PREFETCH
             and envs.VLLM_BAM_DIRECT_PLACEMENT
             and envs.VLLM_BAM_KV_FAST_PATH):
-        # GPU-initiated descriptor 分支不再复用 LMCache engine.prefetch()：
-        # connector 会直接登记本轮 retrieve plan，direct placement start 再消费
-        # 同源 descriptor。这里如果继续走 engine.prefetch()，会额外生成一批
-        # pending key，既不能覆盖 deferrable one-copy 主线，也容易在 write / miss
-        # 阶段产生不可消费的 prefetch 日志。
+        # GPU-initiated demand/frontier 分支不再复用 LMCache engine.prefetch()：
+        # connector 不提前 stage descriptor，也不提前 CPU submit；真正的
+        # descriptor/frontier 会在 storage 的 direct-placement start 边界根据
+        # 真实 prefix hit 现场生成。这里如果继续走 engine.prefetch()，会额外
+        # 生成一批 pending key，既不能覆盖 deferrable one-copy 主线，也容易在
+        # write / miss 阶段产生不可消费的 prefetch 日志。
         return
 
     if getattr(engine, "config", None) is None:
@@ -213,159 +214,10 @@ def _maybe_prefetch_lmcache_bam_chunks(
     if prefetch_calls <= 0:
         return
 
-    # `engine.prefetch()` 内部会按 chunk key 调用 storage_manager.prefetch(key)。
-    # 对兼容的 descriptor prefetch 分支来说，单个 key 进入 storage_manager 时
-    # 还不能立即组成 one-copy 所需的 batch；因此这里在本轮所有 prefetch 调用
-    # 结束后，通过 wrapper 的薄接口显式 flush：
-    #
-    #   pending keys -> prepared descriptor -> direct placement start 消费 descriptor
-    #
-    # 如果当前 storage manager 不是 BaM wrapper，或者新分支未启用，这个调用
-    # 自然是 no-op，不影响 LMCache 原生路径。
-    storage_manager = getattr(engine, "storage_manager", None)
-    flush_prefetch = getattr(storage_manager,
-                             "flush_bam_gpu_initiated_prefetch", None)
-    if callable(flush_prefetch):
-        flushed_chunks = int(flush_prefetch())
-        if flushed_chunks > 0:
-            logger.info(
-                "[LMCACHE_BAM_GPU_INITIATED_PREFETCH_FLUSHED] "
-                "prefetch_calls=%d chunks=%d",
-                prefetch_calls,
-                flushed_chunks,
-            )
-
-
-def _maybe_stage_lmcache_bam_gpu_initiated_prefetch_plan(
-    engine: object,
-    model_input: "ModelInputForGPUWithSamplingMetadata",
-    retrieve_status: List[object],
-) -> int:
-    """在 deferred direct retrieve start 前登记上层 KV descriptor 计划。
-
-    这是当前 GPU-initiated 演进线的上层计划入口。它仍然复用 LMCache V0
-    retrieve 的 tokens/mask 规则，但不再调用 `engine.prefetch()`，也不在
-    connector 阶段发起 native submit：
-
-    ```text
-    connector 已知当前 batch 的 retrieve 输入
-      -> storage_manager.stage_bam_gpu_initiated_prefetch_plan()
-      -> BaM store 用 direct-placement 同源 key 规则收集 prefix hit chunks
-      -> 准备 compact KV descriptor
-      -> 后续 direct placement start 消费 descriptor，再进入统一 read 生命周期
-    ```
-
-    这里属于控制面预热路径；开关未启用、缺少 wrapper 或当前 batch 无 prefix
-    hit 时都返回 0，不改变原始 retrieve 正确性。真正 SSD read 仍在
-    direct-placement request start 边界提交，避免把旧的 CPU early-submit 继续
-    伪装成 GPU-initiated。
-    """
-    if not (envs.VLLM_BAM_LMCACHE_PREFER_LOAD_ENABLE
-            and envs.VLLM_BAM_GPU_INITIATED_PREFETCH
-            and envs.VLLM_BAM_DIRECT_PLACEMENT
-            and envs.VLLM_BAM_KV_FAST_PATH):
-        return 0
-
-    if getattr(engine, "config", None) is None:
-        return 0
-    if getattr(engine.config, "enable_blending", False):
-        return 0
-
-    storage_manager = getattr(engine, "storage_manager", None)
-    stage_prefetch_plan = getattr(
-        storage_manager,
-        "stage_bam_gpu_initiated_prefetch_plan",
-        None,
-    )
-    token_database = getattr(engine, "token_database", None)
-    if not callable(stage_prefetch_plan) or token_database is None:
-        return 0
-
-    attn_metadata = model_input.attn_metadata
-    sampling_metadata = model_input.sampling_metadata
-    if attn_metadata is None or sampling_metadata is None:
-        return 0
-
-    query_start_loc = getattr(attn_metadata, "query_start_loc", None)
-    seq_lens = getattr(attn_metadata, "seq_lens", None)
-    seq_group_list = getattr(sampling_metadata, "seq_groups", None)
-    if query_start_loc is None or seq_lens is None or seq_group_list is None:
-        return 0
-
-    chunk_size = int(engine.config.chunk_size)
-    staged_chunks = 0
-    plan_calls = 0
-    idx = 0
-    for seq_group in seq_group_list:
-        for seq_id in seq_group.seq_ids:
-            seq_data = seq_group.seq_data[seq_id]
-            status = retrieve_status[idx]
-            status_name = getattr(status, "name", str(status))
-
-            if status_name == "NONE":
-                idx += 1
-                continue
-
-            total_seq_len = (int(seq_lens[idx])
-                             if status_name == "CHUNK_PREFILL" else
-                             int(seq_data.get_len()))
-            full_token_tensor = torch.tensor(
-                seq_data.get_token_ids()[:total_seq_len], device="cpu")
-
-            vllm_num_required_tokens = int(
-                (query_start_loc[idx + 1] - query_start_loc[idx]).item())
-            if vllm_num_required_tokens < chunk_size:
-                idx += 1
-                continue
-
-            vllm_num_computed_tokens = total_seq_len - vllm_num_required_tokens
-            vllm_num_computed_tokens_align = (
-                vllm_num_computed_tokens // chunk_size * chunk_size)
-            token_mask = torch.ones_like(full_token_tensor, dtype=torch.bool)
-            token_mask[:vllm_num_computed_tokens_align] = False
-            retrieve_token_limit = _get_lmcache_retrieve_token_limit(
-                total_seq_len=total_seq_len,
-                vllm_num_computed_tokens=vllm_num_computed_tokens,
-                min_query_len=chunk_size,
-            )
-
-            prefetch_tokens = full_token_tensor[:retrieve_token_limit]
-            prefetch_mask = token_mask[:retrieve_token_limit]
-            masked_tokens = int(prefetch_mask.sum().item())
-            if masked_tokens <= 0:
-                idx += 1
-                continue
-
-            chunks = int(
-                stage_prefetch_plan(
-                    token_database=token_database,
-                    tokens=prefetch_tokens,
-                    mask=prefetch_mask,
-                    source="connector_deferred_receive",
-                ))
-            staged_chunks += chunks
-            plan_calls += 1
-            if chunks > 0:
-                logger.info(
-                    "[LMCACHE_BAM_GPU_INITIATED_PREFETCH_PLAN] "
-                    "seq_idx=%d tokens=%d masked_tokens=%d chunks=%d "
-                    "chunk_size=%d",
-                    idx,
-                    len(prefetch_tokens),
-                    masked_tokens,
-                    chunks,
-                    chunk_size,
-                )
-            idx += 1
-
-    if plan_calls > 0:
-        logger.info(
-            "[LMCACHE_BAM_GPU_INITIATED_PREFETCH_PLAN_SUMMARY] "
-            "plan_calls=%d staged_chunks=%d",
-            plan_calls,
-            staged_chunks,
-        )
-    return staged_chunks
+    # 新的 GPU-initiated 主线不再在 connector 层 flush/stage descriptor。
+    # connector 只负责决定“这一轮是否需要 retrieve”，真正的 descriptor/frontier
+    # 由 storage 的 direct-placement start 根据真实 prefix hit 现场生成。
+    # 这样可以避免把 CPU 提前 submit 或提前 prepare 误认为 GPU 发起 I/O。
 
 
 class LMCacheConnector(KVConnectorBase):
@@ -477,12 +329,6 @@ class LMCacheConnector(KVConnectorBase):
         self._cleanup_finished_pending_retrieves(model_input)
         retrieve_status = self.lmcache_should_retrieve(model_input)
         if self._runtime_defer_enabled():
-            batch_key = self._build_receive_batch_key(model_input)
-            if batch_key not in self._pending_deferred_retrieves:
-                self._maybe_stage_gpu_initiated_prefetch_plan(
-                    model_input,
-                    retrieve_status,
-                )
             deferred_result = self._try_drive_deferred_receive(
                 model_executable=model_executable,
                 model_input=model_input,
@@ -525,26 +371,6 @@ class LMCacheConnector(KVConnectorBase):
             logger.exception(
                 "[LMCACHE_BAM_EARLY_PREFETCH] failed before retrieve; "
                 "continue with normal LMCache retrieve")
-
-    def _maybe_stage_gpu_initiated_prefetch_plan(
-        self,
-        model_input: "ModelInputForGPUWithSamplingMetadata",
-        retrieve_status: List[object],
-    ) -> int:
-        """在 deferred direct retrieve start 前尝试登记上层 descriptor plan。"""
-        if self.engine is None:
-            return 0
-        try:
-            return _maybe_stage_lmcache_bam_gpu_initiated_prefetch_plan(
-                self.engine,
-                model_input,
-                retrieve_status,
-            )
-        except Exception:
-            logger.exception(
-                "[LMCACHE_BAM_GPU_INITIATED_PREFETCH_PLAN] stage failed "
-                "before deferred retrieve start")
-            return 0
 
     def _runtime_defer_enabled(self) -> bool:
         """是否启用 direct placement 的 runtime-level defer 主线。"""

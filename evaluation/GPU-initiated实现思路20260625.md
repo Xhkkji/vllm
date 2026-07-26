@@ -4727,7 +4727,7 @@ vllm/vllm_flash_attn/flash_attn_interface.py
 ```text
 第一阶段：
   dense attention 不变；
-  CPU 写 descriptor ring；
+  CPU 写 descriptor ring / readiness metadata；
   GPU persistent service 消费 descriptor 并发起 read；
   direct placement / retrieve 通过 ready frontier 兜底。
 
@@ -4744,4 +4744,693 @@ vllm/vllm_flash_attn/flash_attn_interface.py
 第四阶段：
   如果透明预取收益不足，再评估 sparse/block attention；
   这时才考虑修改 attention backend / selected block table / mask 语义。
+```
+
+### 15.10 Attention 计算流水线与 GPU-initiated 落点
+
+当前已经跑通的新逻辑应定位为 descriptor-plan 版本，而不是完整的
+GPU 发起 submit：
+
+```text
+当前已实现：
+  LMCache / connector 根据 retrieve 状态提前生成 compact KV descriptor；
+  descriptor 绑定 context-chunk readiness frontier；
+  descriptor 被 direct placement start 复用；
+  正式 native submit 仍发生在统一 read-submit 边界；
+  dense attention 仍然只消费已经恢复到 vLLM paged KV cache 的 KV。
+
+当前未实现：
+  layer-wise descriptor / layer-ready frontier；
+  GPU 常驻服务从 GPU-visible ring 消费 descriptor；
+  GPU 在 miss 时真正发起 SSD read；
+  attention kernel 内部按 block miss/resident 状态做 demand-load。
+```
+
+因此当前 one-copy 主线仍是“attention 前恢复 KV”，而不是
+“attention 访问 KV 时发现 miss 再由 GPU 发起 I/O”：
+
+```text
+LMCache retrieve / BaM one-copy restore
+  -> KV 写入 vLLM paged KV cache
+  -> LMCache 返回 ret_mask
+  -> vLLM model forward
+  -> 每层 QKV projection
+  -> attention kernel 按 dense 语义读取 paged KV cache
+  -> MLP / 下一层
+```
+
+如果要把预取点继续前移，优先不要直接改
+`vllm/vllm_flash_attn/flash_attn_interface.py`。第一版更稳的切入点是
+vLLM / LMCache 上层的 layer frontier 和 context chunk frontier，让 attention
+看到的仍然是 ready KV：
+
+```text
+Layer i-1 attention / MLP compute
+  与下面动作重叠：
+GPU service 根据 descriptor 预取 Layer i 所需 KV pages
+  -> 写入 paged KV cache
+  -> 更新 layer-ready frontier
+Layer i attention
+  -> 等待或消费 layer-ready frontier
+  -> dense attention 正常执行
+```
+
+这条链路的好处是：
+
+```text
+1. 不改变模型和 dense attention 正确性；
+2. 不要求 flash-attn kernel 在内部等待 SSD I/O；
+3. 能把 SSD wait 尽量藏到上一层 compute / MLP / 调度间隙里；
+4. readiness frontier 可以继续复用到后续 GPU-side descriptor ring；
+5. 如果预取失败或来不及，仍可退回正式 retrieve 等待，不影响输出。
+```
+
+可流水线化的几个层级按推荐顺序如下：
+
+```text
+1. Layer-wise KV restore prefetch
+   最适合当前主线。
+   粒度是 layer 或 layer group；
+   上一层计算时预取下一层 KV；
+   attention 入口只检查 ready frontier。
+
+2. Chunked-prefill / context-chunk prefetch
+   适合长上下文 prefill。
+   计算 context chunk i 时预取 chunk i+1；
+   prefill compute window 较大，更容易覆盖 SSD latency。
+
+3. Decode next-batch / next-token prefetch
+   适合 continuous batching。
+   对单请求、小 batch 的收益有限；
+   对多请求 steady-state 更有价值。
+
+4. Attention tile-level demand-load
+   GPU-initiated 语义最强，但改动最大。
+   attention tile 访问 block 前检查 resident / ready；
+   miss 时写 descriptor 并等待完成；
+   需要重做 kernel 调度、partial softmax、mask 和 block table 正确性。
+
+5. Query-aware / sparse-like prefetch
+   第一阶段只作为 prefetch hint。
+   dense attention 仍消费完整可见 KV；
+   只有在决定改变计算语义时，才引入 selected block table / sparse mask。
+```
+
+最终主线应收束成四步：
+
+```text
+第一步：
+  保留当前 descriptor-plan + context-chunk frontier；
+  去掉 CPU early-submit handle 叙事；
+  明确它只是 GPU descriptor ring 的前置接口。
+
+第二步：
+  在当前 context frontier 基础上继续增加 layer frontier；
+  vLLM / LMCache 根据下一层或下一 chunk 生成 prefetch plan；
+  attention 前只等待 ready frontier，不改 attention kernel。
+
+第三步：
+  native runtime 增加 GPU-visible descriptor ring；
+  GPU persistent service 负责消费 descriptor、submit read、更新 completion；
+  CPU 只负责 coarse plan 和全局调度。
+
+第四步：
+  在透明预取收益不足时，再评估 query-aware hint 或真正 sparse attention。
+  这一步才涉及 attention metadata、selected block table、mask 和 kernel 语义。
+```
+
+当前代码组织上，下一步建议保持分层：
+
+```text
+vLLM connector / model runner:
+  只提供 request、layer、context chunk 的执行 frontier；
+  不直接理解底层 page cache 细节。
+
+LMCache policy / metadata:
+  决定哪些 chunk/layer 值得预取；
+  负责 prefetch hit、late、waste、wait time 统计。
+
+storage backend:
+  把 prefetch plan 翻译成 compact descriptor；
+  维护 resident / readiness / ref_count；
+  不决定上层调度策略。
+
+attention backend:
+  第一阶段不改；
+  只要求进入 attention 前相关 KV block 已经 ready。
+```
+
+### 15.11 先做 transformer layer 级流水线
+
+如果当前优先目标是验证“前向过程中能否把 SSD/BaM I/O 隐藏到计算里”，
+下一步应先做 transformer layer 级流水线，而不是一上来补 block 级 IO。
+
+原因是 transformer forward 的天然执行顺序就是按层推进：
+
+```text
+Layer 0 attention
+Layer 0 MLP
+Layer 1 attention
+Layer 1 MLP
+...
+```
+
+因此最直接的流水线窗口是：
+
+```text
+计算 Layer i
+  同时预取 Layer i+1 的 KV pages
+
+Layer i+1 attention 前
+  只等待 Layer i+1 / layer_group ready
+```
+
+这一步不减少 dense attention 的总 IO 量，
+但可以验证 I/O wait 是否能被上一层 attention / MLP compute 覆盖。
+它回答的是：
+
+```text
+同样读完整 prefix KV，
+能不能把等待时间藏起来？
+```
+
+而 block 级 IO / sparse attention 回答的是：
+
+```text
+能不能少读一部分 prefix KV？
+```
+
+这两个问题有递进关系，但不应该混在第一版里一起做。
+
+#### 为什么当前布局适合先做 layer 级
+
+当前 BaM page layout 本身已经接近 layer-major / token-page：
+
+```text
+page_id =
+  page_offset
+  + kv_id * num_layers * pages_per_kv_layer
+  + layer_id * pages_per_kv_layer
+  + token_page_id
+```
+
+所以某个 layer 的 K/V page range 可以直接算出来：
+
+```text
+K layer i:
+  page_offset + i * pages_per_kv_layer
+  page_count = pages_per_kv_layer
+
+V layer i:
+  page_offset + num_layers * pages_per_kv_layer
+              + i * pages_per_kv_layer
+  page_count = pages_per_kv_layer
+```
+
+如果设置：
+
+```text
+layer_group_size = 1
+```
+
+就是逐层流水线。
+如果设置：
+
+```text
+layer_group_size = 2 / 4
+```
+
+就是 layer-group 流水线，可以减少 descriptor 数量和 submit/poll 开销。
+
+#### 这一阶段不需要 block 级 IO
+
+先做 layer-wise pipeline 时，需要的是：
+
+```text
+chunk_hash + layer_id / layer_group_id -> page range
+```
+
+暂时不需要：
+
+```text
+chunk_hash + block_id -> page range
+```
+
+也就是说，第一版 layer 流水线只补：
+
+```text
+1. layer_group descriptor
+   chunk_hash
+   layer_start
+   layer_count
+   K page range
+   V page range
+
+2. layer frontier
+   read_ready_layer_group
+   cache_ready_layer_group
+   consumable_layer_group
+
+3. layer-wise direct placement
+   只把当前 layer_group 的 pages scatter 到 vLLM paged KV cache
+
+4. attention 前 ready gate
+   Layer i attention 前确认 Layer i / layer_group 的 KV ready
+```
+
+不需要先改：
+
+```text
+LMCache chunk key；
+token database；
+prefix matching；
+sparse selected block table；
+flash-attn kernel 内部的 block miss handling。
+```
+
+#### 推荐的近期实现边界
+
+近期实现应保持：
+
+```text
+LMCache:
+  仍然按 chunk 做 key / prefix hit / fallback。
+
+vLLM / LMCache adapter:
+  在 forward/layer 边界附近生成 layer prefetch hint；
+  不直接理解 BaM page cache 细节。
+
+BaM storage / fast path:
+  根据 chunk metadata 推导 layer_group page ranges；
+  生成 layer_group descriptor；
+  维护 layer_group frontier。
+
+attention backend:
+  第一阶段不改 kernel；
+  只在进入 Layer i attention 前检查 ready frontier。
+```
+
+这一阶段的实验重点：
+
+```text
+1. layer_group_size = 1 / 2 / 4 的 submit/poll 开销对比；
+2. I/O wait 是否能和上一层 compute 重叠；
+3. 单请求 LongBench 是否有收益；
+4. 多请求 / continuous batching 下是否更容易压出收益；
+5. frontier miss 时是否只等待当前 layer_group，而不是等待整个 chunk。
+```
+
+#### 与后续 block-packed 的关系
+
+layer-wise pipeline 和 block-packed layout 是递进关系：
+
+```text
+第一阶段：
+  layer_group 粒度
+  目标是 overlap，不减少总 IO
+
+第二阶段：
+  block 或 block_group 粒度
+  目标是服务 sparse attention / selected block prefetch
+  可以减少总 IO
+```
+
+所以当前路线应写成：
+
+```text
+先做 layer 级流水线，验证前向计算能否覆盖 I/O；
+再做 block 级数据组织，服务 sparse-attention 和 selected-block read。
+```
+
+### 15.12 第三条路：block-packed physical layout
+
+当前 LMCache 的逻辑 chunk 不应该直接改成 block 语义。
+更合理的长期组织方式是：
+
+```text
+LMCache 逻辑层：
+  chunk_key -> 一个完整 KV chunk
+
+BaM 物理层：
+  chunk_key + block_id + layer_group_id
+    -> chunk 内部一小段 block-packed pages
+```
+
+也就是说：
+
+```text
+chunk 外壳不变；
+block 内核变细；
+dense attention 可以汇总全部 blocks；
+sparse attention 可以只取 selected blocks。
+```
+
+#### 当前布局的问题
+
+当前 BaM page layout 更接近 layer-major / token-page：
+
+```text
+page_id =
+  page_offset
+  + kv_id * num_layers * pages_per_kv_layer
+  + layer_id * pages_per_kv_layer
+  + token_page_id
+```
+
+语义上类似：
+
+```text
+K, layer0, token 0..127
+K, layer0, token 128..255
+K, layer1, token 0..127
+...
+V, layerN, token 128..255
+```
+
+在 Qwen2.5-7B fp16、hidden_dim=512 的典型设置下：
+
+```text
+一个 token vector = 512 * 2B = 1KB
+一个 128KB page = 128 tokens
+vLLM block size = 16 tokens
+
+所以：
+  1 个 BaM page = 8 个 vLLM blocks
+```
+
+因此即使 metadata 能算出某个 block 位于哪个 page，
+如果只需要 16-token block，也仍然要读它所在的整页 128 tokens。
+这会导致 block-level 调度有语义价值，但 IO 省不下来。
+
+直接把 `LMCache chunk_size` 改成一个 vLLM block 也不是好方案：
+
+```text
+chunk_size = 16 tokens
+pages_per_kv_layer = 1
+pages_per_chunk = 2 * num_layers
+```
+
+对于 28 层模型，一个 16-token chunk 就需要约 56 个 128KB pages。
+原来一个 256-token chunk 约 112 pages；
+改成 16 个小 chunk 后会变成：
+
+```text
+16 * 56 = 896 pages
+```
+
+大量 page 是 padding，metadata / submit / poll / eviction 也都会放大。
+所以不应把 LMCache chunk 直接缩成 block。
+
+#### block-packed 布局
+
+第三条路是重排 BaM 内部物理 page，让一个 128KB page 更贴近 attention block：
+
+```text
+page = block_id + layer_group_id
+```
+
+例如：
+
+```text
+block_size = 16 tokens
+hidden_dim = 512
+dtype = fp16
+
+一个 layer 的 K 或 V block:
+  16 * 512 * 2B = 16KB
+
+一个 layer 的 K+V block:
+  32KB
+
+一个 128KB page 可以放：
+  4 个 layer 的 K+V block
+```
+
+于是可以设：
+
+```text
+layer_group_size = 4
+pages_per_block = ceil(num_layers / layer_group_size)
+```
+
+物理顺序可以组织为：
+
+```text
+page 0:
+  block 0, layers 0..3, K/V
+
+page 1:
+  block 0, layers 4..7, K/V
+
+...
+
+page 7:
+  block 0, layers 28..31, K/V
+
+page 8:
+  block 1, layers 0..3, K/V
+```
+
+对于 28 层模型：
+
+```text
+pages_per_block = ceil(28 / 4) = 7
+一个 256-token chunk = 16 blocks
+完整 chunk pages = 16 * 7 = 112 pages
+```
+
+所以 dense 读完整 chunk 时，总 page 数不变；
+但 sparse / block pipeline 只读部分 block 时，可以真的减少 IO：
+
+```text
+selected blocks = 4
+read pages = 4 * 7 = 28 pages
+
+full chunk read = 112 pages
+```
+
+#### metadata 设计
+
+LMCache key 仍然只对应 chunk：
+
+```text
+chunk_hash
+```
+
+BaM metadata 增加 block-packed layout 字段：
+
+```text
+chunk_hash
+  page_offset
+  actual_tokens
+  slot_num_tokens
+  block_size
+  num_blocks
+  num_layers
+  layer_group_size
+  pages_per_block
+  pages_per_chunk
+  layout_kind = block_packed
+```
+
+定位公式：
+
+```text
+block_id = token_offset // block_size
+layer_group_id = layer_id // layer_group_size
+
+page_id =
+  page_offset
+  + block_id * pages_per_block
+  + layer_group_id
+```
+
+这允许：
+
+```text
+dense:
+  selected_blocks = all blocks
+  selected_layer_groups = all layer groups
+
+sparse:
+  selected_blocks = predictor / sparse attention 需要的 blocks
+  selected_layer_groups = 当前 layer 或 layer group
+```
+
+#### descriptor 设计
+
+当前 chunk-level descriptor 类似：
+
+```text
+read chunk:
+  page_offset
+  page_count = pages_per_chunk
+```
+
+block-packed 后应新增 block-level descriptor：
+
+```text
+read block group:
+  chunk_hash
+  block_start / block_count
+  或 selected_block_ids
+  layer_group_start / layer_group_count
+  page_ids / page_ranges
+```
+
+为了避免 tiny random IO，需要在 submit 前做 coalesce：
+
+```text
+selected blocks: 0,1,2,3
+layer_groups: all
+
+可以合并成连续 page range：
+  page_offset + 0 * pages_per_block
+  count = 4 * pages_per_block
+```
+
+如果 sparse block 分布不连续，则生成多个 range，
+但仍应由 runtime / storage backend 负责 range coalescing，
+不要让上层 attention 直接操作 page id 细节。
+
+#### encode / decode / scatter 改动
+
+当前 encode 逻辑是：
+
+```text
+[2, layers, tokens, hidden]
+  -> [2, layers, token_page, page_token_capacity, hidden]
+  -> pages
+```
+
+block-packed encode 应改成：
+
+```text
+[2, layers, tokens, hidden]
+  -> pad tokens 到 block_size 对齐
+  -> [2, layers, blocks, block_size, hidden]
+  -> [blocks, layer_groups, 2, layer_group_size, block_size, hidden]
+  -> pages
+```
+
+当前 direct placement / scatter kernel 假设读回的是完整 chunk pages，
+并按：
+
+```text
+kv_id, layer, token
+```
+
+从 page buffer 里还原。
+
+block-packed scatter 需要改成：
+
+```text
+block_id
+layer_group_id
+layer_in_group
+kv_id
+token_in_block
+hidden
+```
+
+然后写入 vLLM paged KV cache：
+
+```text
+slot = slot_mapping[chunk_start + block_id * block_size + token_in_block]
+layer = layer_group_id * layer_group_size + layer_in_group
+```
+
+这意味着应该新增一个 block-packed direct-placement kernel，
+不要把它硬塞进当前完整 chunk scatter kernel。
+
+#### 与 dense / sparse attention 的关系
+
+dense attention:
+
+```text
+需要当前 chunk 的全部 blocks；
+runtime 可以按 block frontier 逐步读；
+attention 前必须保证需要的 block 全 ready；
+最终语义等价于完整 chunk restore。
+```
+
+sparse attention:
+
+```text
+predictor / sparse metadata 选出 selected blocks；
+只提交 selected block descriptors；
+只等待 selected block frontier；
+attention backend 读取 selected block table / sparse mask。
+```
+
+因此 block-packed layout 不是为了改变 LMCache 语义，
+而是为了让 BaM 的物理 page 内容和后续 sparse/block attention 的消费粒度对齐。
+
+#### 推荐实施顺序
+
+第一步：只加 metadata / 公式，不改 IO
+
+```text
+新增 block/page 映射 helper；
+给每个 chunk 计算 block_id -> page range；
+先用于日志、frontier、调度验证。
+```
+
+第二步：page-aligned block-group read
+
+```text
+在现有 layout 下按 page_token_capacity 聚合 blocks；
+selected block 先映射到 selected pages；
+验证 block-aware scheduler / frontier；
+接受第一版收益被 128KB page 粒度稀释。
+```
+
+第三步：block-packed physical layout 分支
+
+```text
+新增 layout_kind = block_packed；
+新增 encode_pages_block_packed / decode_pages_block_packed；
+新增 block-packed KV read descriptor；
+新增 block-packed direct-placement scatter kernel。
+```
+
+第四步：接 GPU-side descriptor ring
+
+```text
+CPU / policy 写 selected block descriptors；
+GPU persistent service 消费 descriptors；
+miss 时发起 SSD read；
+完成后更新 block frontier / layer frontier。
+```
+
+第五步：接 sparse attention
+
+```text
+vLLM / attention metadata 携带 selected block table；
+attention backend 只消费 selected ready blocks；
+错误预测不应影响 correctness，第一版可保留 dense fallback。
+```
+
+#### 当前判断
+
+```text
+能快速做的：
+  block -> page range metadata；
+  page-aligned block-group frontier；
+  调度和日志验证。
+
+真正有 IO 收益的：
+  block-packed physical layout；
+  block-level descriptor；
+  block-packed scatter；
+  GPU-side descriptor consumer。
+```
+
+结论：
+
+```text
+定位 block 对应 page range 好做；
+只读 block 并产生 IO 收益，需要 block-packed physical layout；
+不要把 LMCache chunk_size 直接缩成 block；
+应保持 chunk 外壳，新增 block-aware BaM runtime 数据面。
 ```

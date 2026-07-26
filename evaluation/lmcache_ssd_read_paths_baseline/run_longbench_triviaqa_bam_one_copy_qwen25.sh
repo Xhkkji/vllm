@@ -52,6 +52,7 @@ VLLM_BAM_SSD_LIST_VALUE="${VLLM_BAM_SSD_LIST:-0}"
 VLLM_BAM_CTRL_IDX_VALUE="${VLLM_BAM_CTRL_IDX:-0}"
 VLLM_BAM_LMCACHE_SHADOW_CHUNKS_VALUE="${VLLM_BAM_LMCACHE_SHADOW_CHUNKS:-1024}"
 VLLM_BAM_GPU_INITIATED_PREFETCH_VALUE="${VLLM_BAM_GPU_INITIATED_PREFETCH:-0}"
+VLLM_BAM_RUNTIME_IDLE_STOP_SECONDS_VALUE="${VLLM_BAM_RUNTIME_IDLE_STOP_SECONDS:-0}"
 VLLM_BAM_CACHE_STATS_EVERY_ITER_VALUE="${VLLM_BAM_CACHE_STATS_EVERY_ITER:-1}"
 VLLM_BAM_DEBUG_STOP_SERVICE_FOR_LIFECYCLE_STATS_VALUE="${VLLM_BAM_DEBUG_STOP_SERVICE_FOR_LIFECYCLE_STATS:-0}"
 GIDS_KV_REF_DEBUG_VALUE="${GIDS_KV_REF_DEBUG:-${VLLM_BAM_DEBUG_STOP_SERVICE_FOR_LIFECYCLE_STATS_VALUE}}"
@@ -100,6 +101,7 @@ if [[ "${EUID}" -ne 0 ]]; then
     "VLLM_BAM_CTRL_IDX=${VLLM_BAM_CTRL_IDX_VALUE}" \
     "VLLM_BAM_LMCACHE_SHADOW_CHUNKS=${VLLM_BAM_LMCACHE_SHADOW_CHUNKS_VALUE}" \
     "VLLM_BAM_GPU_INITIATED_PREFETCH=${VLLM_BAM_GPU_INITIATED_PREFETCH_VALUE}" \
+    "VLLM_BAM_RUNTIME_IDLE_STOP_SECONDS=${VLLM_BAM_RUNTIME_IDLE_STOP_SECONDS_VALUE}" \
     "VLLM_BAM_CACHE_STATS_EVERY_ITER=${VLLM_BAM_CACHE_STATS_EVERY_ITER_VALUE}" \
     "VLLM_BAM_DEBUG_STOP_SERVICE_FOR_LIFECYCLE_STATS=${VLLM_BAM_DEBUG_STOP_SERVICE_FOR_LIFECYCLE_STATS_VALUE}" \
     "GIDS_KV_REF_DEBUG=${GIDS_KV_REF_DEBUG_VALUE}" \
@@ -121,6 +123,7 @@ echo "[longbench-triviaqa-bam-one-copy] lmcache_local_disk=${LMCACHE_LOCAL_DISK_
 echo "[longbench-triviaqa-bam-one-copy] mover_ctas=${GIDS_KV_GPU_WORKER_MOVER_CTAS_VALUE}"
 echo "[longbench-triviaqa-bam-one-copy] shadow_chunks=${VLLM_BAM_LMCACHE_SHADOW_CHUNKS_VALUE}"
 echo "[longbench-triviaqa-bam-one-copy] gpu_initiated_prefetch=${VLLM_BAM_GPU_INITIATED_PREFETCH_VALUE}"
+echo "[longbench-triviaqa-bam-one-copy] runtime_idle_stop_seconds=${VLLM_BAM_RUNTIME_IDLE_STOP_SECONDS_VALUE}"
 echo "[longbench-triviaqa-bam-one-copy] debug_lifecycle_stop=${VLLM_BAM_DEBUG_STOP_SERVICE_FOR_LIFECYCLE_STATS_VALUE}"
 echo "[longbench-triviaqa-bam-one-copy] gids_kv_ref_debug=${GIDS_KV_REF_DEBUG_VALUE}"
 echo "[longbench-triviaqa-bam-one-copy] debug_log=${LONGBENCH_DEBUG_LOG_VALUE}"
@@ -143,6 +146,7 @@ export VLLM_BAM_LMCACHE_SHADOW_CHUNKS="${VLLM_BAM_LMCACHE_SHADOW_CHUNKS_VALUE}"
 export VLLM_BAM_LMCACHE_READ_MODE="${VLLM_BAM_LMCACHE_READ_MODE:-prefetch}"
 export VLLM_BAM_KV_FAST_PATH=1
 export VLLM_BAM_GPU_INITIATED_PREFETCH="${VLLM_BAM_GPU_INITIATED_PREFETCH_VALUE}"
+export VLLM_BAM_RUNTIME_IDLE_STOP_SECONDS="${VLLM_BAM_RUNTIME_IDLE_STOP_SECONDS_VALUE}"
 export VLLM_BAM_KV_BRANCH=gpu_worker_persistent_one_copy
 export VLLM_BAM_KV_EXECUTOR=gpu_worker
 export VLLM_BAM_DIRECT_PLACEMENT=1
@@ -208,15 +212,17 @@ if [[ "${LONGBENCH_DEBUG_LOG_VALUE}" == "1" || "${LONGBENCH_DEBUG_LOG_VALUE}" ==
   "${PYTHON_BIN_VALUE}" "${RUNNER_ARGS[@]}" 2>&1 | tee "${LOG_FILE_VALUE}"
 else
   "${PYTHON_BIN_VALUE}" "${RUNNER_ARGS[@]}" 2>&1 | awk '
-    /Traceback \(most recent call last\):/ { trace=1; print; next }
-    trace { print; next }
-    /^\[longbench-triviaqa/ { print; next }
-    /LMCACHE_BAM_ITER_PERF/ { print; next }
-    /GPU_INITIATED_PREFETCH/ { print; next }
-    /LMCACHE_BAM_KV_FAST_PATH_PREFETCH_ENQUEUE/ { print; next }
-    /LMCACHE_BAM_EARLY_PREFETCH/ { print; next }
-    /LMCACHE_BAM_KV_REF_DEBUG_STATS/ { print; next }
-    /LMCACHE_BAM_CACHE_LIFECYCLE_STATS/ { print; next }
-    /WARNING|ERROR|Exception|RuntimeError|submit failed|failed|FAILED/ { print; next }
+    /Traceback \(most recent call last\):/ { trace=1; print; fflush(); next }
+    trace { print; fflush(); next }
+    /^\[longbench-triviaqa/ { print; fflush(); next }
+    /LMCACHE_BAM_ITER_PERF/ { print; fflush(); next }
+    /GPU_INITIATED_PREFETCH/ { print; fflush(); next }
+    /LMCACHE_BAM_KV_FAST_PATH_PREFETCH_ENQUEUE/ { print; fflush(); next }
+    /LMCACHE_BAM_EARLY_PREFETCH/ { print; fflush(); next }
+    /LMCACHE_BAM_KV_REF_DEBUG_STATS/ { print; fflush(); next }
+    /LMCACHE_BAM_CACHE_LIFECYCLE_STATS/ { print; fflush(); next }
+    /LMCACHE_BAM_RUNTIME_IDLE_STOP/ { print; fflush(); next }
+    /LMCACHE_BAM_STORAGE_MANAGER_CLOSE/ { print; fflush(); next }
+    /WARNING|ERROR|Exception|RuntimeError|submit failed|failed|FAILED/ { print; fflush(); next }
   ' | tee "${LOG_FILE_VALUE}"
 fi

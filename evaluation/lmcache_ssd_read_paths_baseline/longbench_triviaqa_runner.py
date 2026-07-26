@@ -75,6 +75,10 @@ def install_benchmark_log_filter(debug_log: bool) -> None:
         # ref/lifecycle 只有在对应 debug 开关打开时才会产生，这里允许透出。
         "[LMCACHE_BAM_KV_REF_DEBUG_STATS]",
         "[LMCACHE_BAM_CACHE_LIFECYCLE_STATS]",
+        # benchmark 结束后的临时 idle-stop 观察点，默认不改变数据链路。
+        "[LMCACHE_BAM_RUNTIME_IDLE_STOP",
+        # 关闭路径必须默认可见，用来确认 wrapper 没有截断 LMCache 原生 close。
+        "[LMCACHE_BAM_STORAGE_MANAGER_CLOSE",
     )
 
     def filtered_handle(self: logging.Logger, record: logging.LogRecord) -> None:
@@ -262,7 +266,8 @@ def main() -> None:
                 f"repeat_read={args.repeat_read} total_elapsed_s={total_elapsed_s:.4f} "
                 f"avg_request_s={total_elapsed_s / max(request_idx, 1):.4f} "
                 f"write_avg_s={phase_elapsed_s.get('write', 0.0) / max(phase_counts.get('write', 0), 1):.4f} "
-                f"read_avg_s={phase_elapsed_s.get('read', 0.0) / max(phase_counts.get('read', 0), 1):.4f}"
+                f"read_avg_s={phase_elapsed_s.get('read', 0.0) / max(phase_counts.get('read', 0), 1):.4f}",
+                flush=True,
             )
 
 

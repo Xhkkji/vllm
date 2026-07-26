@@ -9,9 +9,9 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # 差异化开关，然后复用稳定的 one-copy 启动脚本：
 #
 #   LMCache prefetch phase
-#     -> 收集 chunk key
-#     -> flush 成 native KV batch handle
-#     -> direct placement start 复用 handle
+#     -> 根据 retrieve 状态收集连续 prefix chunk key
+#     -> 准备 compact KV descriptor + context readiness frontier
+#     -> direct placement start 消费 descriptor
 #     -> GPU persistent one-copy 继续负责 poll / scatter / cleanup
 #
 # 默认样本数保持较小，先验证新分支不会破坏当前 cta=4 one-copy 主线。

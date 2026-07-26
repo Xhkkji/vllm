@@ -42,7 +42,7 @@ from vllm.bam.lmcache_bam_direct_placement import (
     BaMDirectPlacementStateTracker,
     prepare_bam_results_for_vllm_kvcache)
 from vllm.bam.lmcache_bam_kv_fast_path import (
-    LMCacheBaMKVFastPath, LMCacheBaMKVPreparedBatchRead)
+    LMCacheBaMKVFastPath, LMCacheBaMPrefetchFrontierPlan)
 from vllm.bam.lmcache_bam_prefetch import (LMCacheBaMChunkReadRequest,
                                            LMCacheBaMPagePipeline)
 from vllm.bam.row_store_loader import (import_bam_row_store,
@@ -62,6 +62,23 @@ def _env_flag(name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _should_log_kv_runtime_poll_debug(poll_iters: int) -> bool:
+    """限制 runtime poll 调试日志频率。
+
+    这个 helper 只在 `GIDS_KV_DEBUG=1` 时使用。direct retrieve 的 poll 会在
+    vLLM engine loop 里高频发生，如果每轮都打印 runtime slot，会让日志本身
+    成为新的性能干扰。这里保留前几轮和长时间卡住时的采样点，方便定位
+    persistent service 是否停在 mover 等待点。
+    """
+    poll_iters = int(poll_iters)
+    try:
+        every = int(os.getenv("GIDS_KV_DEBUG_POLL_LOG_EVERY", "1000"))
+    except ValueError:
+        every = 1000
+    every = max(every, 1)
+    return poll_iters <= 5 or poll_iters % every == 0
 
 
 # 固定使用 128KB 物理页。
@@ -445,6 +462,14 @@ class _InFlightDirectPlacementRequest:
     # 一旦我们已经确认这次请求真的挂进了 GPU worker runtime slot，就不需要在
     # 后续每次 poll 都重复打印同一份上下文。
     native_runtime_context_logged: bool = False
+    # GPU-initiated demand/frontier 分支绑定的 context/layer readiness 计划。
+    #
+    # 当前实际可推进的是 context chunk frontier：native KV request 一次读取一个
+    # LMCache chunk 的所有层，底层 frontier 也是按 chunk 连续前缀发布。
+    # `prefetch_frontier_plan` 把这个底层 chunk frontier 显式翻译回上层
+    # context token frontier。layer-wise 只保留 num_layers/layer_group_size
+    # 元信息，等后续真的把 descriptor 拆成 layer group 时再参与调度。
+    prefetch_frontier_plan: LMCacheBaMPrefetchFrontierPlan | None = None
 
 
 @dataclass(frozen=True)
@@ -521,22 +546,18 @@ class LMCacheBaMStore:
         self._prefetch_requests: Dict[str, LMCacheBaMChunkReadRequest] = {}
         self._kv_batch_pending_keys: "OrderedDict[str, Any]" = OrderedDict()
         self._kv_batch_loaded_tensors: Dict[str, torch.Tensor] = {}
-        # GPU-initiated descriptor 分支的核心状态：
-        #
-        # - `_kv_batch_pending_keys` 仍只表示 LMCache prefetch 阶段看到的 key；
-        # - `_kv_batch_prefetch_plans` 表示这些 key 已经被整理成紧凑 KV
-        #   descriptor，但**还没有**调用 native submit；
-        # - key 使用 chunk_hash tuple，必须保持顺序，避免把已经提交的 pages
-        #   descriptor 绑定到另一组 placement chunk_starts 上。
-        #
-        # 这一步专门清理掉旧的 CPU early-submit 语义：开关打开时，上层只提前
-        # 生成 descriptor，不提前发 I/O。真正 submit 仍由 direct placement
-        # request 的统一 start 边界负责；未来接 GPU-side ring 时，也只替换这里
-        # 的 descriptor consumer，不需要再改 connector。
-        self._kv_batch_prefetch_plans: (
-            "OrderedDict[tuple[str, ...], LMCacheBaMKVPreparedBatchRead]") = (
-            OrderedDict())
         self._closed = False
+        # benchmark/排障用的 idle-stop watchdog。
+        #
+        # 正常服务模式需要 persistent service 常驻，因此默认不开启。只有设置
+        # `VLLM_BAM_RUNTIME_IDLE_STOP_SECONDS > 0` 时，才会在每次 KV IO 完成后
+        # 安排一个延迟检查：如果这段时间内没有新 IO，就尝试停掉空转的 GPU
+        # persistent service，避免一次性测试脚本在退出阶段被 resident kernel
+        # 拖住。这里使用 generation 而不是简单 timer，是为了避免旧 timer 把
+        # 新一轮正在使用的 service 停掉。
+        self._runtime_idle_stop_lock = threading.Lock()
+        self._runtime_idle_stop_generation = 0
+        self._runtime_idle_stop_timer: Optional[threading.Timer] = None
 
     def close(self) -> None:
         """收口当前 BaM store 持有的 KV runtime 资源。
@@ -556,7 +577,20 @@ class LMCacheBaMStore:
         kv_fast_path = self._kv_fast_path
         if kv_fast_path is None:
             return
+        if self._runtime_idle_stop_seconds() > 0.0:
+            # 一次性 benchmark 中，summary 已经在上层 runner 打印完成；
+            # 此时如果同步 stop 卡在 persistent service stream 上，会让用户误以为
+            # “最后一个 iter 没跑完”。开关开启时不在 close 热路径阻塞，而是复用
+            # 已安排的 idle watchdog；如果还没有 timer，就补安排一次。
+            self._schedule_runtime_idle_stop_if_enabled(source="store.close")
+            logger.info(
+                "[LMCACHE_BAM_RUNTIME_IDLE_STOP_DEFER_CLOSE] "
+                "delay_s=%.3f",
+                self._runtime_idle_stop_seconds(),
+            )
+            return
         try:
+            self._cancel_runtime_idle_stop_timer()
             stopped = bool(kv_fast_path.kv_store.native_runtime_stop_service_if_idle())
             if stopped:
                 logger.info(
@@ -564,6 +598,78 @@ class LMCacheBaMStore:
         except Exception:
             logger.exception(
                 "[LMCACHE_BAM_RUNTIME_IDLE_STOP] failed during store.close")
+
+    def _runtime_idle_stop_seconds(self) -> float:
+        """返回测试用 idle-stop 延迟；0 表示保持后台 service 常驻。"""
+        try:
+            return max(float(envs.VLLM_BAM_RUNTIME_IDLE_STOP_SECONDS), 0.0)
+        except Exception:
+            return 0.0
+
+    def _cancel_runtime_idle_stop_timer(self) -> None:
+        """新 IO 到来或 store 关闭时取消旧的 idle-stop 定时器。"""
+        with self._runtime_idle_stop_lock:
+            self._runtime_idle_stop_generation += 1
+            timer = self._runtime_idle_stop_timer
+            self._runtime_idle_stop_timer = None
+        if timer is not None:
+            timer.cancel()
+
+    def _schedule_runtime_idle_stop_if_enabled(self, *, source: str) -> None:
+        """在最后一次 KV IO 后安排一次延迟 idle-stop。
+
+        这不是正式调度策略，只是 benchmark 退出清理的临时保险：
+        - 正常后台服务：开关为 0，完全不触发；
+        - 一次性测试：设置为 5，最后一次 read 后等待 5 秒；
+        - 如果期间又来了新 request，generation 变化，旧 timer 自动失效。
+        """
+        delay_s = self._runtime_idle_stop_seconds()
+        if delay_s <= 0.0:
+            return
+
+        with self._runtime_idle_stop_lock:
+            self._runtime_idle_stop_generation += 1
+            generation = self._runtime_idle_stop_generation
+            old_timer = self._runtime_idle_stop_timer
+            timer = threading.Timer(
+                delay_s,
+                self._runtime_idle_stop_after_delay,
+                kwargs={
+                    "generation": generation,
+                    "source": source,
+                },
+            )
+            timer.daemon = True
+            self._runtime_idle_stop_timer = timer
+        if old_timer is not None:
+            old_timer.cancel()
+        timer.start()
+        logger.info(
+            "[LMCACHE_BAM_RUNTIME_IDLE_STOP_SCHEDULE] source=%s delay_s=%.3f "
+            "generation=%d",
+            source,
+            delay_s,
+            generation,
+        )
+
+    def _runtime_idle_stop_after_delay(self, *, generation: int,
+                                       source: str) -> None:
+        """timer 回调：只有确认期间没有新 IO，才停止 idle service。"""
+        with self._runtime_idle_stop_lock:
+            if generation != self._runtime_idle_stop_generation:
+                return
+            self._runtime_idle_stop_timer = None
+        stopped = self._stop_kv_runtime_service_if_idle(
+            source=source,
+            reason="idle_timeout",
+        )
+        logger.info(
+            "[LMCACHE_BAM_RUNTIME_IDLE_STOP_TIMEOUT] source=%s generation=%d "
+            "stopped=%s",
+            source,
+            generation,
+            str(stopped).lower(),
+        )
 
     def _maybe_print_cache_stats_after_iter(
         self,
@@ -1204,210 +1310,81 @@ class LMCacheBaMStore:
         return items
 
     @staticmethod
-    def _kv_prefetch_batch_key_from_items(
-        items: list[tuple[str, BaMChunkMetadata]] | tuple[tuple[str, Any], ...],
-    ) -> tuple[str, ...]:
-        """为一个 native KV batch 构造可匹配的顺序键。"""
-        return tuple(chunk_hash for chunk_hash, _ in items)
+    def _build_context_frontier_ranges_from_items(
+        items: list[tuple[str, BaMChunkMetadata]],
+    ) -> tuple[tuple[int, int], ...]:
+        """为缺少 token_database range 的调用方构造连续 context chunk 范围。
 
-    def _take_prepared_kv_prefetch_plan(
-        self,
-        batch_key: tuple[str, ...],
-    ) -> Optional[LMCacheBaMKVPreparedBatchRead]:
-        """取走一个已准备但尚未 submit 的 KV descriptor plan。
+        `engine.prefetch()` 兼容路径只能看到一个个 LMCache key，不知道这些 key
+        在原始 prompt 中的精确 token 起点。为了仍然保持 frontier 语义完整，
+        这里退化成按 actual_tokens 累加出的局部 context 坐标。
 
-        这是“上层调度阶段准备 descriptor、direct placement 阶段正式提交”的
-        连接点。plan 一旦被取走，就由当前 direct placement request 消费；
-        storage 侧不再持有它，避免同一份 descriptor 被错误复用到下一轮请求。
+        新的 GPU-initiated 主线会在 direct-placement start 内根据真实
+        entries 传入 `(start, end)`，因此主实验路径不会使用这个近似坐标。
         """
-        if not envs.VLLM_BAM_GPU_INITIATED_PREFETCH:
-            return None
-        with self._prefetch_lock:
-            plan = self._kv_batch_prefetch_plans.pop(batch_key, None)
-        if plan is not None:
-            logger.info(
-                "[LMCACHE_BAM_GPU_INITIATED_PREFETCH_PLAN_REUSE] "
-                "chunks=%d age_ms=%.3f source=%s chunk_hashes=%s",
-                len(batch_key),
-                (time.perf_counter() - plan.created_at_s) * 1000.0,
-                plan.source,
-                ",".join(chunk_hash[:16] for chunk_hash in batch_key),
-            )
-        return plan
+        ranges: list[tuple[int, int]] = []
+        cursor = 0
+        for _, metadata in items:
+            start = int(cursor)
+            end = start + int(metadata.actual_tokens)
+            ranges.append((start, end))
+            cursor = end
+        return tuple(ranges)
 
-    def flush_kv_fast_path_prefetch_batch(self) -> int:
-        """把 LMCache prefetch 阶段收集的 key flush 成 prepared descriptor。
+    @staticmethod
+    def _context_frontier_starts_and_counts(
+        items: list[tuple[str, BaMChunkMetadata]],
+        chunk_ranges: tuple[tuple[int, int], ...] | None,
+    ) -> tuple[list[int], list[int]]:
+        """把 chunk range 规范成当前 request 可携带的 frontier 信息。"""
+        if chunk_ranges is None:
+            chunk_ranges = LMCacheBaMStore._build_context_frontier_ranges_from_items(
+                items)
+        if len(chunk_ranges) != len(items):
+            raise ValueError(
+                "context frontier ranges must match prepared items: "
+                f"{len(chunk_ranges)} != {len(items)}")
 
-        这个接口保留给旧的 `engine.prefetch()` 兼容路径，但语义已经收束：
+        starts: list[int] = []
+        counts: list[int] = []
+        for (start, end), (_, metadata) in zip(chunk_ranges, items):
+            start_int = int(start)
+            end_int = int(end)
+            if end_int < start_int:
+                raise ValueError(
+                    f"invalid context frontier range: ({start_int}, {end_int})")
+            # 真实可恢复 token 数以 BaM metadata 为准；range 只保留上层 prompt
+            # 坐标。这样尾 chunk 或 mask 场景不会因为上层 end 估计偏大而把
+            # dense attention 可消费 frontier 误报到真实 KV 之外。
+            starts.append(start_int)
+            counts.append(min(end_int - start_int, int(metadata.actual_tokens)))
+        return starts, counts
 
-        ```text
-        LMCache engine.prefetch()
-          -> storage_manager.prefetch(key)
-          -> enqueue key
-          -> flush_kv_fast_path_prefetch_batch()
-          -> prepare descriptor only
-        ```
+    @staticmethod
+    def _format_prefetch_frontier_plan(
+        plan: LMCacheBaMPrefetchFrontierPlan | None,
+    ) -> str:
+        """把 frontier plan 压成单行日志，避免热路径输出过长。"""
+        if plan is None:
+            return "none"
+        ranges = ",".join(
+            f"[{start},{start + count})"
+            for start, count in zip(plan.chunk_start_tokens,
+                                    plan.chunk_token_counts))
+        return (
+            f"granularity={plan.granularity} chunks={plan.total_context_chunks} "
+            f"tokens={plan.total_tokens} num_layers={plan.num_layers} "
+            f"layer_group_size={plan.layer_group_size} ranges={ranges}")
 
-        注意这里不再调用 `submit_native_batch()`。旧的 CPU early-submit 会把
-        submit 时间点前移，但没有改变 CPU 发起 submit 的事实；现在先把分支
-        收束到“只提前准备 descriptor”，为后续 GPU-side descriptor ring 留出
-        干净接口。
-        """
-        if not (envs.VLLM_BAM_GPU_INITIATED_PREFETCH
-                and envs.VLLM_BAM_KV_FAST_PATH):
-            return 0
-
-        with self._prefetch_lock:
-            pending_items = list(self._kv_batch_pending_keys.items())
-            self._kv_batch_pending_keys.clear()
-
-        if not pending_items:
-            return 0
-
-        keys = [item_key for _, item_key in pending_items]
-        items = self._build_kv_fast_path_items(keys)
-        batch_key = self._kv_prefetch_batch_key_from_items(items)
-        if not batch_key:
-            return 0
-
-        # 如果同一批 key 已经准备过，不重复生成 descriptor。正常 LMCache
-        # retrieve 中不应该发生这种情况，但保留这个检查可以防止 connector 被
-        # 重复调用时让同一个 batch 的控制面出现两份计划。
-        with self._prefetch_lock:
-            if batch_key in self._kv_batch_prefetch_plans:
-                logger.info(
-                    "[LMCACHE_BAM_GPU_INITIATED_PREFETCH_PLAN_SKIP] "
-                    "reason=already_prepared chunks=%d chunk_hashes=%s",
-                    len(batch_key),
-                    ",".join(chunk_hash[:16] for chunk_hash in batch_key),
-                )
-                return len(batch_key)
-
-        prepare_start = time.perf_counter()
-        plan = self._ensure_kv_fast_path().prepare_chunk_pages_batch_request(
-            items,
-            source="lmcache_engine_prefetch",
-        )
-        prepare_ms = (time.perf_counter() - prepare_start) * 1000.0
-        with self._prefetch_lock:
-            self._kv_batch_prefetch_plans[batch_key] = plan
-        logger.info(
-            "[LMCACHE_BAM_GPU_INITIATED_PREFETCH_PLAN_PREPARE] chunks=%d "
-            "prepare_ms=%.3f total_bytes=%d source=%s chunk_hashes=%s",
-            len(batch_key),
-            prepare_ms,
-            int(plan.total_bytes),
-            plan.source,
-            ",".join(chunk_hash[:16] for chunk_hash in batch_key),
-        )
-        return len(batch_key)
-
-    def stage_kv_fast_path_prefetch_keys(
-        self,
-        keys: list[Any],
-        *,
-        source: str,
+    @staticmethod
+    def _context_frontier_tokens(
+        plan: LMCacheBaMPrefetchFrontierPlan | None,
+        ready_chunks: int,
     ) -> int:
-        """把上层已经规划好的 direct-placement keys 准备成 descriptor。
-
-        这个接口服务 scheduler/connector-level 的新主线。它不依赖 LMCache
-        `engine.prefetch()` 逐 key 登记，而是直接消费上层 plan 里已经确定的
-        key 顺序，但它**不发起 I/O**：
-
-        ```text
-        connector plan -> token_database/process_tokens -> keys
-          -> prepare KV descriptor
-          -> direct placement start 通过 batch_key 取走 descriptor
-          -> 当前兼容执行层再提交 native read
-        ```
-
-        这里不做 placement，也不 attach vLLM KV cache；request 生命周期仍由
-        后续 direct placement start/poll/finalize 负责，避免把调度预取和数据面
-        收口揉在一起。
-        """
-        if not (envs.VLLM_BAM_GPU_INITIATED_PREFETCH
-                and envs.VLLM_BAM_KV_FAST_PATH):
+        """把 request-level chunk frontier 转成 context token frontier。"""
+        if plan is None:
             return 0
-        if not keys:
-            return 0
-
-        items = self._build_kv_fast_path_items(keys)
-        batch_key = self._kv_prefetch_batch_key_from_items(items)
-        if not batch_key:
-            return 0
-
-        with self._prefetch_lock:
-            if batch_key in self._kv_batch_prefetch_plans:
-                logger.info(
-                    "[LMCACHE_BAM_GPU_INITIATED_PREFETCH_PLAN_SKIP] "
-                    "reason=already_prepared source=%s chunks=%d "
-                    "chunk_hashes=%s",
-                    source,
-                    len(batch_key),
-                    ",".join(chunk_hash[:16] for chunk_hash in batch_key),
-                )
-                return len(batch_key)
-
-        prepare_start = time.perf_counter()
-        plan = self._ensure_kv_fast_path().prepare_chunk_pages_batch_request(
-            items,
-            source=source,
-        )
-        prepare_ms = (time.perf_counter() - prepare_start) * 1000.0
-        with self._prefetch_lock:
-            # connector 在同一个 Python engine 线程内规划/消费 prefetch plan，
-            # 正常不会并发准备同一批 key。这里保持单一 owner 语义，避免额外
-            # race 兜底引入第二套 descriptor 生命周期。
-            self._kv_batch_prefetch_plans[batch_key] = plan
-        logger.info(
-            "[LMCACHE_BAM_GPU_INITIATED_PREFETCH_PLAN_PREPARE] "
-            "source=%s chunks=%d prepare_ms=%.3f total_bytes=%d "
-            "chunk_hashes=%s",
-            source,
-            len(batch_key),
-            prepare_ms,
-            int(plan.total_bytes),
-            ",".join(chunk_hash[:16] for chunk_hash in batch_key),
-        )
-        return len(batch_key)
-
-    def stage_kv_fast_path_prefetch_plan(
-        self,
-        *,
-        token_database: Any,
-        tokens: torch.Tensor,
-        mask: Optional[torch.Tensor],
-        source: str,
-    ) -> int:
-        """用 direct-placement 同源规则把上层预取 plan 准备成 descriptor。
-
-        这里刻意复用 `_collect_direct_placement_entries()`：
-
-        - key/hash 生成和正式 direct placement 完全一致；
-        - 遇到第一个 prefix miss 就停止，保持 LMCache 连续前缀语义；
-        - 不在 connector 里重新实现 BaM metadata 判定。
-        """
-        if not (envs.VLLM_BAM_GPU_INITIATED_PREFETCH
-                and envs.VLLM_BAM_KV_FAST_PATH):
-            return 0
-
-        entries = self._collect_direct_placement_entries(
-            token_database=token_database,
-            tokens=tokens,
-            mask=mask,
-        )
-        if not entries:
-            logger.info(
-                "[LMCACHE_BAM_GPU_INITIATED_PREFETCH_PLAN_NO_PREFIX_HIT] "
-                "source=%s tokens=%d masked_tokens=%d",
-                source,
-                int(len(tokens)),
-                int(mask.sum().item()) if mask is not None else int(len(tokens)),
-            )
-            return 0
-
-        keys = [key for _, _, key in entries]
-        return self.stage_kv_fast_path_prefetch_keys(keys, source=source)
+        return int(plan.tokens_ready_for_chunks(ready_chunks))
 
     def prefetch_chunk(self, key: Any) -> bool:
         """提前提交一个 chunk 的 BaM page read 请求。
@@ -1578,22 +1555,15 @@ class LMCacheBaMStore:
     ) -> Any:
         """显式提交一批 KV page read，并返回后续可 poll/consume 的句柄。
 
-        如果上层已经通过 GPU-initiated descriptor 分支准备过同一批 key，这里
-        只消费那份 descriptor 再 submit；否则保持原来的 inline
-        descriptor+submit。两种情况都会在这里形成 native handle，避免回到旧的
-        connector/storage 阶段提前 CPU submit。
+        当前这个入口只保留 inline descriptor+submit 语义。旧的
+        connector/storage prepared-plan 支线已经移除，因为它没有改变“CPU 发起
+        submit”的事实，反而让 request 生命周期多了一张额外的 Python 状态表。
         """
         items = self._build_kv_fast_path_items(keys)
 
         if not items:
             raise ValueError(
                 "submit_chunk_pages_kv_fast_path_batch_request requires keys")
-
-        batch_key = self._kv_prefetch_batch_key_from_items(items)
-        prepared_plan = self._take_prepared_kv_prefetch_plan(batch_key)
-        if prepared_plan is not None:
-            return self._ensure_kv_fast_path(
-            ).submit_prepared_chunk_pages_batch_request(prepared_plan)
 
         return self._ensure_kv_fast_path().submit_chunk_pages_batch_request(
             items)
@@ -2586,6 +2556,7 @@ class LMCacheBaMStore:
             self._last_direct_placement_state_tracker = None
             return None
 
+        self._cancel_runtime_idle_stop_timer()
         masked_tokens = int(mask.sum().item()) if mask is not None else len(tokens)
         direct_total_start = time.perf_counter()
         logger.info(
@@ -2626,8 +2597,30 @@ class LMCacheBaMStore:
         kv_read_handle: Any | None = None
         blocking_results: list[Any] | None = None
         read_submit_ms = 0.0
-        batch_key = self._kv_prefetch_batch_key_from_items(items)
-        prepared_prefetch_plan = self._take_prepared_kv_prefetch_plan(batch_key)
+        prefetch_frontier_plan: LMCacheBaMPrefetchFrontierPlan | None = None
+        if envs.VLLM_BAM_GPU_INITIATED_PREFETCH:
+            # GPU-initiated 主线现在只在 demand start 边界发布 frontier 计划：
+            #
+            # - connector 不再提前 stage/flush descriptor，避免引入一条额外的
+            #   CPU 控制面支线；
+            # - 这里已经拿到了真实 prefix hit entries，因此 chunk 顺序、token
+            #   range 和后续 direct placement 写入目标天然同源；
+            # - 当前 frontier 仍是 context-chunk 粒度，不改变 dense attention
+            #   语义；后续要做 layer/sparse pipeline 时，只需要把这里的
+            #   granularity 扩展成 layer-group descriptor。
+            chunk_start_tokens, chunk_token_counts = (
+                self._context_frontier_starts_and_counts(
+                    items,
+                    chunk_ranges=tuple(
+                        (int(start), int(end)) for start, end, _ in entries),
+                ))
+            prefetch_frontier_plan = LMCacheBaMPrefetchFrontierPlan(
+                granularity="context_chunk",
+                chunk_start_tokens=tuple(chunk_start_tokens),
+                chunk_token_counts=tuple(chunk_token_counts),
+                num_layers=int(self.layout.num_layers),
+                layer_group_size=int(self.layout.num_layers),
+            )
 
         direct_placer = self._ensure_direct_kv_placer(
             kv_cache_dtype=kv_cache_dtype)
@@ -2652,20 +2645,13 @@ class LMCacheBaMStore:
             "[LMCACHE_BAM_DIRECT_PLACEMENT_READ_SUBMIT_BEGIN] "
             "batch_size=%d descriptor_source=%s chunk_hashes=%s",
             len(keys),
-            ("prepared_prefetch"
-             if prepared_prefetch_plan is not None else "start_inline"),
+            "start_inline",
             chunk_hashes,
         )
         try:
-            if prepared_prefetch_plan is not None:
-                kv_read_handle = (
-                    self._ensure_kv_fast_path().
-                    submit_prepared_chunk_pages_batch_request(
-                        prepared_prefetch_plan))
-            else:
-                kv_read_handle = (
-                    self._ensure_kv_fast_path().
-                    submit_chunk_pages_batch_request(items))
+            kv_read_handle = (
+                self._ensure_kv_fast_path().
+                submit_chunk_pages_batch_request(items))
         except Exception as exc:
             # runtime / persistent 主线不允许在 request 内部偷偷回退成
             # blocking read。否则同一次 direct placement request 会同时混入：
@@ -2681,8 +2667,7 @@ class LMCacheBaMStore:
                     "[LMCACHE_BAM_DIRECT_PLACEMENT_READ_SUBMIT_FAILED] "
                     "batch_size=%d descriptor_source=%s chunks=%s",
                     len(keys),
-                    ("prepared_prefetch"
-                     if prepared_prefetch_plan is not None else "start_inline"),
+                    "start_inline",
                     chunk_hashes,
                 )
                 raise RuntimeError(
@@ -2699,11 +2684,16 @@ class LMCacheBaMStore:
             "[LMCACHE_BAM_DIRECT_PLACEMENT_READ_SUBMIT_DONE] "
             "batch_size=%d descriptor_source=%s submit_ms=%.3f blocking=%s",
             len(keys),
-            ("prepared_prefetch"
-             if prepared_prefetch_plan is not None else "start_inline"),
+            "start_inline",
             read_submit_ms,
             str(blocking_results is not None).lower(),
         )
+        if prefetch_frontier_plan is not None:
+            logger.info(
+                "[LMCACHE_BAM_GPU_INITIATED_PREFETCH_CONTEXT_FRONTIER_PLAN] "
+                "descriptor_source=start_inline %s",
+                self._format_prefetch_frontier_plan(prefetch_frontier_plan),
+            )
 
         # token_database 和 slot_mapping 使用同一段 tokens 的局部坐标系。
         # 例如 mask 前缀有 False 时，第一条可 retrieve 的 chunk 起点可能不是 0。
@@ -2827,6 +2817,7 @@ class LMCacheBaMStore:
                 runtime_direct_placement_attached),
             runtime_direct_placement_attachment=(
                 runtime_direct_placement_attachment),
+            prefetch_frontier_plan=prefetch_frontier_plan,
         )
 
     def _poll_direct_placement_request(
@@ -2887,7 +2878,57 @@ class LMCacheBaMStore:
                 or int(snapshot.consumable_chunks) >
                 int(previous_snapshot.consumable_chunks)
             )
+            if (not frontier_advanced and _env_flag("GIDS_KV_DEBUG")
+                    and _should_log_kv_runtime_poll_debug(
+                        int(kv_poll_snapshot.poll_iters))):
+                try:
+                    runtime_snapshot = (
+                        self.
+                        get_chunk_pages_kv_fast_path_batch_request_runtime_snapshot(
+                            in_flight_request.kv_read_handle))
+                    runtime_row = getattr(runtime_snapshot,
+                                          "matched_runtime_row", None)
+                    logger.info(
+                        "[LMCACHE_BAM_DIRECT_PLACEMENT_RUNTIME_POLL_STALL] "
+                        "request_id=%d poll_iters=%d host_status=%d "
+                        "read_ready_chunks=%d/%d cache_ready_chunks=%d/%d "
+                        "consumable_chunks=%d/%d service_running=%s "
+                        "active_count=%d runtime_row=%s",
+                        int(getattr(runtime_snapshot, "request_id", 0)),
+                        int(kv_poll_snapshot.poll_iters),
+                        int(kv_poll_snapshot.host_status),
+                        int(snapshot.read_ready_chunks),
+                        len(snapshot.chunk_states),
+                        int(snapshot.cache_ready_chunks),
+                        len(snapshot.chunk_states),
+                        int(snapshot.consumable_chunks),
+                        len(snapshot.chunk_states),
+                        str(bool(getattr(runtime_snapshot,
+                                         "service_running", False))).lower(),
+                        int(getattr(runtime_snapshot, "active_count", 0)),
+                        (tuple(int(value) for value in runtime_row)
+                         if runtime_row is not None else None),
+                    )
+                except Exception:
+                    logger.debug(
+                        "[LMCACHE_BAM_DIRECT_PLACEMENT_RUNTIME_POLL_STALL] "
+                        "runtime snapshot unavailable",
+                        exc_info=True,
+                    )
             if frontier_advanced:
+                context_frontier_plan = in_flight_request.prefetch_frontier_plan
+                read_ready_context_tokens = self._context_frontier_tokens(
+                    context_frontier_plan,
+                    int(snapshot.read_ready_chunks),
+                )
+                cache_ready_context_tokens = self._context_frontier_tokens(
+                    context_frontier_plan,
+                    int(snapshot.cache_ready_chunks),
+                )
+                consumable_context_tokens = self._context_frontier_tokens(
+                    context_frontier_plan,
+                    int(snapshot.consumable_chunks),
+                )
                 logger.info(
                     "[LMCACHE_BAM_DIRECT_PLACEMENT_READ_FRONTIER] "
                     "launch_frontier_chunks=%d/%d "
@@ -2919,6 +2960,29 @@ class LMCacheBaMStore:
                     kv_poll_snapshot.poll_iters,
                     kv_poll_snapshot.host_status,
                 )
+                if context_frontier_plan is not None:
+                    logger.info(
+                        "[LMCACHE_BAM_GPU_INITIATED_PREFETCH_CONTEXT_FRONTIER] "
+                        "stage=poll granularity=%s read_ready_chunks=%d/%d "
+                        "read_ready_context_tokens=%d/%d "
+                        "cache_ready_chunks=%d/%d "
+                        "cache_ready_context_tokens=%d/%d "
+                        "consumable_chunks=%d/%d "
+                        "consumable_context_tokens=%d/%d",
+                        context_frontier_plan.granularity,
+                        int(snapshot.read_ready_chunks),
+                        context_frontier_plan.total_context_chunks,
+                        read_ready_context_tokens,
+                        context_frontier_plan.total_tokens,
+                        int(snapshot.cache_ready_chunks),
+                        context_frontier_plan.total_context_chunks,
+                        cache_ready_context_tokens,
+                        context_frontier_plan.total_tokens,
+                        int(snapshot.consumable_chunks),
+                        context_frontier_plan.total_context_chunks,
+                        consumable_context_tokens,
+                        context_frontier_plan.total_tokens,
+                    )
                 if kv_poll_snapshot.ready:
                     try:
                         ready_runtime_snapshot = (
@@ -3549,6 +3613,20 @@ class LMCacheBaMStore:
             active_chunk_slots = len(self._chunk_slots)
             metadata_entries = len(self._chunk_metadata)
             chunk_slot_evictions = int(self._chunk_slot_evictions)
+        context_frontier_plan = in_flight_request.prefetch_frontier_plan
+        context_total_chunks = (
+            int(context_frontier_plan.total_context_chunks)
+            if context_frontier_plan is not None else 0)
+        context_total_tokens = (
+            int(context_frontier_plan.total_tokens)
+            if context_frontier_plan is not None else 0)
+        context_consumable_chunks = (
+            min(int(return_snapshot.consumable_chunks), context_total_chunks)
+            if context_frontier_plan is not None else 0)
+        context_consumable_tokens = self._context_frontier_tokens(
+            context_frontier_plan,
+            int(return_snapshot.consumable_chunks),
+        )
         # 默认性能日志只需要这一行：它把当前 retrieve iter 的 BaM I/O、
         # direct-placement 和 cache 状态压缩到一个稳定格式里。更细的
         # READ/PROFILE/FRONTIER 日志仍保留在代码里，运行时通过
@@ -3558,6 +3636,8 @@ class LMCacheBaMStore:
             "total_bytes=%d submit_ms=%.3f poll_ms=%.3f poll_iters=%d "
             "get_ms=%.3f read_ms=%.3f place_ms=%.3f total_ms=%.3f "
             "executor=%s worker_backend=%s finalize_mode=%s "
+            "prefetch_frontier=%s context_consumable_chunks=%d/%d "
+            "context_consumable_tokens=%d/%d "
             "cache_size_mb=%d active_chunk_slots=%d chunk_capacity=%d "
             "metadata_entries=%d chunk_slot_evictions=%d",
             pipeline_name,
@@ -3574,6 +3654,11 @@ class LMCacheBaMStore:
             read_executor_name,
             read_worker_backend,
             read_finalize_mode,
+            ("context_chunk" if context_frontier_plan is not None else "none"),
+            context_consumable_chunks,
+            context_total_chunks,
+            context_consumable_tokens,
+            context_total_tokens,
             int(envs.VLLM_BAM_CACHE_SIZE_MB),
             active_chunk_slots,
             int(self.chunk_capacity),
@@ -3608,6 +3693,8 @@ class LMCacheBaMStore:
             request_chunks=in_flight_request.prefix_hit_chunks,
             request_tokens=total_tokens,
         )
+        self._schedule_runtime_idle_stop_if_enabled(
+            source="direct_placement_finalize")
         return ret_mask
 
     def start_direct_placement_request(
@@ -4085,10 +4172,10 @@ class LMCacheBaMStore:
         第一次 `get(key)` 进来时，再把这批 key 一次性走
         `load_chunk_tensors_kv_fast_path_batch()`，避免逐 key 串行 read/refill。
 
-        如果打开 `VLLM_BAM_GPU_INITIATED_PREFETCH=1`，这个函数仍然只负责登记；
-        后续 `flush_kv_fast_path_prefetch_batch()` 也只会把 pending key 整理成
-        prepared descriptor，不会提前 CPU submit。真正 native submit 仍保留在
-        direct placement request start 的统一边界上。
+        注意：GPU-initiated/direct-placement 主线已经不再消费这张 pending key
+        表。它只服务 `engine.prefetch()` 兼容路径下的 LMCache tensor batch
+        读取；真正 one-copy demand-load 会在 direct placement request start
+        内根据真实 prefix hit 现场生成 descriptor/frontier。
         """
         chunk_hash = _extract_chunk_hash(key)
         metadata = self._lookup_metadata(chunk_hash)
@@ -4222,17 +4309,47 @@ class LMCacheBaMStorageManager:
         atexit.register(self.close)
 
     def close(self) -> None:
-        """在 storage manager 生命周期结束时收口 BaM runtime。"""
+        """在 storage manager 生命周期结束时收口 BaM 与原生 LMCache 资源。
+
+        `LMCacheBaMStorageManager` 只是包在原生 LMCache storage manager 外面
+        的一层增强逻辑：BaM 负责 shadow / prefer-load，原始 storage manager 仍然
+        拥有 LMCache 自己的 backend、asyncio loop 和后台线程。因此 close 不能只
+        停 BaM runtime，还必须继续转发给被包装的 `_storage_manager.close()`。
+
+        如果这里不转发，`LMCacheEngine.close()` 看起来已经调用了
+        `storage_manager.close()`，但实际只进入 wrapper，原生 LMCache 的事件循环
+        线程不会 stop/join，benchmark 主进程就会在 summary 打印后继续挂住。
+        """
         if self._closed:
             return
         self._closed = True
-        if self._bam_store is None:
-            return
+
+        logger.info(
+            "[LMCACHE_BAM_STORAGE_MANAGER_CLOSE_BEGIN] has_bam_store=%s",
+            str(self._bam_store is not None).lower(),
+        )
+
+        # 先收 BaM runtime，再收原生 LMCache。这样可以保证：
+        # - BaM 侧不再持有新的 direct-placement / persistent-service 状态；
+        # - 即便 BaM close 失败，也不会跳过原生 LMCache 的 loop/thread 收口。
         try:
-            self._bam_store.close()
+            if self._bam_store is not None:
+                self._bam_store.close()
+            logger.info("[LMCACHE_BAM_STORAGE_MANAGER_CLOSE_BAM_DONE]")
         except Exception:
             logger.exception(
                 "[LMCACHE_BAM_RUNTIME_IDLE_STOP] failed during manager.close")
+        finally:
+            original_close = getattr(self._storage_manager, "close", None)
+            if original_close is not None:
+                try:
+                    original_close()
+                    logger.info(
+                        "[LMCACHE_BAM_STORAGE_MANAGER_CLOSE_ORIGINAL_DONE]")
+                except Exception:
+                    logger.exception(
+                        "[LMCACHE_BAM_STORAGE_MANAGER_CLOSE_ORIGINAL_FAILED]")
+                    raise
 
     def __del__(self) -> None:
         try:
@@ -4430,52 +4547,6 @@ class LMCacheBaMStorageManager:
         prefetch = getattr(self._storage_manager, "prefetch", None)
         if prefetch is not None:
             prefetch(key)
-
-    def flush_bam_gpu_initiated_prefetch(self) -> int:
-        """把本轮 LMCache prefetch key flush 成 KV descriptor plan。
-
-        这个方法是 connector 层唯一需要知道的新接口。它刻意放在
-        storage-manager wrapper 上，而不是让 connector 直接访问
-        `LMCacheBaMStore`：
-
-        - connector 只负责在合适的时机触发“prefetch 阶段结束”；
-        - BaM wrapper 自己决定是否已启用 descriptor prefetch 分支；
-        - 未启用或 BaM store 尚未初始化时直接 no-op。
-        """
-        if not (envs.VLLM_BAM_LMCACHE_PREFER_LOAD_ENABLE
-                and envs.VLLM_BAM_KV_FAST_PATH
-                and envs.VLLM_BAM_GPU_INITIATED_PREFETCH
-                and not self._bam_prefer_load_disabled
-                and self._bam_store is not None):
-            return 0
-        return self._bam_store.flush_kv_fast_path_prefetch_batch()
-
-    def stage_bam_gpu_initiated_prefetch_plan(
-        self,
-        *,
-        token_database: Any,
-        tokens: torch.Tensor,
-        mask: Optional[torch.Tensor],
-        source: str,
-    ) -> int:
-        """登记 connector/scheduler-level 的 BaM KV descriptor 计划。
-
-        这个入口是上层唯一需要调用的薄接口。它不暴露 BaM store 内部结构，只把
-        “本轮预计会 retrieve 的 tokens/mask”交给 store，用 direct placement
-        同源规则生成 key 并准备 descriptor。这里不会发起 native submit。
-        """
-        if not (envs.VLLM_BAM_LMCACHE_PREFER_LOAD_ENABLE
-                and envs.VLLM_BAM_KV_FAST_PATH
-                and envs.VLLM_BAM_GPU_INITIATED_PREFETCH
-                and not self._bam_prefer_load_disabled
-                and self._bam_store is not None):
-            return 0
-        return self._bam_store.stage_kv_fast_path_prefetch_plan(
-            token_database=token_database,
-            tokens=tokens,
-            mask=mask,
-            source=source,
-        )
 
     def _maybe_verify_prefer_load_tensor(self, key: Any,
                                          bam_tensor: torch.Tensor) -> None:

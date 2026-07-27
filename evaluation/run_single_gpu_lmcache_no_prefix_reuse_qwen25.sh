@@ -174,6 +174,7 @@ elif [[ "${VLLM_BAM_KV_BRANCH_VALUE}" == "gpu_worker_persistent_one_copy" ]]; th
 else
   GIDS_KV_GPU_WORKER_MOVER_CTAS_VALUE="0"
 fi
+GIDS_KV_GPU_WORKER_MODE_VALUE="${GIDS_KV_GPU_WORKER_MODE:-dedicated}"
 BAM_PREFLIGHT_VALUE="${BAM_PREFLIGHT:-0}"
 
 # BaM 读写路径都可能需要更高权限。只有显式打开 BaM 相关路径时才自动提权，
@@ -235,6 +236,7 @@ if [[ ( "${VLLM_BAM_LMCACHE_SHADOW_ENABLE_VALUE}" == "1" || \
     "GIDS_KV_GPU_WORKER_RUNTIME_ENABLE=${GIDS_KV_GPU_WORKER_RUNTIME_ENABLE_VALUE}"
     "GIDS_KV_GPU_WORKER_PERSISTENT_ENABLE=${GIDS_KV_GPU_WORKER_PERSISTENT_ENABLE_VALUE}"
     "GIDS_KV_GPU_WORKER_MOVER_CTAS=${GIDS_KV_GPU_WORKER_MOVER_CTAS_VALUE}"
+    "GIDS_KV_GPU_WORKER_MODE=${GIDS_KV_GPU_WORKER_MODE_VALUE}"
     "BAM_PREFLIGHT=${BAM_PREFLIGHT_VALUE}"
     "BAM_LIB_DIR=${BAM_LIB_DIR_VALUE}"
     "LD_LIBRARY_PATH=${BAM_LIB_DIR_VALUE}:${LD_LIBRARY_PATH:-}"
@@ -295,6 +297,7 @@ export GIDS_KV_WAIT_TIMEOUT_S="${GIDS_KV_WAIT_TIMEOUT_S_VALUE}"
 export GIDS_KV_GPU_WORKER_RUNTIME_ENABLE="${GIDS_KV_GPU_WORKER_RUNTIME_ENABLE_VALUE}"
 export GIDS_KV_GPU_WORKER_PERSISTENT_ENABLE="${GIDS_KV_GPU_WORKER_PERSISTENT_ENABLE_VALUE}"
 export GIDS_KV_GPU_WORKER_MOVER_CTAS="${GIDS_KV_GPU_WORKER_MOVER_CTAS_VALUE}"
+export GIDS_KV_GPU_WORKER_MODE="${GIDS_KV_GPU_WORKER_MODE_VALUE}"
 export DIRECT_RETRIEVE_PREWARM_AFTER_REQUEST1="${DIRECT_RETRIEVE_PREWARM_AFTER_REQUEST1}"
 export PROMPT_REUSE_REQUEST1="${PROMPT_REUSE_REQUEST1}"
 export LD_LIBRARY_PATH="${BAM_LIB_DIR_VALUE}:${LD_LIBRARY_PATH:-}"
@@ -393,6 +396,7 @@ echo "[single-gpu-lmcache-no-prefix-reuse] gids_kv_wait_timeout_s=${GIDS_KV_WAIT
 echo "[single-gpu-lmcache-no-prefix-reuse] gids_kv_gpu_worker_runtime_enable=${GIDS_KV_GPU_WORKER_RUNTIME_ENABLE_VALUE}"
 echo "[single-gpu-lmcache-no-prefix-reuse] gids_kv_gpu_worker_persistent_enable=${GIDS_KV_GPU_WORKER_PERSISTENT_ENABLE_VALUE}"
 echo "[single-gpu-lmcache-no-prefix-reuse] gids_kv_gpu_worker_mover_ctas=${GIDS_KV_GPU_WORKER_MOVER_CTAS_VALUE}"
+echo "[single-gpu-lmcache-no-prefix-reuse] gids_kv_gpu_worker_mode=${GIDS_KV_GPU_WORKER_MODE_VALUE}"
 echo "[single-gpu-lmcache-no-prefix-reuse] bam_preflight=${BAM_PREFLIGHT_VALUE}"
 echo "[single-gpu-lmcache-no-prefix-reuse] bam_lib_dir=${BAM_LIB_DIR_VALUE}"
 echo "[single-gpu-lmcache-no-prefix-reuse] prompt_repeat=${PROMPT_REPEAT}"

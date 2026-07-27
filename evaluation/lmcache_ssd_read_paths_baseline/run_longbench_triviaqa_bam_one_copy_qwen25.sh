@@ -60,6 +60,7 @@ GIDS_FORCE_SYNC_READ_VALUE="${GIDS_FORCE_SYNC_READ:-1}"
 GIDS_KV_DEBUG_VALUE="${GIDS_KV_DEBUG:-0}"
 GIDS_KV_WAIT_TIMEOUT_S_VALUE="${GIDS_KV_WAIT_TIMEOUT_S:-10}"
 GIDS_KV_GPU_WORKER_MOVER_CTAS_VALUE="${GIDS_KV_GPU_WORKER_MOVER_CTAS:-4}"
+GIDS_KV_GPU_WORKER_MODE_VALUE="${GIDS_KV_GPU_WORKER_MODE:-dedicated}"
 LONGBENCH_DEBUG_LOG_VALUE="${LONGBENCH_DEBUG_LOG:-0}"
 
 mkdir -p "${RUN_DIR_VALUE}"
@@ -109,6 +110,7 @@ if [[ "${EUID}" -ne 0 ]]; then
     "GIDS_KV_DEBUG=${GIDS_KV_DEBUG_VALUE}" \
     "GIDS_KV_WAIT_TIMEOUT_S=${GIDS_KV_WAIT_TIMEOUT_S_VALUE}" \
     "GIDS_KV_GPU_WORKER_MOVER_CTAS=${GIDS_KV_GPU_WORKER_MOVER_CTAS_VALUE}" \
+    "GIDS_KV_GPU_WORKER_MODE=${GIDS_KV_GPU_WORKER_MODE_VALUE}" \
     "LONGBENCH_DEBUG_LOG=${LONGBENCH_DEBUG_LOG_VALUE}" \
     "PYTHONPATH=${PYTHONPATH:-}" \
     "LD_LIBRARY_PATH=${BAM_LIB_DIR_VALUE}:${LD_LIBRARY_PATH:-}" \
@@ -121,6 +123,7 @@ echo "[longbench-triviaqa-bam-one-copy] log_file=${LOG_FILE_VALUE}"
 echo "[longbench-triviaqa-bam-one-copy] metrics_jsonl=${METRICS_JSONL_VALUE}"
 echo "[longbench-triviaqa-bam-one-copy] lmcache_local_disk=${LMCACHE_LOCAL_DISK_VALUE}"
 echo "[longbench-triviaqa-bam-one-copy] mover_ctas=${GIDS_KV_GPU_WORKER_MOVER_CTAS_VALUE}"
+echo "[longbench-triviaqa-bam-one-copy] worker_mode=${GIDS_KV_GPU_WORKER_MODE_VALUE}"
 echo "[longbench-triviaqa-bam-one-copy] shadow_chunks=${VLLM_BAM_LMCACHE_SHADOW_CHUNKS_VALUE}"
 echo "[longbench-triviaqa-bam-one-copy] gpu_initiated_prefetch=${VLLM_BAM_GPU_INITIATED_PREFETCH_VALUE}"
 echo "[longbench-triviaqa-bam-one-copy] runtime_idle_stop_seconds=${VLLM_BAM_RUNTIME_IDLE_STOP_SECONDS_VALUE}"
@@ -172,6 +175,7 @@ export GIDS_KV_WAIT_TIMEOUT_S="${GIDS_KV_WAIT_TIMEOUT_S_VALUE}"
 export GIDS_KV_GPU_WORKER_RUNTIME_ENABLE=1
 export GIDS_KV_GPU_WORKER_PERSISTENT_ENABLE=1
 export GIDS_KV_GPU_WORKER_MOVER_CTAS="${GIDS_KV_GPU_WORKER_MOVER_CTAS_VALUE}"
+export GIDS_KV_GPU_WORKER_MODE="${GIDS_KV_GPU_WORKER_MODE_VALUE}"
 export LONGBENCH_DEBUG_LOG="${LONGBENCH_DEBUG_LOG_VALUE}"
 
 # 确保 GDS wrapper 不干扰 BaM one-copy 对照。

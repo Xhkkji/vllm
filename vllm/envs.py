@@ -537,6 +537,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: int(
         os.getenv("VLLM_BAM_DIRECT_PLACEMENT_DEFER_MIN_POLLS", "0")),
 
+    # one-copy direct placement 的可关闭同步实验点。
+    #
+    # 打开后，runtime cleanup-only finalize 返回前会等待 request 级
+    # metadata_ready_flag。这个开关用于定位 normal hot path 下：
+    #
+    #   GPU persistent service 发布 CONSUMED
+    #     -> vLLM attention 立刻消费 paged KV cache / metadata
+    #
+    # 之间的可见性 race。默认关闭，避免影响正式性能口径。
+    "VLLM_BAM_DIRECT_PLACEMENT_CONSUME_FENCE":
+    lambda: bool(
+        int(os.getenv("VLLM_BAM_DIRECT_PLACEMENT_CONSUME_FENCE", "0"))),
+
     # 测试/benchmark 用的临时 idle-stop 开关。
     #
     # 默认 0 表示保持 persistent service 常驻，不改变正常服务模式。

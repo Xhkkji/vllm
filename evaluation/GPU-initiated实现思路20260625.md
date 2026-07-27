@@ -1,7 +1,7 @@
 # GPU-initiated BaM 实现思路
 
 日期：2026-06-25
-最近整理：2026-07-26
+最近整理：2026-07-27
 
 本文只保留当前 `vllm-bam` 中与 LMCache / vLLM KVCache 主线直接相关、并且仍有工程价值的实现思路。
 目标不是记录所有历史尝试，而是回答下面四个问题：
@@ -16,7 +16,7 @@
 建议阅读顺序：
 
 ```text
-1. 先看“1. 当前主线结论”
+1. 先看“1. 当前主线结论”和“1.-1 2026-07-27 one-copy 最新修正结论”
 2. 再看“3. 当前真实数据通路”
 3. 再看“4. 当前异步/轮询逻辑到底是什么”
 4. 再看“14. 相关 SSD/KVCache 工作的评测数据集与后续 baseline 选择”
@@ -26,6 +26,222 @@
 ---
 
 ## 1. 当前主线结论
+
+### 1.-1 2026-07-27 one-copy 最新修正结论
+
+截至 2026-07-27，`gpu_worker_persistent_one_copy` 不能再简单视为
+no-debug 条件下的稳定正确基线。
+
+最新排查结论是：
+
+```text
+one-copy 数据面确实触发了 BaM -> vLLM paged KV cache 的 direct placement；
+prefix hit / runtime attach / runtime ready / deferred retrieve done 都能正常出现；
+但在 GIDS_KV_DEBUG=0 的 normal hot path 下，write/read 文本级一致性不稳定。
+
+GIDS_KV_DEBUG=1 会把结果从 1/4 exact 改成 4/4 exact；
+VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE=1 单独打开不能修复。
+
+因此当前问题不是“没有命中 prefix cache”，也不是“没有触发 KV read/write”，
+而是 native KV worker runtime / one-copy direct placement 的时序或同步边界问题。
+```
+
+本轮使用的核心测试条件：
+
+```text
+dataset:
+  LongBench TriviaQA
+bucket:
+  4k_8k
+model:
+  Qwen2.5-7B-Instruct
+pipeline:
+  gpu_worker_persistent_one_copy
+cache_size_mb:
+  1024
+chunk_capacity:
+  128
+NUM_SAMPLES:
+  4
+REPEAT_READ:
+  1
+MAX_TOKENS:
+  32
+```
+
+#### 现象 1：no-debug 复现 mismatch
+
+日志：
+
+```text
+evaluation/lmcache_ssd_read_paths_baseline/logs_longbench_triviaqa/bam_one_copy_nodebug_4samples_cap128/20260727_170804/run.log
+evaluation/lmcache_ssd_read_paths_baseline/logs_longbench_triviaqa/bam_one_copy_nodebug_4samples_cap128/20260727_170804/metrics.jsonl
+```
+
+结果：
+
+```text
+exact_pairs=1/4
+answer_hits=8/8
+```
+
+判断：
+
+```text
+1. 4 个样本的 answer substring 都命中；
+2. 但 4 组里只有第 4 组 write/read generated_text 逐字一致；
+3. 前 3 组 read 的答案开头正确，后续 Passage 文本漂移；
+4. 这说明当前问题不是完全读不到 KV，
+   更像是 prefix KV / metadata / stream visibility 的部分时序不一致。
+```
+
+关键链路信号：
+
+```text
+pipeline=gpu_worker_persistent_one_copy
+finalize_mode=runtime_direct
+chunk_capacity=128
+active_chunk_slots=73
+chunk_slot_evictions=0
+prefix_hit_chunks=16/17
+ret_mask_tokens=4096/4352
+RUNTIME_ATTACH present
+RUNTIME_READY present
+DEFERRED_RETRIEVE_DONE present
+```
+
+因此不能把文本差异解释为“没命中前缀缓存”或“没有触发 KV 读写”。
+
+#### 现象 2：完整 debug 版本通过
+
+日志：
+
+```text
+evaluation/lmcache_ssd_read_paths_baseline/logs_longbench_triviaqa/bam_one_copy_debug_4samples_cap128/20260727_170357/run.log
+evaluation/lmcache_ssd_read_paths_baseline/logs_longbench_triviaqa/bam_one_copy_debug_4samples_cap128/20260727_170357/metrics.jsonl
+```
+
+结果：
+
+```text
+exact_pairs=4/4
+answer_hits=8/8
+```
+
+这说明：
+
+```text
+1. chunk_capacity=128 本身不是充分复现条件；
+2. active_chunk_slots 到 73 时也可以正确；
+3. debug / verify 组合会改变时序，使 race 被掩盖。
+```
+
+#### 现象 3：隔离开关定位到 GIDS_KV_DEBUG
+
+只开 runtime write verify：
+
+```text
+evaluation/lmcache_ssd_read_paths_baseline/logs_longbench_triviaqa/bam_one_copy_isolate_runtime_verify_4samples_cap128/20260727_172108/metrics.jsonl
+
+GIDS_KV_DEBUG=0
+GIDS_KV_REF_DEBUG=0
+VLLM_BAM_DIRECT_RETRIEVE_SLOT_BLOCK_ALIGN_VERIFY=0
+VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE=1
+
+exact_pairs=1/4
+answer_hits=8/8
+```
+
+只开 GIDS_KV_DEBUG：
+
+```text
+evaluation/lmcache_ssd_read_paths_baseline/logs_longbench_triviaqa/bam_one_copy_isolate_gids_debug_4samples_cap128/20260727_172512/metrics.jsonl
+
+GIDS_KV_DEBUG=1
+GIDS_KV_REF_DEBUG=0
+VLLM_BAM_DIRECT_RETRIEVE_SLOT_BLOCK_ALIGN_VERIFY=0
+VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE=0
+
+exact_pairs=4/4
+answer_hits=8/8
+```
+
+结论：
+
+```text
+VLLM_BAM_DIRECT_PLACEMENT_VERIFY_RUNTIME_WRITE=1 不是关键同步来源；
+GIDS_KV_DEBUG=1 是关键差异。
+
+GIDS_KV_DEBUG 不只是打印日志，它会触发 native runtime 路径里的
+KV_RUNTIME_DIRECT_PLACE_PROBE、状态观测以及额外 stream/device sync 副作用。
+这些副作用很可能把 normal hot path 的 race 等住了。
+```
+
+#### 当前根因判断
+
+当前根因应优先收敛到：
+
+```text
+BaM_IOStack/gids_module/gids_nvme.cu
+  GPU persistent service 标记 cache_ready / consumable 的时机
+  direct placement 写入 vLLM paged KV cache 的可见性
+  host poll 看到 RUNTIME_READY 后进入 vLLM forward 的同步边界
+  cleanup / retire 与后续 attention 消费之间的 stream ordering
+```
+
+暂时不应优先怀疑：
+
+```text
+1. LMCache 没命中 prefix；
+2. ret_mask 完全没返回；
+3. BaM cache 容量不够；
+4. chunk_slot_evictions；
+5. direct_placement_finalize 分支；
+6. runtime write verify repair 分支。
+```
+
+#### 下一步建议
+
+下一步不要继续扩大 debug 开关，而是增加一个最小、可控、可关闭的同步实验开关。
+
+建议优先验证两个位置：
+
+```text
+位置 A：
+  native persistent worker 在完成 direct placement 写入后、
+  写 cache_ready / consumable / host_status=READY 前，
+  增加最小 stream/event ordering。
+
+位置 B：
+  host poll 看到 RUNTIME_READY 后、
+  finalize 返回给 vLLM attention 消费前，
+  等待对应 runtime stream/event，而不是依赖 GIDS_KV_DEBUG 的 probe/sync 副作用。
+```
+
+验证标准：
+
+```text
+1. GIDS_KV_DEBUG=0；
+2. 不打开 raw verify / alignment verify；
+3. 仍使用 4 samples + cap128；
+4. exact_pairs 从 1/4 恢复为 4/4；
+5. read_ms / poll_ms 不因全设备同步明显退化。
+```
+
+在修复前，当前正确性口径应调整为：
+
+```text
+rowctx_baseline:
+  正确性 oracle
+
+gpu_worker_persistent_materialized:
+  当前默认可靠 fast path / 回归口径
+
+gpu_worker_persistent_one_copy:
+  当前目标实验线；
+  no-debug hot path 存在同步 race；
+  只能作为待修复路径，不能作为最终正确性结论。
+```
 
 截至 2026-07-23，当前主线可以概括成一句话：
 

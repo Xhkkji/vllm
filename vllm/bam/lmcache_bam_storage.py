@@ -36,10 +36,9 @@ from vllm.bam.lmcache_bam_direct_placement import (
     _DIRECT_FRONTIER_COL_READ_READY, _DIRECT_FRONTIER_COL_STATUS,
     _DIRECT_FRONTIER_COL_TOTAL, BaMDirectKVPlacer,
     BaMRuntimeAttentionMetadataAttachment, BaMRuntimeDirectPlacementAttachment,
-    BaMDirectPlacementBatchDescriptor,
-    BaMDirectPlacementBatchStateSnapshot, BaMDirectPlacementChunkDescriptor,
-    BaMDirectPlacementExecution, BaMDirectPlacementFrontierSnapshot,
-    BaMDirectPlacementStateTracker,
+    BaMDirectPlacementBatchDescriptor, BaMDirectPlacementBatchStateSnapshot,
+    BaMDirectPlacementChunkDescriptor, BaMDirectPlacementExecution,
+    BaMDirectPlacementFrontierSnapshot, BaMDirectPlacementStateTracker,
     prepare_bam_results_for_vllm_kvcache)
 from vllm.bam.lmcache_bam_kv_fast_path import (
     LMCacheBaMKVFastPath, LMCacheBaMPrefetchFrontierPlan)
@@ -79,6 +78,31 @@ def _should_log_kv_runtime_poll_debug(poll_iters: int) -> bool:
         every = 1000
     every = max(every, 1)
     return poll_iters <= 5 or poll_iters % every == 0
+
+
+def _wait_runtime_metadata_ready_for_consume(
+    *,
+    ready_flag: torch.Tensor,
+    timeout_s: float,
+) -> float:
+    """等待 runtime one-copy 发布 request 级 metadata 可消费信号。
+
+    这个 helper 只由 `VLLM_BAM_DIRECT_PLACEMENT_CONSUME_FENCE=1` 启用。
+    它是一个有意保守的同步实验点：host 等到 persistent GPU worker 写出的
+    `metadata_ready_flag` 后，再让上层返回 `ready_forward`。如果这能恢复
+    no-debug 正确性，就说明 race 位于 one-copy publish/consume 边界。
+    """
+    wait_start = time.perf_counter()
+    deadline = wait_start + max(float(timeout_s), 0.0)
+    poll_interval_s = 0.0005
+    while True:
+        if int(ready_flag.item()) != 0:
+            return (time.perf_counter() - wait_start) * 1000.0
+        if time.perf_counter() > deadline:
+            raise TimeoutError(
+                "Timed out waiting runtime direct placement consume fence: "
+                f"timeout_s={timeout_s:.3f}")
+        time.sleep(poll_interval_s)
 
 
 # 固定使用 128KB 物理页。
@@ -438,17 +462,11 @@ class _InFlightDirectPlacementRequest:
     runtime_attention_metadata_attached: bool = False
     runtime_attention_metadata_attachment: (
         BaMRuntimeAttentionMetadataAttachment | None) = None
-    # 这两个字段用来向上层 adapter 显式发布一个更“硬”的 request 级语义：
+    # 这两个字段向 LMCache adapter 发布 request 级完成语义。
     #
-    # - 不是“某个中间 metadata_ready_flag 是否正好被前台读成 1”
-    # - 而是“这次 request 是否已经由 runtime direct 主线完整收口，且 metadata
-    #    workspace 可以和 ret_mask 一起被直接消费”
-    #
-    # 当前只要走到 cleanup-only runtime direct finalize，且这条请求确实挂上了
-    # runtime attention metadata attachment，就把这层语义置为 True。
-    #
-    # 这样上层 adapter 的 fast path 判定就能统一绑定到 request completion 主线，
-    # 不需要再额外跨到另一套 `metadata_ready_flag.item()` 的只读检查上。
+    # adapter 仍依赖它判断 runtime direct cleanup-only finalize 后，metadata
+    # workspace 是否可按 request completion 直接消费。不能只看单个
+    # metadata_ready_flag，否则容易和 runtime 发布顺序脱节。
     runtime_metadata_fast_path_authoritative: bool = False
     runtime_metadata_consumable_tokens: int = 0
     # runtime cleanup-only 主线下，`kv_read_handle` 会在 read consume 收口后清空，
@@ -550,7 +568,7 @@ class LMCacheBaMStore:
         # benchmark/排障用的 idle-stop watchdog。
         #
         # 正常服务模式需要 persistent service 常驻，因此默认不开启。只有设置
-        # `VLLM_BAM_RUNTIME_IDLE_STOP_SECONDS > 0` 时，才会在每次 KV IO 完成后
+        # `VLLM_BAM_RUNTIME_IDLE_STOP_SECONDS > 0` 时，才会在 store close 阶段
         # 安排一个延迟检查：如果这段时间内没有新 IO，就尝试停掉空转的 GPU
         # persistent service，避免一次性测试脚本在退出阶段被 resident kernel
         # 拖住。这里使用 generation 而不是简单 timer，是为了避免旧 timer 把
@@ -3177,6 +3195,21 @@ class LMCacheBaMStore:
             raise RuntimeError(
                 "runtime direct placement did not reach cleanup-only "
                 "completion")
+        if envs.VLLM_BAM_DIRECT_PLACEMENT_CONSUME_FENCE:
+            attachment = in_flight_request.runtime_attention_metadata_attachment
+            if attachment is None:
+                raise RuntimeError(
+                    "runtime direct placement consume fence requested, but "
+                    "attention metadata attachment is missing")
+            fence_wait_ms = _wait_runtime_metadata_ready_for_consume(
+                ready_flag=attachment.metadata_ready_flag,
+                timeout_s=float(envs.VLLM_ENGINE_ITERATION_TIMEOUT_S),
+            )
+            logger.info(
+                "[LMCACHE_BAM_DIRECT_PLACEMENT_CONSUME_FENCE] "
+                "wait_ms=%.3f",
+                fence_wait_ms,
+            )
         self._mark_direct_read_ready_and_log(
             in_flight_request=in_flight_request,
             ready_chunks=in_flight_request.prefix_hit_chunks,
@@ -3461,8 +3494,8 @@ class LMCacheBaMStore:
         state_tracker = in_flight_request.state_tracker
         read_outcome = self._consume_direct_placement_read_request(
             in_flight_request=in_flight_request)
-        # 每次 finalize 都先把“本次 request 对上层是否可直接信任 runtime
-        # metadata”重置掉，避免旧 request 某轮留下的状态混到新一轮判断中。
+        # 每次 finalize 都先重置 request 级 metadata 完成语义，避免旧请求状态
+        # 混到新一轮判断中。
         in_flight_request.runtime_metadata_fast_path_authoritative = False
         in_flight_request.runtime_metadata_consumable_tokens = 0
         read_finalize_mode = str(read_outcome.read_finalize_mode)
@@ -3489,24 +3522,8 @@ class LMCacheBaMStore:
         )
         ret_mask_ms = (time.perf_counter() - ret_mask_start) * 1000.0
         return_snapshot = first_wave_snapshot
-        # 只有 runtime direct cleanup-only 这条主线，才能说明：
-        #
-        # 1. GPU persistent service 已经完成
-        #      BaM cache -> vLLM KV cache
-        # 2. 并且与这条 request 绑定的 attention metadata workspace 也应该已经
-        #    处于“可直接消费”的完成态
-        #
-        # 因此这里把“可直接走 runtime metadata fast path”的 authoritative
-        # request-level 语义显式发布给上层，而不再让 adapter 去额外猜测
-        # 某个中间 ready_flag 是否恰好被读成 1。
         if (in_flight_request.runtime_direct_placement_attached and
                 read_finalize_mode == _DIRECT_FINALIZE_MODE_RUNTIME_DIRECT):
-            # `runtime_metadata_consumable_tokens` 的发布不应再绑死在 metadata
-            # attachment 是否启用上。
-            #
-            # 原因是当前默认主线里，这条 metadata attachment 实验支线本来就是关的；
-            # 但即便如此，我们仍然需要把“这次 request 实际已经恢复了多少连续
-            # prefix token”稳定发布给上层日志/调试口径。
             in_flight_request.runtime_metadata_consumable_tokens = int(
                 return_snapshot.consumable_tokens)
         if (in_flight_request.runtime_direct_placement_attached and
@@ -3693,8 +3710,6 @@ class LMCacheBaMStore:
             request_chunks=in_flight_request.prefix_hit_chunks,
             request_tokens=total_tokens,
         )
-        self._schedule_runtime_idle_stop_if_enabled(
-            source="direct_placement_finalize")
         return ret_mask
 
     def start_direct_placement_request(
@@ -4119,20 +4134,7 @@ class LMCacheBaMStore:
         in_flight_request: _InFlightDirectPlacementRequest,
         attachment: BaMRuntimeAttentionMetadataAttachment,
     ) -> bool:
-        """把单条 sequence 的 attention metadata workspace 挂到 live request 上。
-
-        当前主线刻意把“数据搬运目标”和“attention metadata workspace”拆成两份
-        attachment，原因是两者虽然都由同一个 persistent service CTA 消费，但
-        职责完全不同：
-
-        - direct placement attachment:
-          描述 `BaM cache -> vLLM paged KV cache` 的最终写入目标
-        - attention metadata attachment:
-          描述 finalize 后当前 sequence 要给 attention / sampling 使用的元数据
-
-        这样后续继续清理旧的前台 rebuild 逻辑时，就不需要把两种语义重新揉回
-        一个大结构里。
-        """
+        """把单条 sequence 的 attention metadata workspace 挂到 live request 上。"""
         kv_read_handle = in_flight_request.kv_read_handle
         if kv_read_handle is None:
             return False

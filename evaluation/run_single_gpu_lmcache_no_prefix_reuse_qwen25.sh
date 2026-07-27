@@ -466,6 +466,7 @@ prompt_target_margin = int(os.environ.get("PROMPT_TARGET_MARGIN", "96"))
 prompt_reuse_request1_env = os.environ.get("PROMPT_REUSE_REQUEST1", "").strip()
 direct_retrieve_prewarm_after_request1 = int(
     os.environ.get("DIRECT_RETRIEVE_PREWARM_AFTER_REQUEST1", "0"))
+kv_branch = os.environ.get("VLLM_BAM_KV_BRANCH", "rowctx_baseline").strip()
 
 
 @contextlib.contextmanager
@@ -617,6 +618,7 @@ def _build_prompts():
 
 
 prompt_a, prompt_b = _build_prompts()
+request_metrics = []
 
 if prompt_reuse_request1:
     # 为了明确验证 BaM/LMCache 读回链路，这里让第二个请求复用第一个请求的长 prompt。
@@ -654,9 +656,27 @@ with build_llm() as llm:
         start = time.time()
         outputs = llm.generate(prompt, sampling_params)
         elapsed = time.time() - start
+        output_text = outputs[0].outputs[0].text
+        output_token_ids = getattr(outputs[0].outputs[0], "token_ids", None)
+        output_tokens = (
+            len(output_token_ids) if output_token_ids is not None else -1)
+        output_chars = len(output_text)
+        request_metrics.append({
+            "idx": idx,
+            "elapsed": elapsed,
+            "output_chars": output_chars,
+            "output_tokens": output_tokens,
+        })
         print(f"===== request {idx} =====")
-        print(outputs[0].outputs[0].text)
+        print(output_text)
         print(f"[baseline] request_{idx}_elapsed_s={elapsed:.4f}")
+        if kv_branch == "gpu_worker_persistent_one_copy":
+            print(
+                "[gpu_worker_persistent_one_copy] "
+                f"request_{idx}_elapsed_s={elapsed:.4f} "
+                f"output_chars={output_chars} "
+                f"output_tokens={output_tokens}"
+            )
         print()
 
         # 把 direct placement / fused kernel 的首次 warmup 提前到正式测量请求之前。
@@ -676,4 +696,20 @@ with build_llm() as llm:
                 "[prewarm] direct_retrieve_after_request1_elapsed_s="
                 f"{prewarm_elapsed:.4f}")
             print()
+
+    if kv_branch == "gpu_worker_persistent_one_copy" and request_metrics:
+        fields = [
+            f"request_{item['idx']}_elapsed_s={item['elapsed']:.4f}"
+            for item in request_metrics
+        ]
+        if len(request_metrics) >= 2 and request_metrics[1]["elapsed"] > 0:
+            fields.append(
+                "request_1_over_request_2="
+                f"{request_metrics[0]['elapsed'] / request_metrics[1]['elapsed']:.3f}"
+            )
+        print(
+            "[gpu_worker_persistent_one_copy_summary] "
+            "pipeline=gpu_worker_persistent_one_copy "
+            + " ".join(fields)
+        )
 PY

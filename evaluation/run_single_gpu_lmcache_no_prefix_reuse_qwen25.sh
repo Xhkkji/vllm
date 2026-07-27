@@ -69,29 +69,9 @@ VLLM_BAM_LMCACHE_SHADOW_CHUNKS_VALUE="${VLLM_BAM_LMCACHE_SHADOW_CHUNKS:-1024}"
 VLLM_BAM_KV_FAST_PATH_VALUE="${VLLM_BAM_KV_FAST_PATH:-1}"
 VLLM_BAM_DIRECT_PLACEMENT_VALUE="${VLLM_BAM_DIRECT_PLACEMENT:-1}"
 VLLM_BAM_DIRECT_PLACEMENT_IMPL_VALUE="${VLLM_BAM_DIRECT_PLACEMENT_IMPL:-fused}"
-# 当前 KV 路径只保留三条工程分支。用户层只需要选择分支名，底层
-# executor / runtime / persistent / one-copy 开关都从这里派生，避免出现
-# “executor 是 gpu_worker，但 persistent 没开”这类半配置状态。
-#
-# 兼容性：若外部没有设置 `VLLM_BAM_KV_BRANCH`，仍会根据旧低层变量推断
-# 分支，这样历史命令不会立刻失效；但推荐新命令只传分支名。
-VLLM_BAM_KV_BRANCH_VALUE="${VLLM_BAM_KV_BRANCH:-}"
-if [[ -z "${VLLM_BAM_KV_BRANCH_VALUE}" ]]; then
-  LEGACY_KV_EXECUTOR="${VLLM_BAM_KV_EXECUTOR:-rowctx}"
-  LEGACY_RUNTIME_ENABLE="${GIDS_KV_GPU_WORKER_RUNTIME_ENABLE:-0}"
-  LEGACY_PERSISTENT_ENABLE="${GIDS_KV_GPU_WORKER_PERSISTENT_ENABLE:-0}"
-  LEGACY_ONE_COPY="${VLLM_BAM_DIRECT_PLACEMENT_RUNTIME_ONE_COPY:-0}"
-  LEGACY_REQUIRE_ONE_COPY="${VLLM_BAM_DIRECT_PLACEMENT_REQUIRE_RUNTIME_ONE_COPY:-0}"
-  if [[ "${LEGACY_ONE_COPY}" == "1" || "${LEGACY_REQUIRE_ONE_COPY}" == "1" ]]; then
-    VLLM_BAM_KV_BRANCH_VALUE="gpu_worker_persistent_one_copy"
-  elif [[ "${LEGACY_KV_EXECUTOR}" == "gpu_worker" || \
-          "${LEGACY_RUNTIME_ENABLE}" == "1" || \
-          "${LEGACY_PERSISTENT_ENABLE}" == "1" ]]; then
-    VLLM_BAM_KV_BRANCH_VALUE="gpu_worker_persistent_materialized"
-  else
-    VLLM_BAM_KV_BRANCH_VALUE="rowctx_baseline"
-  fi
-fi
+# 分支名是唯一的用户层选择开关；executor/runtime/persistent/one-copy 均由
+# 分支派生，避免旧底层变量组合出互相矛盾的半配置状态。
+VLLM_BAM_KV_BRANCH_VALUE="${VLLM_BAM_KV_BRANCH:-rowctx_baseline}"
 
 case "${VLLM_BAM_KV_BRANCH_VALUE}" in
   rowctx_baseline)
@@ -165,16 +145,17 @@ VLLM_BAM_CTRL_IDX_VALUE="${VLLM_BAM_CTRL_IDX:-0}"
 GIDS_FORCE_SYNC_READ_VALUE="${GIDS_FORCE_SYNC_READ:-1}"
 GIDS_KV_DEBUG_VALUE="${GIDS_KV_DEBUG:-0}"
 GIDS_KV_WAIT_TIMEOUT_S_VALUE="${GIDS_KV_WAIT_TIMEOUT_S:-10}"
-if [[ -n "${GIDS_KV_GPU_WORKER_MOVER_CTAS:-}" ]]; then
-  GIDS_KV_GPU_WORKER_MOVER_CTAS_VALUE="${GIDS_KV_GPU_WORKER_MOVER_CTAS}"
-elif [[ "${VLLM_BAM_KV_BRANCH_VALUE}" == "gpu_worker_persistent_one_copy" ]]; then
-  # 2026-07-19 后，cta=4 one-copy 是当前稳定性能基线。
-  # 非 one-copy 分支保持 0，避免 materialized/rowctx 被额外 mover CTA 干扰。
-  GIDS_KV_GPU_WORKER_MOVER_CTAS_VALUE="4"
+if [[ "${VLLM_BAM_KV_BRANCH_VALUE}" == "gpu_worker_persistent_one_copy" ]]; then
+  # one-copy 默认采用稳定的 1 service CTA + 4 mover CTA 性能主线；显式传入
+  # cta=1 或 mode=mixed 时仍可运行对应的正确性回归拓扑。
+  GIDS_KV_GPU_WORKER_MOVER_CTAS_VALUE="${GIDS_KV_GPU_WORKER_MOVER_CTAS:-4}"
+  GIDS_KV_GPU_WORKER_MODE_VALUE="${GIDS_KV_GPU_WORKER_MODE:-dedicated}"
 else
+  # CTA topology 只属于 one-copy。其它分支固定关闭，外部遗留变量不能改变
+  # rowctx/materialized 的执行语义。
   GIDS_KV_GPU_WORKER_MOVER_CTAS_VALUE="0"
+  GIDS_KV_GPU_WORKER_MODE_VALUE=""
 fi
-GIDS_KV_GPU_WORKER_MODE_VALUE="${GIDS_KV_GPU_WORKER_MODE:-dedicated}"
 BAM_PREFLIGHT_VALUE="${BAM_PREFLIGHT:-0}"
 
 # BaM 读写路径都可能需要更高权限。只有显式打开 BaM 相关路径时才自动提权，

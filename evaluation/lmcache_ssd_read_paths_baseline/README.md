@@ -39,7 +39,7 @@ LongBench-TriviaQA 用于把固定 prompt baseline 扩展到真实长上下文 Q
 
 - `ssd_cpu_gpu`：原生 LMCache local_disk。
 - `gds_gpu`：LMCache-style GDS wrapper。
-- `bam_one_copy`：当前 cta=4 BaM one-copy 稳定基线。
+- `bam_one_copy`：默认 1 service CTA + 4 mover CTA 的 BaM one-copy 主线。
 
 每条样本默认连续跑两次：
 
@@ -75,6 +75,16 @@ NUM_SAMPLES=0 \
 MAX_MODEL_LEN=24576 \
 bash evaluation/lmcache_ssd_read_paths_baseline/run_longbench_triviaqa_bam_one_copy_qwen25.sh
 ```
+
+BaM one-copy 只保留两个 topology 开关：
+
+- `GIDS_KV_GPU_WORKER_MOVER_CTAS`：并行搬运 CTA 数，默认 `4`；设为 `1`
+  时回归原始单 CTA 路径。
+- `GIDS_KV_GPU_WORKER_MODE`：多 CTA 拓扑，默认 `dedicated`（1 service + N
+  mover）；`mixed` 保留为稳定正确性对照。
+
+上层链路统一通过 `VLLM_BAM_KV_BRANCH` 选择，底层 runtime、persistent 和
+one-copy 开关由启动脚本派生，不再使用旧底层开关组合反推分支。
 
 这里 `NUM_SAMPLES=0` 表示不截断 manifest，直接按全量跑。
 

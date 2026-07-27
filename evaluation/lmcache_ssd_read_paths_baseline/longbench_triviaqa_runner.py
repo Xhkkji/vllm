@@ -79,6 +79,14 @@ def install_benchmark_log_filter(debug_log: bool) -> None:
         "[LMCACHE_BAM_RUNTIME_IDLE_STOP",
         # 关闭路径必须默认可见，用来确认 wrapper 没有截断 LMCache 原生 close。
         "[LMCACHE_BAM_STORAGE_MANAGER_CLOSE",
+        # 轻量请求/connector 阶段标记，用来定位无 debug 压测卡点。
+        "[LMCACHE_BAM_RECEIVE_STAGE]",
+        "[LMCACHE_BAM_DIRECT_PLACEMENT_READ_SUBMIT",
+        "[LMCACHE_BAM_DIRECT_PLACEMENT_PIPELINE]",
+        "[LMCACHE_BAM_DIRECT_PLACEMENT_RUNTIME_ATTACH]",
+        "[LMCACHE_BAM_DIRECT_PLACEMENT_RUNTIME_POLL_STALL]",
+        "[LMCACHE_BAM_DIRECT_PLACEMENT_READ_FRONTIER]",
+        "[LMCACHE_BAM_DIRECT_PLACEMENT_RUNTIME_READY]",
     )
 
     def filtered_handle(self: logging.Logger, record: logging.LogRecord) -> None:
@@ -211,6 +219,12 @@ def main() -> None:
                 request_idx += 1
                 sample_id = row["_id"]
                 prompt = row["prompt"]
+                print(
+                    "[longbench-triviaqa-begin] "
+                    f"iter={request_idx} sample_id={sample_id} phase={phase} "
+                    f"length={row.get('length')} bucket={row.get('length_bucket')}",
+                    flush=True,
+                )
                 start = time.perf_counter()
                 # 使用 runner 自己的逐请求指标作为统一性能输出，避免 vLLM 每次
                 # generate 的 tqdm/progress bar 淹没底层 cache 统计。

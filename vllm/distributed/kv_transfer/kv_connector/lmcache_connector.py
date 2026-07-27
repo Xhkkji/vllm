@@ -326,8 +326,28 @@ class LMCacheConnector(KVConnectorBase):
         不必再被硬塞进一次 blocking `recv()` 调用里同步收口。
         """
 
+        batch_key = self._build_receive_batch_key(model_input)
+        if batch_key not in self._pending_deferred_retrieves:
+            logger.info(
+                "[LMCACHE_BAM_RECEIVE_STAGE] stage=recv_enter request_ids=%s "
+                "seq_lens=%s query_lens=%s pending=%d",
+                ",".join(batch_key[0]),
+                ",".join(str(value) for value in batch_key[1]),
+                ",".join(str(value) for value in batch_key[2]),
+                len(self._pending_deferred_retrieves),
+            )
         self._cleanup_finished_pending_retrieves(model_input)
         retrieve_status = self.lmcache_should_retrieve(model_input)
+        if batch_key not in self._pending_deferred_retrieves:
+            logger.info(
+                "[LMCACHE_BAM_RECEIVE_STAGE] stage=should_retrieve "
+                "request_ids=%s statuses=%s defer_enabled=%s",
+                ",".join(batch_key[0]),
+                ",".join(
+                    getattr(status, "name", str(status))
+                    for status in retrieve_status),
+                str(self._runtime_defer_enabled()).lower(),
+            )
         if self._runtime_defer_enabled():
             deferred_result = self._try_drive_deferred_receive(
                 model_executable=model_executable,
@@ -453,6 +473,11 @@ class LMCacheConnector(KVConnectorBase):
         pending_state = self._pending_deferred_retrieves.get(batch_key)
 
         if pending_state is None:
+            logger.info(
+                "[LMCACHE_BAM_RECEIVE_STAGE] stage=deferred_start_begin "
+                "request_ids=%s",
+                ",".join(batch_key[0]),
+            )
             deferred_batch = self.lmcache_start_deferrable_retrieve_kv(
                 model_executable,
                 model_input,
@@ -461,6 +486,11 @@ class LMCacheConnector(KVConnectorBase):
                 retrieve_status,
             )
             if deferred_batch is None:
+                logger.info(
+                    "[LMCACHE_BAM_RECEIVE_STAGE] stage=deferred_start_skip "
+                    "request_ids=%s",
+                    ",".join(batch_key[0]),
+                )
                 return None
             pending_state = _PendingDeferredRetrieveState(
                 batch_key=batch_key,
@@ -497,6 +527,18 @@ class LMCacheConnector(KVConnectorBase):
                      1000.0),
                     pending_state.poll_attempts,
                     min_defer_polls,
+                    wait_reason,
+                )
+            elif (pending_state.poll_attempts in (10, 100, 1000)
+                  or pending_state.poll_attempts % 10000 == 0):
+                logger.info(
+                    "[LMCACHE_BAM_RECEIVE_STAGE] stage=deferred_wait "
+                    "request_ids=%s wait_ms=%.3f poll_attempts=%d "
+                    "reason=%s",
+                    ",".join(batch_key[0]),
+                    ((time.perf_counter() - pending_state.created_at_s) *
+                     1000.0),
+                    pending_state.poll_attempts,
                     wait_reason,
                 )
             return KVReceiveResult.deferred(model_input=model_input)

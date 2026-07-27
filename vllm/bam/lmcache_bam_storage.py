@@ -3693,8 +3693,11 @@ class LMCacheBaMStore:
             request_chunks=in_flight_request.prefix_hit_chunks,
             request_tokens=total_tokens,
         )
-        self._schedule_runtime_idle_stop_if_enabled(
-            source="direct_placement_finalize")
+        if self._runtime_idle_stop_seconds() > 0.0:
+            self._stop_kv_runtime_service_if_idle(
+                source="direct_placement_finalize",
+                reason="finalize_sync",
+            )
         return ret_mask
 
     def start_direct_placement_request(

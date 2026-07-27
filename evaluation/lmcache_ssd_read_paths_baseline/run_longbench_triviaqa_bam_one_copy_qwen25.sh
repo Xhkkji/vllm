@@ -223,6 +223,13 @@ else
     /LMCACHE_BAM_CACHE_LIFECYCLE_STATS/ { print; fflush(); next }
     /LMCACHE_BAM_RUNTIME_IDLE_STOP/ { print; fflush(); next }
     /LMCACHE_BAM_STORAGE_MANAGER_CLOSE/ { print; fflush(); next }
+    /LMCACHE_BAM_RECEIVE_STAGE/ { print; fflush(); next }
+    /LMCACHE_BAM_DIRECT_PLACEMENT_READ_SUBMIT/ { print; fflush(); next }
+    /LMCACHE_BAM_DIRECT_PLACEMENT_PIPELINE/ { print; fflush(); next }
+    /LMCACHE_BAM_DIRECT_PLACEMENT_RUNTIME_ATTACH/ { print; fflush(); next }
+    /LMCACHE_BAM_DIRECT_PLACEMENT_RUNTIME_POLL_STALL/ { print; fflush(); next }
+    /LMCACHE_BAM_DIRECT_PLACEMENT_READ_FRONTIER/ { print; fflush(); next }
+    /LMCACHE_BAM_DIRECT_PLACEMENT_RUNTIME_READY/ { print; fflush(); next }
     /WARNING|ERROR|Exception|RuntimeError|submit failed|failed|FAILED/ { print; fflush(); next }
   ' | tee "${LOG_FILE_VALUE}"
 fi

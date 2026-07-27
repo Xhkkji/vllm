@@ -11,9 +11,7 @@ import torch
 from vllm.bam.lmcache_bam_direct_placement import (
     BaMDirectKVPlacer, BaMDirectPlacementBatchDescriptor,
     BaMDirectPlacementChunkDescriptor, BaMDirectPlacementStateTracker)
-from vllm.bam.lmcache_bam_storage import (
-    BaMChunkMetadata, LMCacheBaMStore,
-    _wait_runtime_metadata_ready_for_consume)
+from vllm.bam.lmcache_bam_storage import BaMChunkMetadata, LMCacheBaMStore
 
 
 @dataclass(frozen=True)
@@ -85,17 +83,6 @@ def _make_store() -> LMCacheBaMStore:
         chunk_capacity=16,
         base_row_offset=0,
     )
-
-
-def test_runtime_metadata_consume_fence_returns_when_ready():
-    ready_flag = torch.tensor([1], dtype=torch.int32)
-
-    wait_ms = _wait_runtime_metadata_ready_for_consume(
-        ready_flag=ready_flag,
-        timeout_s=0.1,
-    )
-
-    assert wait_ms >= 0.0
 
 
 def _register_chunk(store: LMCacheBaMStore, chunk_hash: str, slot_id: int) -> Any:

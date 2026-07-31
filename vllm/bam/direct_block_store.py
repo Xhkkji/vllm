@@ -9,14 +9,33 @@ page cache，也不执行 pack/refill/scatter。它只把一个 vLLM block 展�
 from __future__ import annotations
 
 from dataclasses import dataclass
+import importlib
+from pathlib import Path
+import sys
+import time
 from typing import Any, Sequence
 
 import torch
 
+import vllm.envs as envs
+from vllm.logger import init_logger
+
+
+logger = init_logger(__name__)
+
+GPU_DMA_ALIGNMENT = 64 * 1024
+SSD_IO_ALIGNMENT = 4096
+DIRECT_IO_REQUEST_CAPACITY = 1024
+DIRECT_IO_REGION_CAPACITY = 64
+DIRECT_IO_QUEUE_DEPTH = 4096
+DIRECT_IO_NUM_QUEUES = 128
+DIRECT_IO_POLL_TIMEOUT_S = 30.0
+DIRECT_IO_SSD_TAIL_GUARD_BYTES = 64 * 1024 * 1024
+
 
 @dataclass(frozen=True)
 class BaMDirectKVLayout:
-    """vLLM V0 paged KV allocation 的直接 IO 布局。"""
+    """【BaM KVStore 直通调用链】描述 vLLM V0 paged KV 的 IO 布局。"""
 
     num_layers: int
     num_gpu_blocks: int
@@ -31,6 +50,7 @@ class BaMDirectKVLayout:
     def from_gpu_cache(
         cls, gpu_cache: Sequence[torch.Tensor]
     ) -> "BaMDirectKVLayout":
+        """【BaM KVStore 直通调用链】从真实 KV tensors 固化 block stride。"""
         if not gpu_cache:
             raise ValueError("gpu_cache must not be empty")
 
@@ -84,6 +104,7 @@ class BaMDirectKVLayout:
         )
 
     def region_offset(self, *, kv_index: int, block_id: int) -> int:
+        """【BaM KVStore 直通调用链】计算 block fragment 的 layer-region 偏移。"""
         if kv_index not in (0, 1):
             raise ValueError(f"kv_index must be 0 or 1, got {kv_index}")
         if block_id < 0 or block_id >= self.num_gpu_blocks:
@@ -97,6 +118,7 @@ class BaMDirectKVLayout:
         ) * self.element_size
 
     def ssd_fragment_offset(self, *, layer_id: int, kv_index: int) -> int:
+        """【BaM KVStore 直通调用链】计算 block-major SSD 记录内的偏移。"""
         if layer_id < 0 or layer_id >= self.num_layers:
             raise ValueError(f"invalid layer id: {layer_id}")
         if kv_index not in (0, 1):
@@ -106,7 +128,7 @@ class BaMDirectKVLayout:
 
 @dataclass(frozen=True)
 class BaMDirectBlockHandle:
-    """一个 block batch 和底层 native direct-IO handle 的绑定。"""
+    """【BaM KVStore 直通调用链】block batch 与 native handle 的绑定。"""
 
     native_handle: Any
     block_count: int
@@ -115,7 +137,7 @@ class BaMDirectBlockHandle:
 
 
 class BaMDirectBlockStore:
-    """vLLM block -> direct NVMe fragment request 的唯一转换层。"""
+    """【BaM KVStore 直通调用链】block 到 NVMe fragment 的唯一转换层。"""
 
     def __init__(
         self,
@@ -123,19 +145,52 @@ class BaMDirectBlockStore:
         direct_io: Any,
         gpu_cache: Sequence[torch.Tensor],
         ssd_base_offset: int,
+        dma_regions: Sequence[torch.Tensor] | None = None,
     ) -> None:
-        if ssd_base_offset < 0 or ssd_base_offset % 4096 != 0:
+        """【BaM KVStore 直通调用链】注册 vLLM 持有的 KV CUDA regions。
+
+        ``gpu_cache`` 是 attention 真正读取的 tensor；``dma_regions`` 是覆盖这些
+        tensor 的 64KB 对齐 allocation。合成测试中二者可以是同一对象，真实
+        vLLM 中后者允许保留最多一个 DMA page 的尾部 padding，而不会改变
+        attention 看到的 shape/stride。
+        """
+        if ssd_base_offset < 0 or ssd_base_offset % SSD_IO_ALIGNMENT != 0:
             raise ValueError("ssd_base_offset must be non-negative and 4KB aligned")
         self.direct_io = direct_io
         self.gpu_cache = list(gpu_cache)
         self.layout = BaMDirectKVLayout.from_gpu_cache(self.gpu_cache)
         self.ssd_base_offset = int(ssd_base_offset)
 
+        if dma_regions is None:
+            dma_regions = self.gpu_cache
+        if len(dma_regions) != len(self.gpu_cache):
+            raise ValueError("dma_regions and gpu_cache must have equal length")
+        self.dma_regions = list(dma_regions)
+        self.region_base_offsets: list[int] = []
+        for layer_id, (layer_cache, dma_region) in enumerate(
+                zip(self.gpu_cache, self.dma_regions)):
+            if (not dma_region.is_cuda or not dma_region.is_contiguous()
+                    or dma_region.device != layer_cache.device):
+                raise ValueError(
+                    "DMA region must be contiguous CUDA memory at layer "
+                    f"{layer_id}")
+            layer_begin = int(layer_cache.data_ptr())
+            layer_end = layer_begin + int(layer_cache.numel()
+                                          * layer_cache.element_size())
+            region_begin = int(dma_region.data_ptr())
+            region_end = region_begin + int(dma_region.numel()
+                                             * dma_region.element_size())
+            if layer_begin < region_begin or layer_end > region_end:
+                raise ValueError(
+                    "DMA region does not cover KV layer allocation at layer "
+                    f"{layer_id}")
+            self.region_base_offsets.append(layer_begin - region_begin)
+
         # 每层 tensor 只注册一次。后续所有 block read/write 都通过 region id +
         # byte offset 引用它，不按 request 重复 map/unmap。
         self.region_ids = [
-            int(self.direct_io.register_tensor(layer_cache))
-            for layer_cache in self.gpu_cache
+            int(self.direct_io.register_tensor(dma_region))
+            for dma_region in self.dma_regions
         ]
 
     def write_blocks(
@@ -145,7 +200,7 @@ class BaMDirectBlockStore:
         storage_block_ids: Sequence[int],
         stream: torch.cuda.Stream | None = None,
     ) -> BaMDirectBlockHandle:
-        """直接从 vLLM KV cache 写入 SSD，不经过 pack 或 staging。"""
+        """【BaM KVStore 直通调用链】从 vLLM KV cache 直接写入 SSD。"""
         return self._submit_blocks(
             operation=1,
             operation_name="write",
@@ -161,7 +216,7 @@ class BaMDirectBlockStore:
         gpu_block_ids: Sequence[int],
         stream: torch.cuda.Stream | None = None,
     ) -> BaMDirectBlockHandle:
-        """从 SSD 直接恢复到最终 vLLM physical blocks。"""
+        """【BaM KVStore 直通调用链】从 SSD 直接恢复到 vLLM blocks。"""
         return self._submit_blocks(
             operation=0,
             operation_name="read",
@@ -171,9 +226,11 @@ class BaMDirectBlockStore:
         )
 
     def poll(self, handle: BaMDirectBlockHandle) -> bool:
+        """【BaM KVStore 直通调用链】只检查 GPU 已发布的 batch ready。"""
         return bool(self.direct_io.poll(handle.native_handle))
 
     def finish(self, handle: BaMDirectBlockHandle) -> None:
+        """【BaM KVStore 直通调用链】在 ready 后回收 direct batch slot。"""
         self.direct_io.finish(handle.native_handle)
 
     def _submit_blocks(
@@ -185,6 +242,7 @@ class BaMDirectBlockStore:
         storage_block_ids: Sequence[int],
         stream: torch.cuda.Stream | None,
     ) -> BaMDirectBlockHandle:
+        """【BaM KVStore 直通调用链】展开 block 并无阻塞发布 GPU submit。"""
         if len(gpu_block_ids) != len(storage_block_ids):
             raise ValueError(
                 "gpu_block_ids and storage_block_ids must have equal length"
@@ -225,7 +283,8 @@ class BaMDirectBlockStore:
                     )
                     region_ids.append(region_id)
                     region_offsets.append(
-                        self.layout.region_offset(
+                        self.region_base_offsets[layer_id]
+                        + self.layout.region_offset(
                             kv_index=kv_index, block_id=gpu_block_id
                         )
                     )
@@ -250,3 +309,226 @@ class BaMDirectBlockStore:
             fragment_count=len(operations),
             operation=operation_name,
         )
+
+
+def allocate_aligned_kv_region(
+    *,
+    allocation_shape: Sequence[int],
+    stride_order: Sequence[int],
+    dtype: torch.dtype,
+    device: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """【BaM KVStore 直通调用链】分配 DMA 对齐且保持 vLLM shape 的 KV layer。
+
+    返回 ``(owner, dma_region, kv_layer)``：
+
+    - ``owner`` 负责持有完整 CUDA allocation；
+    - ``dma_region`` 是 64KB 对齐并向上补齐到 64KB 的注册范围；
+    - ``kv_layer`` 与原 CacheEngine 分配结果保持相同 shape/stride，attention
+      仍按 vLLM 原生 paged layout 使用它。
+
+    这里没有 payload staging。padding 只用于满足 GPUDirect registration 的
+    allocation 边界要求，SSD 数据仍然直接落到 ``kv_layer``。
+    """
+    if device != "cuda":
+        raise ValueError("aligned direct KV allocation only supports CUDA")
+    element_size = int(torch.empty((), dtype=dtype).element_size())
+    logical_bytes = element_size
+    for dimension in allocation_shape:
+        logical_bytes *= int(dimension)
+    region_bytes = (
+        (logical_bytes + GPU_DMA_ALIGNMENT - 1) // GPU_DMA_ALIGNMENT
+        * GPU_DMA_ALIGNMENT
+    )
+
+    owner = torch.empty(
+        region_bytes + GPU_DMA_ALIGNMENT, dtype=torch.uint8, device=device
+    )
+    aligned_offset = (-int(owner.data_ptr())) % GPU_DMA_ALIGNMENT
+    dma_region = owner.narrow(0, aligned_offset, region_bytes)
+    logical_region = dma_region.narrow(0, 0, logical_bytes)
+    kv_layer = logical_region.view(dtype).view(tuple(allocation_shape))
+    kv_layer = kv_layer.permute(*tuple(stride_order))
+    kv_layer.zero_()
+
+    if int(dma_region.data_ptr()) % GPU_DMA_ALIGNMENT != 0:
+        raise AssertionError("failed to create 64KB-aligned KV DMA region")
+    return owner, dma_region, kv_layer
+
+
+def _import_bam_direct_kv_io() -> Any:
+    """【BaM KVStore 直通调用链】按实验环境定位 direct-IO Python binding。"""
+    candidate_paths: list[Path] = []
+    if envs.VLLM_BAM_IMPORT_PATH:
+        candidate_paths.append(Path(envs.VLLM_BAM_IMPORT_PATH))
+    candidate_paths.append(
+        Path(__file__).resolve().parents[3] / "BaM_IOStack" / "gids_module"
+    )
+
+    errors: list[str] = []
+    for path in candidate_paths:
+        path_string = str(path)
+        if path.exists() and path_string not in sys.path:
+            sys.path.insert(0, path_string)
+        try:
+            module = importlib.import_module("bam_direct_kv_io")
+            return module.BaMDirectKVIO
+        except Exception as exc:  # pragma: no cover - 依赖部署环境
+            errors.append(f"{path_string}: {type(exc).__name__}: {exc}")
+    raise ImportError("Failed to import BaMDirectKVIO:\n" + "\n".join(errors))
+
+
+def _parse_direct_ssd_list() -> tuple[int, ...]:
+    """【BaM KVStore 直通调用链】复用现有 BaM SSD 选择配置。"""
+    value = envs.VLLM_BAM_SSD_LIST
+    if value is None or not value.strip():
+        return (int(envs.VLLM_BAM_CTRL_IDX), )
+    parsed = tuple(int(item.strip()) for item in value.split(",")
+                   if item.strip())
+    if len(parsed) != 1:
+        raise ValueError("phase-1 direct KVStore requires exactly one SSD")
+    return parsed
+
+
+class BaMVLLMDirectKVStore:
+    """【BaM KVStore 直通调用链】连接 CacheEngine swap 与 direct 数据面。
+
+    本类只解释 vLLM scheduler 已经生成的 ``src_to_dst`` block mapping。
+    GPU submit、NVMe CQ polling 和 DMA 均由 ``BaMDirectKVIO`` 完成；CPU 侧循环
+    只读取 GPU worker 发布的 request 状态，ready 后才返回 CacheEngine 继续
+    attention。
+    """
+
+    def __init__(
+        self,
+        *,
+        gpu_cache: Sequence[torch.Tensor],
+        dma_regions: Sequence[torch.Tensor],
+        num_storage_blocks: int,
+    ) -> None:
+        """【BaM KVStore 直通调用链】绑定真实 vLLM cache 和 SSD block 空间。"""
+        if num_storage_blocks <= 0:
+            raise ValueError("direct KVStore requires positive storage blocks")
+        direct_io_class = _import_bam_direct_kv_io()
+        self.direct_io = direct_io_class(
+            ssd_list=_parse_direct_ssd_list(),
+            request_capacity=DIRECT_IO_REQUEST_CAPACITY,
+            region_capacity=DIRECT_IO_REGION_CAPACITY,
+            queue_depth=DIRECT_IO_QUEUE_DEPTH,
+            num_queues=DIRECT_IO_NUM_QUEUES,
+        )
+        try:
+            layout = BaMDirectKVLayout.from_gpu_cache(gpu_cache)
+            storage_bytes = int(num_storage_blocks) * layout.logical_block_bytes
+            namespace_bytes = int(self.direct_io.namespace_size_bytes)
+            required_bytes = storage_bytes + DIRECT_IO_SSD_TAIL_GUARD_BYTES
+            if required_bytes > namespace_bytes:
+                raise ValueError(
+                    "direct KVStore SSD namespace is too small: "
+                    f"required={required_bytes}, available={namespace_bytes}"
+                )
+            # 独立 direct backend 在 namespace 尾部区域保留连续 block 空间，
+            # 同时留出 64MB 尾部 guard。该布局与已经验证稳定的 direct block
+            # roundtrip 一致，既不覆盖旧 row/page baseline 从低地址开始使用的
+            # 数据，也不把 NVMe command 压到 namespace 最后一个 LBA 边界。
+            ssd_base_offset = (
+                (namespace_bytes - required_bytes) // SSD_IO_ALIGNMENT
+                * SSD_IO_ALIGNMENT
+            )
+            self.block_store = BaMDirectBlockStore(
+                direct_io=self.direct_io,
+                gpu_cache=gpu_cache,
+                dma_regions=dma_regions,
+                ssd_base_offset=ssd_base_offset,
+            )
+        except Exception:
+            self.direct_io.close()
+            raise
+
+        self.num_storage_blocks = int(num_storage_blocks)
+        fragments_per_block = self.block_store.layout.num_layers * 2
+        self.max_blocks_per_batch = max(
+            1, int(self.direct_io.request_capacity) // fragments_per_block
+        )
+        logger.info(
+            "[BAM_DIRECT_KVSTORE] initialized layers=%d gpu_blocks=%d "
+            "storage_blocks=%d logical_block_bytes=%d ssd_base_offset=%d "
+            "max_blocks_per_batch=%d bam_page_cache=0 staging=0 refill=0",
+            self.block_store.layout.num_layers,
+            self.block_store.layout.num_gpu_blocks,
+            self.num_storage_blocks,
+            self.block_store.layout.logical_block_bytes,
+            self.block_store.ssd_base_offset,
+            self.max_blocks_per_batch,
+        )
+
+    def swap_out(self, src_to_dst: torch.Tensor) -> None:
+        """【BaM KVStore 直通调用链】执行 GPU block -> SSD storage block。"""
+        self._transfer_mapping(src_to_dst, operation="write")
+
+    def swap_in(self, src_to_dst: torch.Tensor) -> None:
+        """【BaM KVStore 直通调用链】执行 SSD storage block -> GPU block。"""
+        self._transfer_mapping(src_to_dst, operation="read")
+
+    def close(self) -> None:
+        """【BaM KVStore 直通调用链】停止 persistent worker 并解除 DMA map。"""
+        direct_io = getattr(self, "direct_io", None)
+        if direct_io is not None:
+            direct_io.close()
+            self.direct_io = None
+
+    def _transfer_mapping(
+        self, src_to_dst: torch.Tensor, *, operation: str
+    ) -> None:
+        """【BaM KVStore 直通调用链】分批 submit、检查 ready 并完成请求。"""
+        if src_to_dst.numel() == 0:
+            return
+        mappings = src_to_dst.to(device="cpu", dtype=torch.int64).tolist()
+        for begin in range(0, len(mappings), self.max_blocks_per_batch):
+            batch = mappings[begin:begin + self.max_blocks_per_batch]
+            source_ids = [int(mapping[0]) for mapping in batch]
+            destination_ids = [int(mapping[1]) for mapping in batch]
+            if operation == "write":
+                self._validate_storage_block_ids(destination_ids)
+                handle = self.block_store.write_blocks(
+                    gpu_block_ids=source_ids,
+                    storage_block_ids=destination_ids,
+                )
+            elif operation == "read":
+                self._validate_storage_block_ids(source_ids)
+                handle = self.block_store.read_blocks(
+                    storage_block_ids=source_ids,
+                    gpu_block_ids=destination_ids,
+                )
+            else:
+                raise ValueError(f"unsupported direct KV operation: {operation}")
+            self._wait_until_ready(handle)
+            self.block_store.finish(handle)
+
+    def _wait_until_ready(self, handle: BaMDirectBlockHandle) -> None:
+        """【BaM KVStore 直通调用链】CPU 仅检查 GPU request-ready flag。"""
+        deadline = time.monotonic() + DIRECT_IO_POLL_TIMEOUT_S
+        while not self.block_store.poll(handle):
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    "BaM direct KVStore request did not become ready within "
+                    f"{DIRECT_IO_POLL_TIMEOUT_S}s operation={handle.operation} "
+                    f"blocks={handle.block_count}"
+                )
+            time.sleep(0.001)
+
+    def _validate_storage_block_ids(self, block_ids: Sequence[int]) -> None:
+        """【BaM KVStore 直通调用链】阻止 scheduler id 越过 SSD extent。"""
+        for block_id in block_ids:
+            if block_id < 0 or block_id >= self.num_storage_blocks:
+                raise ValueError(
+                    f"storage block id {block_id} is outside "
+                    f"[0, {self.num_storage_blocks})"
+                )
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            # CUDA runtime 退出阶段不能从析构函数继续抛异常。
+            pass

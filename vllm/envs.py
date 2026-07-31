@@ -53,6 +53,7 @@ if TYPE_CHECKING:
     VLLM_BAM_LMCACHE_BASE_ROW_OFFSET: int = 0
     VLLM_BAM_KV_FAST_PATH: bool = False
     VLLM_BAM_GPU_INITIATED_PREFETCH: bool = False
+    VLLM_BAM_DIRECT_KVSTORE_ENABLE: bool = False
     VLLM_BAM_DIRECT_PLACEMENT: bool = False
     VLLM_BAM_DIRECT_PLACEMENT_IMPL: str = "lmcache"
     VLLM_BAM_DIRECT_PLACEMENT_RUNTIME_ONE_COPY: bool = False
@@ -471,6 +472,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # descriptor ring，而不是恢复 connector-stage 预提交支线。
     "VLLM_BAM_GPU_INITIATED_PREFETCH":
     lambda: bool(int(os.getenv("VLLM_BAM_GPU_INITIATED_PREFETCH", "0"))),
+
+    # 是否启用独立的 BaM KVStore vLLM-block 直通路径：
+    #
+    #   vLLM scheduler block mapping
+    #     -> GPU submit
+    #     -> SSD DMA 直接读写 vLLM paged KV cache
+    #     -> GPU persistent CQ poll
+    #     -> CPU 只检查 request ready 后继续 attention
+    #
+    # 该开关与旧 BaM page cache / LMCache direct-placement 完全隔离。默认关闭，
+    # 因此不会改变 LMCache SSD、传统 GDS、普通 V0 swap 等 baseline 的行为。
+    "VLLM_BAM_DIRECT_KVSTORE_ENABLE":
+    lambda: bool(int(os.getenv("VLLM_BAM_DIRECT_KVSTORE_ENABLE", "0"))),
 
     # 是否启用 Direct Placement v0。
     # 开启后 LMCache retrieve 会优先尝试：

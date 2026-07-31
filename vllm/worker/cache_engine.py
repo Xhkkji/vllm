@@ -34,6 +34,18 @@ class CacheEngine:
         self.model_config = model_config
         self.parallel_config = parallel_config
         self.device_config = device_config
+        self.bam_direct_kvstore_enabled = envs.VLLM_BAM_DIRECT_KVSTORE_ENABLE
+        if self.bam_direct_kvstore_enabled and (
+                envs.VLLM_BAM_SHADOW_ENABLE
+                or envs.VLLM_BAM_SWAPIN_ENABLE):
+            raise ValueError(
+                "VLLM_BAM_DIRECT_KVSTORE_ENABLE cannot be combined with the "
+                "legacy BaM cache-backed V0 swap path")
+
+        # 【BaM KVStore 直通调用链】owner / DMA region 只为真实 GPU KV cache
+        # 保活。普通 vLLM、LMCache 和 GDS 路径不会创建或读取这两张表。
+        self._bam_direct_gpu_cache_owners: List[torch.Tensor] = []
+        self._bam_direct_gpu_cache_regions: List[torch.Tensor] = []
 
         self.head_size = model_config.get_head_size()
         # Models like Jamba, have mixed typed layers, E.g Mamba
@@ -65,11 +77,36 @@ class CacheEngine:
         # Initialize the cache.
         self.gpu_cache = self._allocate_kv_cache(
             self.num_gpu_blocks, self.device_config.device_type)
-        self.cpu_cache = self._allocate_kv_cache(self.num_cpu_blocks, "cpu")
+        # 【BaM KVStore 直通调用链】scheduler 仍使用 CPU block id 作为稳定的
+        # storage block id，但 payload 已经落到 SSD，因此不再分配等大的 CPU
+        # KV tensor。关闭新开关时仍完整保留 vLLM 原生 CPU swap baseline。
+        self.cpu_cache = (
+            [] if self.bam_direct_kvstore_enabled else
+            self._allocate_kv_cache(self.num_cpu_blocks, "cpu")
+        )
         self.swap_trace_enabled = envs.VLLM_V0_SWAP_TRACE
+        # 【BaM KVStore 直通调用链】此处只完成真实 KV allocation，不立刻执行
+        # NVMe controller 初始化或 DMA registration。Worker 必须等模型 warmup、
+        # CUDA Graph capture 和全部 workspace allocation 完成后，再显式调用
+        # initialize_bam_direct_kv_store()。这样不会让 BaM runtime 介入后续
+        # cudaMalloc/capture 生命周期。
+        self.bam_direct_kv_store = None
         self.bam_block_store = self._init_bam_block_store()
         self.bam_shadow_writer = self._init_bam_shadow_writer()
         self.bam_swap_reader = self._init_bam_swap_reader()
+
+    def initialize_bam_direct_kv_store(self) -> None:
+        """【BaM KVStore 直通调用链】在所有 CUDA warmup 后注册真实 KV cache。"""
+        if not self.bam_direct_kvstore_enabled:
+            return
+        if self.bam_direct_kv_store is not None:
+            return
+        from vllm.bam.direct_block_store import BaMVLLMDirectKVStore
+        self.bam_direct_kv_store = BaMVLLMDirectKVStore(
+            gpu_cache=self.gpu_cache,
+            dma_regions=self._bam_direct_gpu_cache_regions,
+            num_storage_blocks=self.num_cpu_blocks,
+        )
 
     def _init_bam_block_store(self):
         if not (envs.VLLM_BAM_SHADOW_ENABLE or envs.VLLM_BAM_SWAPIN_ENABLE):
@@ -123,7 +160,11 @@ class CacheEngine:
         num_blocks: int,
         device: str,
     ) -> List[torch.Tensor]:
-        """Allocates KV cache on the specified device."""
+        """Allocates KV cache on the specified device.
+
+        【BaM KVStore 直通调用链】新后端开启时，GPU 分配改用 64KB 对齐 owner，
+        但返回给 attention 的 tensor shape/stride 与原生分配完全一致。
+        """
         kv_cache_generic_shape = self.attn_backend.get_kv_cache_shape(
             num_blocks, self.block_size, self.num_kv_heads, self.head_size)
         pin_memory = is_pin_memory_available() if device == "cpu" else False
@@ -145,11 +186,24 @@ class CacheEngine:
             # null block in CpuGpuBlockAllocator requires at least that
             # block to be zeroed-out.
             # We zero-out everything for simplicity.
-            layer_kv_cache = torch.zeros(
-                kv_cache_allocation_shape,
-                dtype=self.dtype,
-                pin_memory=pin_memory,
-                device=device).permute(*kv_cache_stride_order)
+            if self.bam_direct_kvstore_enabled and device == "cuda":
+                from vllm.bam.direct_block_store import (
+                    allocate_aligned_kv_region)
+                owner, dma_region, layer_kv_cache = (
+                    allocate_aligned_kv_region(
+                        allocation_shape=kv_cache_allocation_shape,
+                        stride_order=kv_cache_stride_order,
+                        dtype=self.dtype,
+                        device=device,
+                    ))
+                self._bam_direct_gpu_cache_owners.append(owner)
+                self._bam_direct_gpu_cache_regions.append(dma_region)
+            else:
+                layer_kv_cache = torch.zeros(
+                    kv_cache_allocation_shape,
+                    dtype=self.dtype,
+                    pin_memory=pin_memory,
+                    device=device).permute(*kv_cache_stride_order)
 
             # view back to (TOTAL_PAGES, PAGE_SIZE, entry_shape...) for cases
             # when entry_shape is higher than 1D
@@ -157,8 +211,16 @@ class CacheEngine:
         return kv_cache
 
     def swap_in(self, src_to_dst: torch.Tensor) -> None:
+        """把 scheduler 的 storage->GPU block mapping 恢复到 KV cache。
+
+        【BaM KVStore 直通调用链】新后端下，本函数等待的只是 GPU worker 发布
+        request ready；CPU 不读取 NVMe CQ，也不参与 payload 搬运。返回后 Worker
+        才会继续发起当前 engine step 的 attention。
+        """
         start = time.perf_counter()
-        if self.bam_swap_reader is not None:
+        if self.bam_direct_kv_store is not None:
+            self.bam_direct_kv_store.swap_in(src_to_dst)
+        elif self.bam_swap_reader is not None:
             self.bam_swap_reader.swap_in(self.gpu_cache, self.cpu_cache,
                                          src_to_dst)
         else:
@@ -168,12 +230,20 @@ class CacheEngine:
         self._log_swap_event("swap_in", src_to_dst, time.perf_counter() - start)
 
     def swap_out(self, src_to_dst: torch.Tensor) -> None:
+        """把 scheduler 的 GPU->storage block mapping 写出。
+
+        【BaM KVStore 直通调用链】新后端直接从 vLLM physical block 发起 SSD
+        write，不再先复制到 CPU cache，也不经过 BaM payload cache。
+        """
         start = time.perf_counter()
-        for i in range(self.num_attention_layers):
-            self.attn_backend.swap_blocks(self.gpu_cache[i], self.cpu_cache[i],
-                                          src_to_dst)
-        if self.bam_shadow_writer is not None:
-            self.bam_shadow_writer.on_swap_out(self.gpu_cache, src_to_dst)
+        if self.bam_direct_kv_store is not None:
+            self.bam_direct_kv_store.swap_out(src_to_dst)
+        else:
+            for i in range(self.num_attention_layers):
+                self.attn_backend.swap_blocks(self.gpu_cache[i],
+                                              self.cpu_cache[i], src_to_dst)
+            if self.bam_shadow_writer is not None:
+                self.bam_shadow_writer.on_swap_out(self.gpu_cache, src_to_dst)
         self._log_swap_event("swap_out", src_to_dst,
                              time.perf_counter() - start)
 

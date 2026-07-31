@@ -452,3 +452,53 @@ GPU-initiated 调度都可以继续建立在同一套 block/request ABI 上，�
 - 4-block batch roundtrip：224 fragments、3,670,016 bytes，exact_equal=1。
 - 4-block 实测 write/read 均约 1.26 GiB/s；该数据只用于当前小批量正确性测试，
   不作为正式吞吐 baseline。
+## 11. 新调用链代码标记
+
+> 本目录中的新路径统一以 `【BaM KVStore 直通调用链】` 标记。该标记表示函数
+> 属于 `vLLM block metadata -> GPU submit -> SSD DMA -> vLLM KV cache -> GPU
+> ready -> CPU launch attention` 主线，不属于旧 LMCache chunk/page cache 路径。
+
+## 12. 真实 CacheEngine 接入进度（2026-07-31）
+
+当前已经把独立 direct block 数据面接入 vLLM V0 `CacheEngine`：
+
+```text
+Scheduler blocks_to_swap_out: GPU block -> storage block
+  -> CacheEngine.swap_out
+  -> BaMVLLMDirectKVStore
+  -> BaMDirectBlockStore 展开 layer/K/V fragments
+  -> GPU submit + persistent CQ poll
+  -> SSD write 完成
+
+Scheduler blocks_to_swap_in: storage block -> GPU block
+  -> CacheEngine.swap_in
+  -> SSD DMA 直接写入真实 vLLM paged KV cache
+  -> GPU 发布 request ready
+  -> CPU 只检查 ready
+  -> Worker 继续发起 attention
+```
+
+实现约束如下：
+
+- 新路径仅由 `VLLM_BAM_DIRECT_KVSTORE_ENABLE=1` 显式开启，默认关闭。
+- 开启后，CPU block id 只作为 SSD storage block id，不再分配 CPU KV payload。
+- vLLM GPU KV cache 使用 64KB 对齐 owner，但 attention 看到的 shape/stride
+  与原生 XFormers paged KV cache 一致。
+- BaM controller 初始化和 DMA registration 延迟到模型 warmup、CUDA Graph
+  capture、workspace allocation 全部完成之后。
+- persistent CQ worker 仍然延迟到第一批 submit 才启动。
+- SSD extent 位于 namespace 尾部实验区域之前，并额外保留 64MB tail guard。
+- 旧 LMCache SSD、GDS、BaM page cache 和普通 V0 CPU swap 路径没有改默认行为。
+
+真实 `CacheEngine` smoke 使用 Qwen2.5-7B、FP16、block size 16、XFormers
+layout，结果如下：
+
+```text
+cache_engine_layout=(2, 8, 8192)
+stride=(65536, 8192, 1)
+compute_launch_after_ready=1
+cpu_kv_payload_cache_layers=0
+bam_page_cache=0 staging=0 refill=0
+exact_equal=1
+[DIRECT_KV_CACHE_ENGINE] PASS
+```

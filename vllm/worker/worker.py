@@ -326,6 +326,11 @@ class Worker(LocalOrDistributedWorkerBase):
         with context:
             self._init_cache_engine()
         self._warm_up_model()
+        # 【BaM KVStore 直通调用链】BaM direct runtime 必须在模型 warmup、
+        # CUDA Graph capture 和 workspace allocation 全部结束后再注册 vLLM KV
+        # allocation。persistent CQ worker 仍到首次 submit 才真正启动。
+        for cache_engine in self.cache_engine:
+            cache_engine.initialize_bam_direct_kv_store()
 
     def _init_cache_engine(self):
         assert self.cache_config.num_gpu_blocks is not None

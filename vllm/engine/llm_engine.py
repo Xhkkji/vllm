@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import copy
+import os
 import time
 from collections import Counter as collectionsCounter
 from collections import deque
@@ -68,6 +69,29 @@ _LOCAL_LOGGING_INTERVAL_SEC = 5
 
 _O = TypeVar("_O", RequestOutput, PoolingRequestOutput)
 _R = TypeVar("_R", default=Any)
+
+
+def _bam_nvtx_trace_enabled() -> bool:
+    value = os.environ.get("VLLM_BAM_NVTX_TRACE")
+    return value is not None and value.strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+@contextmanager
+def _bam_nvtx_range(name: str):
+    """按需标记 vLLM engine 侧调度区间，默认关闭。"""
+    if not _bam_nvtx_trace_enabled() or not torch.cuda.is_available():
+        yield
+        return
+    torch.cuda.nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
 
 
 @dataclass
@@ -1351,10 +1375,11 @@ class LLMEngine:
         if not self._has_remaining_steps(
                 seq_group_metadata_list
         ) and not self._skip_scheduling_next_step:
-            # Schedule iteration
-            (seq_group_metadata_list, scheduler_outputs,
-             allow_async_output_proc
-             ) = self.scheduler[virtual_engine].schedule()
+            with _bam_nvtx_range("vllm_engine_schedule"):
+                # Schedule iteration
+                (seq_group_metadata_list, scheduler_outputs,
+                 allow_async_output_proc
+                 ) = self.scheduler[virtual_engine].schedule()
 
             ctx.seq_group_metadata_list = seq_group_metadata_list
             ctx.scheduler_outputs = scheduler_outputs
@@ -1410,8 +1435,9 @@ class LLMEngine:
                     virtual_engine]
 
             try:
-                outputs = self.model_executor.execute_model(
-                    execute_model_req=execute_model_req)
+                with _bam_nvtx_range("vllm_engine_execute_model"):
+                    outputs = self.model_executor.execute_model(
+                        execute_model_req=execute_model_req)
                 self._skip_scheduling_next_step = False
             except DeferredModelExecution as e:
                 # 这里不是错误，而是 connector/runtime 显式要求：

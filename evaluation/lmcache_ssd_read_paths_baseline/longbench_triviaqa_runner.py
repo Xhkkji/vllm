@@ -52,6 +52,56 @@ def env_flag(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def env_float(name: str, default: float = 0.0) -> float:
+    value = os.environ.get(name)
+    if value is None or value.strip() == "":
+        return default
+    return float(value)
+
+
+@contextlib.contextmanager
+def maybe_nvtx_range(name: str):
+    """按需给 Nsight Systems 标出 runner 侧 request 阶段。
+
+    默认关闭，避免给普通 benchmark 引入额外依赖和开销。打开
+    `LONGBENCH_NVTX_TRACE=1` 后，Nsight timeline 里可以直接区分 write/read
+    request，再结合 vLLM 内部的 prefill/decode range 做 decode-only 分析。
+    """
+    if not env_flag("LONGBENCH_NVTX_TRACE", False):
+        yield
+        return
+    import torch
+    torch.cuda.nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
+
+
+def drop_kernel_page_cache_before_read(request_idx: int, sample_id: str) -> None:
+    """在 read request 计时前清 Linux page cache。
+
+    这个开关只服务 LMCache 原生 SSD cold-read baseline。默认关闭，避免影响
+    常规 BaM/GDS/LMCache 回归。调用方必须以 root 运行，否则无法写
+    `/proc/sys/vm/drop_caches`。
+    """
+    if os.geteuid() != 0:
+        raise RuntimeError(
+            "LONGBENCH_DROP_CACHES_BEFORE_READ=1 requires root because "
+            "it writes /proc/sys/vm/drop_caches")
+
+    print(
+        "[longbench-triviaqa-drop-caches] "
+        f"iter={request_idx} sample_id={sample_id} action=sync_drop_caches",
+        flush=True,
+    )
+    os.sync()
+    Path("/proc/sys/vm/drop_caches").write_text("3\n", encoding="ascii")
+    settle_s = env_float("LONGBENCH_DROP_CACHES_SETTLE_S", 0.0)
+    if settle_s > 0:
+        time.sleep(settle_s)
+
+
 def install_benchmark_log_filter(debug_log: bool) -> None:
     """默认压掉底层调试 INFO，只保留性能/告警/错误相关日志。
 
@@ -133,6 +183,26 @@ def iter_request_plan(rows: Iterable[dict], repeat_read: int) -> Iterable[tuple[
             yield row, "read"
 
 
+def iter_batch_request_plan(
+    rows: list[dict],
+    repeat_read: int,
+    batch_size: int,
+) -> Iterable[tuple[list[dict], str]]:
+    """按 batch 组织 write/read 请求。
+
+    batch_size=1 时等价于原来的逐样本 write/read；batch_size>1 时，同一批
+    prompt 会先一起 write，再一起 read，从而真正触发 vLLM 的多请求 batch
+    调度，而不是只在 Python for-loop 中串行跑多个单请求。
+    """
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
+    for start in range(0, len(rows), batch_size):
+        batch_rows = rows[start:start + batch_size]
+        yield batch_rows, "write"
+        for _ in range(max(repeat_read, 0)):
+            yield batch_rows, "read"
+
+
 @contextlib.contextmanager
 def build_llm(args: argparse.Namespace):
     ktc = KVTransferConfig.from_cli(
@@ -145,6 +215,7 @@ def build_llm(args: argparse.Namespace):
         enable_chunked_prefill=args.enable_chunked_prefill,
         gpu_memory_utilization=args.gpu_memory_utilization,
         dtype=args.dtype,
+        swap_space=args.swap_space,
         enforce_eager=args.enforce_eager,
         trust_remote_code=False,
     )
@@ -163,10 +234,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.60)
     parser.add_argument("--dtype", default="half")
+    parser.add_argument("--swap-space", type=float,
+                        default=env_float("SWAP_SPACE", 4.0))
     parser.add_argument("--max-tokens", type=int, default=32)
     # 默认跑完整 Qwen-tokenized lt4k bucket；传 0 表示不截断。
     parser.add_argument("--num-samples", type=int, default=25)
     parser.add_argument("--repeat-read", type=int, default=1)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=int(os.environ.get("BATCH_SIZE", "1")),
+        help="number of prompts submitted in one llm.generate call",
+    )
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--enforce-eager", action=argparse.BooleanOptionalAction,
@@ -203,9 +282,13 @@ def main() -> None:
     print("[longbench-triviaqa] metrics_jsonl=", args.metrics_jsonl)
     print("[longbench-triviaqa] samples=", len(rows))
     print("[longbench-triviaqa] repeat_read=", args.repeat_read)
+    print("[longbench-triviaqa] batch_size=", args.batch_size)
     print("[longbench-triviaqa] max_model_len=", args.max_model_len)
     print("[longbench-triviaqa] max_tokens=", args.max_tokens)
+    print("[longbench-triviaqa] swap_space=", args.swap_space)
     print("[longbench-triviaqa] debug_log=", args.debug_log)
+    print("[longbench-triviaqa] drop_caches_before_read=",
+          env_flag("LONGBENCH_DROP_CACHES_BEFORE_READ", False))
     print("[longbench-triviaqa] lmcache_local_disk=", os.environ.get("LMCACHE_LOCAL_DISK"))
     print("[longbench-triviaqa] gds_path=", os.environ.get("VLLM_GDS_LMCACHE_PATH"))
 
@@ -215,21 +298,43 @@ def main() -> None:
             total_elapsed_s = 0.0
             phase_elapsed_s: dict[str, float] = {"write": 0.0, "read": 0.0}
             phase_counts: dict[str, int] = {"write": 0, "read": 0}
-            for row, phase in iter_request_plan(rows, repeat_read=args.repeat_read):
+            plan_iter = iter_batch_request_plan(
+                rows,
+                repeat_read=args.repeat_read,
+                batch_size=args.batch_size,
+            )
+            for batch_rows, phase in plan_iter:
                 request_idx += 1
-                sample_id = row["_id"]
-                prompt = row["prompt"]
+                batch_sample_ids = [row["_id"] for row in batch_rows]
+                prompts = [row["prompt"] for row in batch_rows]
                 print(
                     "[longbench-triviaqa-begin] "
-                    f"iter={request_idx} sample_id={sample_id} phase={phase} "
-                    f"length={row.get('length')} bucket={row.get('length_bucket')}",
+                    f"iter={request_idx} sample_ids={','.join(batch_sample_ids)} "
+                    f"phase={phase} batch_size={len(batch_rows)} "
+                    f"lengths={','.join(str(row.get('length')) for row in batch_rows)} "
+                    f"bucket={batch_rows[0].get('length_bucket')}",
                     flush=True,
                 )
+                dropped_caches = False
+                if (phase == "read"
+                        and env_flag("LONGBENCH_DROP_CACHES_BEFORE_READ", False)):
+                    drop_kernel_page_cache_before_read(
+                        request_idx,
+                        ",".join(batch_sample_ids),
+                    )
+                    dropped_caches = True
                 start = time.perf_counter()
                 # 使用 runner 自己的逐请求指标作为统一性能输出，避免 vLLM 每次
                 # generate 的 tqdm/progress bar 淹没底层 cache 统计。
-                outputs = llm.generate([prompt], sampling_params=sampling_params,
-                                       use_tqdm=False)
+                nvtx_name = (
+                    f"longbench_request:{phase}:iter={request_idx}:"
+                    f"batch_size={len(batch_rows)}:"
+                    f"samples={','.join(batch_sample_ids)}")
+                with maybe_nvtx_range(nvtx_name):
+                    outputs = llm.generate(
+                        prompts,
+                        sampling_params=sampling_params,
+                        use_tqdm=False)
                 elapsed_s = time.perf_counter() - start
                 total_elapsed_s += elapsed_s
                 phase_elapsed_s[phase] = phase_elapsed_s.get(phase, 0.0) + elapsed_s
@@ -243,36 +348,70 @@ def main() -> None:
                 read_avg_s = (
                     phase_elapsed_s.get("read", 0.0) /
                     max(phase_counts.get("read", 0), 1))
-                generated = outputs[0].outputs[0].text
-                output_tokens = len(outputs[0].outputs[0].token_ids)
-                record = {
+                output_tokens_list = [
+                    len(output.outputs[0].token_ids) for output in outputs
+                ]
+                batch_record = {
                     "request_idx": request_idx,
-                    "sample_id": sample_id,
+                    "sample_id": ",".join(batch_sample_ids),
+                    "sample_ids": batch_sample_ids,
                     "phase": phase,
+                    "record_type": "batch",
+                    "batch_size": len(batch_rows),
                     "elapsed_s": elapsed_s,
-                    "source_dataset": row.get("source_dataset"),
-                    "prompt_mode": row.get("prompt_mode"),
-                    "length": row.get("length"),
-                    "length_bucket": row.get("length_bucket"),
-                    "prompt_sha1": row.get("prompt_sha1"),
-                    "output_tokens": output_tokens,
-                    "answers": row.get("answers", []),
-                    "generated_text": generated,
+                    "per_sample_elapsed_s": elapsed_s / max(len(batch_rows), 1),
+                    "source_dataset": batch_rows[0].get("source_dataset"),
+                    "prompt_mode": batch_rows[0].get("prompt_mode"),
+                    "length": [row.get("length") for row in batch_rows],
+                    "length_bucket": batch_rows[0].get("length_bucket"),
+                    "prompt_sha1": [row.get("prompt_sha1") for row in batch_rows],
+                    "output_tokens": output_tokens_list,
+                    "drop_caches_before_request": dropped_caches,
+                    "answers": [row.get("answers", []) for row in batch_rows],
+                    "generated_text": [
+                        output.outputs[0].text for output in outputs
+                    ],
                 }
-                metrics_f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                metrics_f.write(json.dumps(batch_record, ensure_ascii=False) + "\n")
+                for row, output in zip(batch_rows, outputs):
+                    generated = output.outputs[0].text
+                    output_tokens = len(output.outputs[0].token_ids)
+                    record = {
+                        "request_idx": request_idx,
+                        "sample_id": row["_id"],
+                        "phase": phase,
+                        "record_type": "sample",
+                        "batch_size": len(batch_rows),
+                        "elapsed_s": elapsed_s,
+                        "per_sample_elapsed_s": elapsed_s / max(len(batch_rows), 1),
+                        "source_dataset": row.get("source_dataset"),
+                        "prompt_mode": row.get("prompt_mode"),
+                        "length": row.get("length"),
+                        "length_bucket": row.get("length_bucket"),
+                        "prompt_sha1": row.get("prompt_sha1"),
+                        "output_tokens": output_tokens,
+                        "drop_caches_before_request": dropped_caches,
+                        "answers": row.get("answers", []),
+                        "generated_text": generated,
+                    }
+                    metrics_f.write(json.dumps(record, ensure_ascii=False) + "\n")
                 metrics_f.flush()
 
                 print(
                     "[longbench-triviaqa-iter] "
-                    f"iter={request_idx} sample_id={sample_id} phase={phase} "
-                    f"length={row.get('length')} bucket={row.get('length_bucket')} "
+                    f"iter={request_idx} sample_ids={','.join(batch_sample_ids)} "
+                    f"phase={phase} batch_size={len(batch_rows)} "
+                    f"bucket={batch_rows[0].get('length_bucket')} "
                     f"elapsed_s={elapsed_s:.4f} phase_avg_s={phase_avg_s:.4f} "
                     f"write_avg_s={write_avg_s:.4f} read_avg_s={read_avg_s:.4f} "
-                    f"total_avg_s={total_avg_s:.4f} output_tokens={output_tokens}",
+                    f"total_avg_s={total_avg_s:.4f} "
+                    f"output_tokens={','.join(str(v) for v in output_tokens_list)}",
                     flush=True,
                 )
                 if args.print_output:
-                    print("[longbench-triviaqa-output]", generated)
+                    for sample_id, output in zip(batch_sample_ids, outputs):
+                        print("[longbench-triviaqa-output]", sample_id,
+                              output.outputs[0].text)
 
             print(
                 "[longbench-triviaqa-summary] "

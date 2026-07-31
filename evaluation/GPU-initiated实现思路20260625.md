@@ -1,7 +1,7 @@
 # GPU-initiated BaM 实现思路
 
 日期：2026-06-25
-最近整理：2026-07-27
+最近整理：2026-07-29
 
 本文只保留当前 `vllm-bam` 中与 LMCache / vLLM KVCache 主线直接相关、并且仍有工程价值的实现思路。
 目标不是记录所有历史尝试，而是回答下面四个问题：
@@ -26,6 +26,189 @@
 ---
 
 ## 1. 当前主线结论
+
+### 1.-0 2026-07-29 decode-only NVTX / Nsight 最新结论
+
+截至 2026-07-29，`gpu_worker_persistent_one_copy` 的一个状态机误报已经修正：
+
+```text
+问题：
+  gpu_worker_submit 后原本强制校验 request frontier status == SUBMITTED；
+  但 persistent GPU worker 是异步推进的，submit 返回前 frontier 可能已经被推进到
+  IO_DONE / CONSUMED。
+
+修正：
+  只在 gpu_worker_submit 阶段允许 frontier 从 SUBMITTED 合法前进到
+  IO_DONE / CONSUMED；
+  仍然拒绝 ERROR 或未知状态。
+
+影响：
+  该修正只调整 Python 层状态校验语义，不改变 BaM / CUDA 数据面。
+```
+
+修正后完成的关键验证：
+
+```text
+BaM one-copy 1+4 CTA
+  NUM_SAMPLES=1, REPEAT_READ=1, MAX_TOKENS=16:
+    正常跑通
+
+BaM one-copy 1+4 CTA + Nsight Systems:
+  NUM_SAMPLES=1, REPEAT_READ=1, MAX_TOKENS=16:
+    正常跑通，能够生成包含 NVTX / CUDA trace 的 nsys-rep
+
+BaM one-copy 1+4 CTA 长 decode 压力：
+  NUM_SAMPLES=5, REPEAT_READ=1, MAX_TOKENS=128:
+    requests=10
+    write_avg_s=3.5267
+    read_avg_s=3.0458
+    avg_request_s=3.2863
+```
+
+同口径 GDS 对照：
+
+```text
+LMCache GDS
+  NUM_SAMPLES=5, REPEAT_READ=1, MAX_TOKENS=128:
+    requests=10
+    write_avg_s=3.4125
+    read_avg_s=3.0890
+    avg_request_s=3.2508
+
+BaM vs GDS read speedup @128 tokens:
+  1.014x
+```
+
+这说明：
+
+```text
+1. 修正后，之前 max_tokens=128 下的 frontier status mismatch 不再复现；
+2. 长 decode 下，BaM SSD->GPU read path 的端到端优势被 decode 计算明显稀释；
+3. 继续只优化 KV read path，难以在长 decode 场景下获得显著端到端收益。
+```
+
+#### decode-only NVTX / Nsight 结论
+
+为判断“多轮 decode 中 CPU 调度/切换是否是瓶颈”，新增了默认关闭的 NVTX 观测开关：
+
+```text
+LONGBENCH_NVTX_TRACE=1
+  标记 longbench_request:write/read
+
+VLLM_BAM_NVTX_TRACE=1
+  标记 vllm_engine_schedule
+  标记 vllm_engine_execute_model
+  标记 vllm_recv_kv:prefill/decode
+  标记 vllm_forward:prefill/decode
+  标记 vllm_logits:prefill/decode
+  标记 vllm_sample:prefill/decode
+```
+
+NVTX trace 口径：
+
+```text
+dataset:
+  LongBench TriviaQA lt4k bucket
+model:
+  Qwen2.5-7B-Instruct
+NUM_SAMPLES:
+  1
+REPEAT_READ:
+  1
+MAX_TOKENS:
+  16
+paths:
+  BaM one-copy 1+4 CTA
+  LMCache GDS
+```
+
+read request 的 decode-only 对比结果：
+
+| 路径 | read request | decode token span | GPU busy / token | token 间 gap | schedule 总耗时 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| BaM one-copy 1+4 CTA | 1082.8 ms | 约 22 ms/token | 约 21 ms/token，95%+ | 约 0.9 ms | 1.4 ms / 16 steps |
+| LMCache GDS | 1090.0 ms | 约 22 ms/token | 约 21 ms/token，95%+ | 约 0.9 ms | 1.4 ms / 16 steps |
+
+BaM read request 细分：
+
+```text
+read request duration:
+  1082.779 ms
+
+read request GPU kernel busy:
+  434.772 ms
+  busy_ratio=0.402
+
+vLLM decode steps:
+  decode_forward count=15
+  decode_forward avg=14.94 ms/token
+  decode_logits avg=0.10 ms/token
+  decode_sample avg=7.04 ms/token
+
+per-token step span:
+  约 21.8 - 22.7 ms
+
+per-token GPU busy:
+  约 20.8 - 21.7 ms
+  busy_ratio≈95%
+
+token 间 inter_gap:
+  约 0.9 ms
+
+vllm_engine_schedule:
+  16 次合计约 1.4 ms
+  单步约 0.08 - 0.09 ms
+```
+
+GDS read request 呈现基本一致的形态：
+
+```text
+decode_forward avg:
+  约 14.5 - 15.3 ms/token
+
+decode_sample:
+  约 6.7 - 7.9 ms/token
+
+per-token GPU busy_ratio:
+  约 95%+
+
+token 间 inter_gap:
+  约 0.9 ms
+
+vllm_engine_schedule:
+  16 次合计约 1.4 ms
+```
+
+因此当前结论是：
+
+```text
+当前单请求 decode 下，CPU scheduler / 多轮 decode 切换不是主要瓶颈。
+
+虽然整个 read request 的 GPU busy ratio 只有约 39% - 40%，但低 busy 主要来自
+read/prefill/restore/sampling 等阶段混合后的整体口径；在真正的 per-token
+decode forward/logits/sample 区间内，GPU kernel busy ratio 已经接近 95%。
+
+token 间确实存在约 0.9 ms gap，但相比单 token 约 22 ms 的执行时间不是主导项。
+```
+
+当前更值得优先推进的方向应调整为：
+
+```text
+1. layer 级 KV prefetch / IO-compute overlap；
+2. SSD read 与 transformer layer 计算的流水线重叠；
+3. sampling / launch overhead 优化；
+4. CUDA Graph bucket / 取消 enforce-eager 的对照实验；
+5. 多请求 batch 下调度开销是否被摊薄的进一步测试。
+```
+
+暂时不建议立刻大改成完整 GPU-side decode loop：
+
+```text
+理由：
+  现有 NVTX trace 不支持“CPU 调度是 decode 主瓶颈”的判断；
+  当前 decode token 内部 GPU 已经高度忙碌；
+  大改 GPU-side decode loop 的工程风险高，收益证据不足。
+```
 
 ### 1.-1 2026-07-27 one-copy 最新修正结论
 

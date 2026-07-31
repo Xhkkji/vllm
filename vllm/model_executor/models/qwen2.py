@@ -23,6 +23,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only Qwen2 model compatible with HuggingFace weights."""
+import os
 from typing import Iterable, Optional, Set, Tuple, Union
 
 import torch
@@ -58,6 +59,20 @@ from .utils import (AutoWeightsLoader, PPMissingLayer, WeightsMapper,
                     maybe_prefix)
 
 logger = init_logger(__name__)
+
+
+def _qwen2_layer_nvtx_trace_enabled() -> bool:
+    value = os.environ.get("VLLM_BAM_LAYER_NVTX_TRACE")
+    return value is not None and value.lower() not in ("", "0", "false",
+                                                       "off", "no")
+
+
+def _qwen2_layer_nvtx_push(name: str) -> bool:
+    """默认关闭的 layer 级观测点，用于分析 IO 与逐层计算的重叠空间。"""
+    if not _qwen2_layer_nvtx_trace_enabled() or not torch.cuda.is_available():
+        return False
+    torch.cuda.nvtx.range_push(name)
+    return True
 
 
 class Qwen2MLP(nn.Module):
@@ -339,12 +354,23 @@ class Qwen2Model(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
-        for layer in self.layers[self.start_layer:self.end_layer]:
-            hidden_states, residual = layer(
-                positions,
-                hidden_states,
-                residual,
-            )
+        layers = self.layers[self.start_layer:self.end_layer]
+        for layer_idx, layer in enumerate(layers, start=self.start_layer):
+            token_count = hidden_states.shape[0]
+            # 仅在显式打开 VLLM_BAM_LAYER_NVTX_TRACE 时标记每层边界，
+            # 用于 Nsight 中判断当前整段 KV 恢复是否具备拆成 layer 级
+            # prefetch 并与后续层计算重叠的空间；默认关闭，不改变数据路径。
+            nvtx_pushed = _qwen2_layer_nvtx_push(
+                f"qwen2_layer:{layer_idx}:tokens={token_count}")
+            try:
+                hidden_states, residual = layer(
+                    positions,
+                    hidden_states,
+                    residual,
+                )
+            finally:
+                if nvtx_pushed:
+                    torch.cuda.nvtx.range_pop()
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
                 "hidden_states": hidden_states,

@@ -210,8 +210,14 @@ csrc/moe/marlin_moe_wna16/kernel_*
 evaluation/logs/
 evaluation/lmcache_ssd_read_paths_baseline/logs/
 evaluation/lmcache_ssd_read_paths_baseline/logs_longbench_triviaqa/
+evaluation/lmcache_ssd_read_paths_baseline/logs_tutti/
+evaluation/lmcache_ssd_read_paths_baseline/nsys_decode_probe/
 evaluation/lmcache_ssd_read_paths_baseline/**/lmcache_local_disk/
 evaluation/lmcache_ssd_read_paths_baseline/**/metrics.jsonl
+evaluation/lmcache_ssd_read_paths_baseline/**/*.kvcache.safetensors
+evaluation/lmcache_ssd_read_paths_baseline/**/*.kvcache.safetensors.metadata
+evaluation/lmcache_ssd_read_paths_baseline/**/*.nsys-rep
+evaluation/lmcache_ssd_read_paths_baseline/**/*.sqlite
 evaluation/logs/**/lmcache_gds/
 evaluation/logs/**/*.safetensors
 evaluation/logs/**/*.bin

@@ -4,6 +4,7 @@ import dataclasses
 import gc
 import inspect
 import itertools
+import os
 import time
 import weakref
 from contextlib import contextmanager
@@ -70,6 +71,35 @@ logger = init_logger(__name__)
 LORA_WARMUP_RANK = 8
 
 _NUM_WARMUP_ITERS = 2
+
+
+def _bam_nvtx_trace_enabled() -> bool:
+    value = os.environ.get("VLLM_BAM_NVTX_TRACE")
+    return value is not None and value.strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+@contextmanager
+def _bam_nvtx_range(name: str):
+    """按需标记 vLLM worker 侧 prefill/decode 执行区间。
+
+    默认关闭，避免影响普通 benchmark。打开 `VLLM_BAM_NVTX_TRACE=1` 后，
+    Nsight Systems 可以直接过滤 `vllm_execute:*`、`vllm_forward:*`、
+    `vllm_logits:*`、`vllm_sample:*` 这些 range，判断 decode token 之间的
+    GPU 空洞是否来自 CPU scheduler / launch / sampling。
+    """
+    if not _bam_nvtx_trace_enabled() or not torch.cuda.is_available():
+        yield
+        return
+    torch.cuda.nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
 
 
 def _bam_tensor_sample_for_log(tensor: Optional[torch.Tensor],
@@ -1811,6 +1841,10 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         assert model_input.attn_metadata is not None
         prefill_meta = model_input.attn_metadata.prefill_metadata
         decode_meta = model_input.attn_metadata.decode_metadata
+        phase_name = "prefill" if prefill_meta is not None else "decode"
+        token_count = (
+            int(model_input.input_tokens.shape[0])
+            if model_input.input_tokens is not None else 0)
         # TODO(andoorve): We can remove this once all
         # virtual engines share the same kv cache.
         virtual_engine = model_input.virtual_engine
@@ -1841,14 +1875,18 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         # NOTE: The receive operation is blocking
         bypass_model_exec = False
         if self.need_recv_kv(model_input, kv_caches):
-            recv_result = get_kv_transfer_group().recv_kv_caches_and_hidden_states(
-                # model is used to know which layer the current worker
-                # is working on, so that we can receive KV for only those
-                # layers.
-                model_executable,
-                model_input,
-                kv_caches=kv_caches,
-            )
+            with _bam_nvtx_range(
+                    f"vllm_recv_kv:{phase_name}:tokens={token_count}"):
+                recv_result = (
+                    get_kv_transfer_group().
+                    recv_kv_caches_and_hidden_states(
+                        # model is used to know which layer the current worker
+                        # is working on, so that we can receive KV for only those
+                        # layers.
+                        model_executable,
+                        model_input,
+                        kv_caches=kv_caches,
+                    ))
             if recv_result.status == KVReceiveStatus.DEFERRED:
                 request_ids = list(
                     (model_input.request_ids_to_seq_ids or {}).keys())
@@ -1879,17 +1917,19 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             model_forward_start.record()
 
         if not bypass_model_exec:
-            with set_forward_context(model_input.attn_metadata,
-                                     self.vllm_config, virtual_engine):
-                hidden_or_intermediate_states = model_executable(
-                    input_ids=model_input.input_tokens,
-                    positions=model_input.input_positions,
-                    intermediate_tensors=intermediate_tensors,
-                    **MultiModalKwargs.as_kwargs(multi_modal_kwargs,
-                                                 device=self.device),
-                    **seqlen_agnostic_kwargs,
-                    **model_kwargs,
-                )
+            with _bam_nvtx_range(
+                    f"vllm_forward:{phase_name}:tokens={token_count}"):
+                with set_forward_context(model_input.attn_metadata,
+                                         self.vllm_config, virtual_engine):
+                    hidden_or_intermediate_states = model_executable(
+                        input_ids=model_input.input_tokens,
+                        positions=model_input.input_positions,
+                        intermediate_tensors=intermediate_tensors,
+                        **MultiModalKwargs.as_kwargs(multi_modal_kwargs,
+                                                     device=self.device),
+                        **seqlen_agnostic_kwargs,
+                        **model_kwargs,
+                    )
 
         if (self.observability_config is not None
                 and self.observability_config.collect_model_forward_time):
@@ -1927,8 +1967,9 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                     torch.tensor(model_forward_time + orig_model_forward_time))
             return hidden_or_intermediate_states
 
-        logits = self.model.compute_logits(hidden_or_intermediate_states,
-                                           model_input.sampling_metadata)
+        with _bam_nvtx_range(f"vllm_logits:{phase_name}:tokens={token_count}"):
+            logits = self.model.compute_logits(hidden_or_intermediate_states,
+                                               model_input.sampling_metadata)
         _maybe_log_bam_logits_semantic_debug(
             model_input=model_input,
             hidden_or_intermediate_states=hidden_or_intermediate_states,
@@ -1942,10 +1983,11 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             model_input.async_callback()
 
         # Sample the next token.
-        output: SamplerOutput = self.sampler(
-            logits=logits,
-            sampling_metadata=model_input.sampling_metadata,
-        )
+        with _bam_nvtx_range(f"vllm_sample:{phase_name}:tokens={token_count}"):
+            output: SamplerOutput = self.sampler(
+                logits=logits,
+                sampling_metadata=model_input.sampling_metadata,
+            )
         if (self.observability_config is not None
                 and self.observability_config.collect_model_forward_time
                 and output is not None):

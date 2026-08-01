@@ -11,7 +11,8 @@
 3. 已排除的假设和已经收束掉的临时逻辑。
 4. 与旧 BaM one-copy 的准确对比。
 5. AGIO 的源码级执行模型及其对当前问题的直接启示。
-6. 第一优先级：解决 resident I/O service 与 attention 的执行冲突。
+6. Hyperion 的异步 IO、CUDA IPC 与 MPS 参考。
+7. 当前 V100 保底策略，以及独立 BaM daemon 的后续验证边界。
 
 本文不再把早期设计建议、已删除的诊断接口和当前实现混写。Git 历史和旧稳定
 分支继续保存 LMCache/BaM one-copy 及早期实验实现。
@@ -500,7 +501,8 @@ per-batch stop。
 3. **request payload 先写，最后以 release 语义发布 valid/ready**。
 4. **blocking poll 必须运行在不会阻塞 application 的执行资源上**。
 5. **所有 runtime allocation、DMA mapping 和 queue allocation 在 service 启动前完成**。
-6. **正常 batch 完成只 retire request，不停止 resident runtime**。
+6. **长期隔离模式下正常 batch 完成只 retire request，不停止 resident runtime**；
+   当前 V100 因缺少可靠资源隔离，仍采用 `io_active` 的 idle-stop 保底策略。
 
 ### 10.2 不直接照搬
 
@@ -510,6 +512,90 @@ per-batch stop。
   runtime 同时接管 GPU submit；当前问题首先是执行资源冲突。
 - 不引入 CPU completion thread、CPU CQ poll 或 per-batch service stop。
 - 不直接复制 Green Context 代码到当前 V100 环境。
+
+### 10.3 Hyperion 的相关参考
+
+本地参考实现：
+
+```text
+/home/xhk/hyperion/Hyperion/README.md
+/home/xhk/hyperion/Hyperion/IOStack/iostack.cuh
+/home/xhk/hyperion/Hyperion/sampling_server/src/engine/ipc_service.cu
+/home/xhk/hyperion/Hyperion/training_backend/ipc_cuda_kernel.cu
+```
+
+Hyperion 的关键点不是把 completion 做成永久 resident kernel，而是把提交和完成
+分开：
+
+```text
+io_submission(micro-batch 1)
+  -> application compute
+io_submission(micro-batch 2)
+  -> application compute
+io_submission(micro-batch 3)
+  -> io_completion()
+```
+
+其 IOStack 配置使用少量 submission blocks 和有限的 completion blocks；
+`io_completion()` 在消费数据前处理此前累计的请求，completion kernel 完成后退出。
+这与当前 `io_active` 的“IO 活跃期保留 service、空闲后退役”方向一致，说明细粒度
+预取不要求所有请求完成后才能发起 attention，真正需要的是 request/block 级 ready
+和分阶段 completion，而不是全局 batch barrier。
+
+Hyperion 还实现了跨进程 GPU buffer 共享：server 通过
+`cudaIpcGetMemHandle()` 发布 GPU allocation，consumer 通过
+`cudaIpcOpenMemHandle()` 打开；共享内存只保存 handle，命名 semaphore 和多槽
+pipeline 负责 buffer 的写入、消费和复用生命周期。这是独立 BaM daemon 方案可参考
+的控制面和数据面骨架。
+
+Hyperion README 还给 training backend 设置了：
+
+```text
+CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=80
+```
+
+这说明“独立 CUDA client + MPS 执行资源限制”在同类 GPU 直达异步 IO 系统中有实际
+使用依据。但这不是当前 direct daemon 已经验证成功的证据，仍需单独验证 BaM direct
+映射和 completion 语义。
+
+### 10.4 独立 BaM daemon + MPS 的判断
+
+该方案有希望从根上缓解当前 V100 问题，因果链应当是：
+
+```text
+独立 BaM daemon CUDA context
+  + MPS 限制 daemon 的 resident poll 执行资源
+  + vLLM 使用另一 MPS client 执行 attention
+  -> poll 不再占满 application 可用执行资源
+  -> attention 能够获得稳定调度
+```
+
+必须区分三个条件：
+
+1. 仅拆成独立进程不保证隔离；没有 MPS 或其他资源限制时，两个 CUDA client 仍可能
+   竞争同一 GPU 执行资源。
+2. MPS active-thread percentage 不是 Green Context 那样的固定 SM 编号分区，但在
+   Volta 上有机会限制 resident kernel 的并发资源占用，值得优先做 PoC。
+3. CUDA IPC 只解决 GPU allocation 共享，不自动解决当前 BaM 使用的 GPU 地址、DMA
+   mapping、completion event 和 buffer 生命周期问题。daemon 打开 IPC handle 后，
+   必须确认其 CUDA context 中的地址能够被 BaM direct IO 路径正确使用。
+
+因此长期目标不是简单地把当前 service thread 搬到另一个进程，而是：
+
+```text
+vLLM
+  -> 通过共享内存/Unix socket 发布 block IO descriptor
+  -> 通过 CUDA IPC 共享固定 KV buffer
+  -> 按 block/request 等待 completion
+
+BaM daemon
+  -> 打开 CUDA IPC buffer
+  -> 保留后台 GPU poll
+  -> 写入 completion ring 或 IPC event
+```
+
+这个架构仍然支持连续请求和细粒度预取。attention 只等待当前依赖的 KV blocks，
+不等待 daemon 清空全部请求队列。
 
 ## 11. 第一优先级：解决常驻线程冲突
 
@@ -536,65 +622,35 @@ CUDA toolkit=12.2
 `cuDevSmResourceSplitByCount` 等 API。因此当前不能编译 AGIO 的硬件 SM partition
 代码，也不能假设升级 header 后 V100/driver 组合一定支持。
 
-第一步不是立即把 AGIO Green Context 移植进 BaM，而是先验证普通 stream 路径
-是否因为 hardware work queue 映射产生 head-of-line blocking。旧 one-copy 已在同一
-V100 上跑通，说明应先寻找当前 direct 与旧路径的调度差异。
+当前已完成的普通 stream 验证如下：
 
-### 11.2 第一步 A：确认 CUDA hardware queue 映射
+- `CUDA_DEVICE_MAX_CONNECTIONS=8`、`CUDA_LAUNCH_BLOCKING=0` 仍在第一次
+  `before_forward` 停止。
+- service stream 设置最低优先级仍在同一位置停止。
+- batch DONE 后停止空转 service，能够继续到 `after_forward`、`swap_in/read DONE`
+  和 `Run summary`。
 
-必须从 root wrapper 的真实进程环境确认：
+因此目前证据支持：问题不只是 connection 数量或 stream priority，而是 V100 上
+resident poll 与 PyTorch attention 的执行资源/调度共存不可靠。旧 one-copy 能跑通，
+说明应继续对比其“IO 活跃期 service、空闲阶段停止”的生命周期条件。
 
-```text
-CUDA_DEVICE_MAX_CONNECTIONS
-CUDA_LAUNCH_BLOCKING
-CUDA_VISIBLE_DEVICES
-```
+### 11.2 已收束：普通 stream 调度参数
 
-特别检查 `CUDA_DEVICE_MAX_CONNECTIONS=1`。如果 service stream 与 compute stream
-被映射到同一个 hardware work queue，先入队且永不结束的 persistent kernel 可能
-让后续 attention kernel 排在其后。
+`CUDA_DEVICE_MAX_CONNECTIONS=8` 和最低优先级 service stream 均未恢复
+`after_forward`。它们可以保留为诊断或兼容配置，但不能作为 resident service 与
+attention 隔离方案。
 
-验证方式必须是 direct-only wrapper 固定环境，不修改系统全局环境：
+### 11.3 已收束：生命周期条件
 
-```text
-CUDA_DEVICE_MAX_CONNECTIONS=8
-CUDA_LAUNCH_BLOCKING=0
-```
+停止 batch 完成后的空转 service 可以恢复完整 Qwen2.5 direct KVStore 链路。因此
+当前 V100 的可交付策略是：IO 活跃期间保留后台 poll，IO batch 空闲后退役 service，
+下一次 submit 再启动。这个策略不破坏 IO 活跃期的后台常驻语义，也不要求所有未来
+请求排队到当前请求完全结束后才能计算。
 
-只运行一次相同 Qwen2.5 workload。判断标准：
+### 11.4 对齐旧 one-copy 的保留检查
 
-```text
-resident service 不停止
-write DONE 后出现 after_forward
-随后出现 swap_in/read DONE 和 Run summary
-```
-
-如果该测试通过，根因是 hardware queue 映射，而不是 CQ ownership 或 ready
-协议。最终只需要把 direct 运行环境固定为多个 connection，并增加启动时诊断。
-
-### 11.3 第一步 B：降低 service stream 调度优先级
-
-如果多个 hardware connections 仍复现，下一项最小代码实验是把 service stream
-创建为最低优先级：
-
-```cpp
-int least_priority = 0;
-int greatest_priority = 0;
-cudaDeviceGetStreamPriorityRange(&least_priority, &greatest_priority);
-cudaStreamCreateWithPriority(
-    &service_stream, cudaStreamNonBlocking, least_priority);
-```
-
-PyTorch compute stream 保持默认优先级。该改动不停止 resident service、不改变
-request/CQ 状态机，只向 CUDA 调度器声明：有新 block 可调度时优先 compute。
-
-限制：stream priority 不能抢占已经运行的 thread block，因此它不是 AGIO Green
-Context 的等价替代。它只适合验证当前阻塞是否来自待调度 work 的优先级/queue
-选择。
-
-### 11.4 第一步 C：对齐旧 one-copy 启动条件
-
-若 A/B 都失败，逐项核对：
+以下检查仍作为 direct 与旧 one-copy 的链路对照项保留，不再作为普通 stream 调度
+参数实验的前置条件：
 
 - service 启动前是否已完成所有 PyTorch/XFormers workspace 和 lazy kernel 初始化。
 - service stream 是否与旧 one-copy 使用相同 CUDA context。
@@ -613,18 +669,23 @@ attention exit
 layer0 exit
 ```
 
-### 11.5 第一步 D：硬件资源隔离的决策边界
+### 11.5 中长期：独立 daemon 与 MPS PoC
 
-如果确认普通 stream 在当前 V100 上无法可靠容纳 resident poll，真正对齐 AGIO
-需要硬件执行资源隔离，而不是 per-batch stop。候选路线：
+如果目标是恢复真正的 resident service，同时允许 attention 持续推进，优先级应为：
 
-1. 在支持 Green Context 的 GPU/driver/CUDA 组合上建立 I/O control domain。
-2. 评估 V100 可用的 MPS execution affinity/active-thread partition，但这可能需要
-   独立 context/process 和 CUDA IPC，会显著扩大架构改动。
-3. 在做平台迁移前，以旧 one-copy 的可运行版本继续作为 V100 correctness
-   reference。
+1. 用两个独立 CUDA client 做最小 persistent-poll/compute 共存 PoC。
+2. 在 MPS 下给 poll client 设置较小配额、给 compute client 设置主要配额，观察
+   compute 是否稳定推进。
+3. 再验证固定 GPU buffer 的 CUDA IPC：一个进程导出 allocation，另一个进程打开并
+   完成一次 BaM direct IO。
+4. 最后才把 request ring、completion ring、KV block 引用计数接入 vLLM。
 
-未确认平台 API 前，不实现 MPS/多 context，不把问题复杂化。
+这条路线是架构验证，不改变当前 direct 主线。若 MPS PoC 成功，说明独立 daemon
+方向有根因层面的价值；若只有独立进程而没有 MPS 仍失败，则进一步确认问题是执行
+资源隔离而非 Python 线程隔离。
+
+在当前 CUDA 12.2 header 缺少 Green Context API 的前提下，不直接移植 AGIO Green
+Context。MPS 也暂不视为已验证能力，直到完成上述最小 PoC。
 
 ### 11.6 heartbeat 的处理顺序
 
@@ -689,6 +750,20 @@ Run summary
 console log path
 ```
 
+中长期 daemon+MPS 验证不进入当前 direct workload 的默认测试路径，单独按以下
+顺序进行：
+
+```text
+独立 persistent poll 进程 + compute 进程
+  -> MPS 配额对比
+  -> CUDA IPC 固定 GPU buffer roundtrip
+  -> BaM direct IO roundtrip
+  -> request/block completion pipeline
+```
+
+验证成功标准是 compute 进程在 daemon resident poll 持续运行时仍能稳定完成计算，
+并且 IPC buffer 的数据和 completion 顺序正确；不能只以 daemon 进程存活作为成功。
+
 完整成功标准：
 
 ```text
@@ -703,11 +778,29 @@ swap_out
 
 ## 13. 构建、权限与会话约束
 
-- 不读取旧 Codex JSONL。
-- 只用窄范围 `rg`、`sed`、`tail` 检查日志和代码。
+### 13.1 长上下文排查纪律
+
+- 不恢复旧会话上下文，不读取 `~/.codex/sessions/*.jsonl`，不依赖旧 rollout JSONL
+  或超大历史；只以当前交接文档、本文和当前链路的必要证据恢复状态。
+- 每轮只执行一个目标明确的读取命令。执行前说明该命令要回答的问题，优先使用窄
+  范围 `sed -n`、精确 `rg --max-count`、`head` 或 `tail`。
+- 禁止无边界的全仓库 `rg`/`find`，禁止读取长日志全文，禁止为“完整性”展开与当前
+  调度、completion、buffer 生命周期无关的实现。
+- 一旦证据足够，立即停止读取并记录：事实、判断、未证实假设和下一步；不重复读取
+  已确认内容，也不把早期假设继续当作当前结论。
+- 读取日志时只保留关键事件窗口：`write/read DONE`、`before_forward`、
+  `after_forward`、`Run summary`、错误和退出状态，并记录日志路径与测试环境。
+- 用户要求“只回答问题、只总结思路”时不修改代码；需要修改或运行测试时，先明确
+  影响范围，再执行最小必要动作。
+
+### 13.2 权限、进程与系统状态
+
 - 测试脚本一次只运行一个。
-- 权限不足立即停止，并给出 sudoers/wrapper 命令。
-- root wrapper 启动的进程必须由授权 wrapper 或 root 精确终止。
+- 需要 `sudo`、加载/卸载内核模块、修改系统配置、启动/停止系统级服务或执行其他
+  破坏性操作时立即停止，只给出用户手动执行的命令和权限配置步骤。
+- 只有用户明确授权的测试进程清理可以执行；清理时必须按授权 wrapper 或精确 PID
+  操作，不能使用模糊的全局 kill，并在结束后确认没有残留测试进程。
+- 权限不足立即停止，并给出最小 sudoers/wrapper 命令；不通过扩大权限范围绕过问题。
 - 不改 LMCache SSD、GDS 和旧 BaM one-copy baseline。
 - direct 正常路径采用 `io_active` 生命周期；保留后台 poll 的 IO 活跃期常驻语义，
   但不在 V100 上让空转 service 跨 PyTorch forward。
@@ -720,6 +813,21 @@ KV cache、GPU CQ completion 和 CPU 只读 DONE 均已验证。当前 V100 可�
 `io_active` 生命周期：后台 persistent poll 在 IO 活跃期保留，batch 空闲后退役，
 避免空转 service 与真实 Qwen2.5 attention 争用执行资源。
 
+当前判断分成两层：
+
+```text
+短期 V100 保底：io_active
+  IO 活跃期保留后台 poll
+  batch 空闲后停止空转 service
+  保证 Qwen2.5 direct KVStore 链路能跑通
+
+中长期 resident 目标：独立 BaM daemon + MPS + CUDA IPC
+  daemon 保留后台 poll
+  MPS 限制 daemon 执行资源
+  IPC 共享 KV buffer 和 completion 状态
+  vLLM 按 block/request 消费 ready 数据
+```
+
 AGIO 给出的最重要结论不是“给 poll 加 sleep”，而是：
 
 ```text
@@ -728,8 +836,12 @@ application 和 runtime 通过 GPU-visible request/completion state 通信；
 runtime 正常只在 shutdown 时退出。
 ```
 
-当前 V100/CUDA 12.2 不能直接使用 AGIO 的 Green Context 实现。已验证普通 stream
-路径下 hardware work queue connections 和 service stream priority 不足以保证
-resident service 跨 forward 共存；因此 direct 默认对齐旧 one-copy 的 idle-stop
-生命周期。未来若迁移到支持 Green Context/MPS partition 的平台，再重新评估
-`resident` 生命周期。
+Hyperion 进一步说明，独立进程方案需要 CUDA IPC buffer、多槽 pipeline 和明确的
+producer/consumer 生命周期；它的 completion 也是阶段性启动，而不是无边界地占用
+GPU。当前 V100/CUDA 12.2 不能直接使用 AGIO 的 Green Context 实现，普通 stream
+connections 和最低优先级也不足以保证 resident service 跨 forward 共存。因此
+direct 默认采用 `io_active`，而 `resident` 只保留为实验模式。
+
+独立 daemon + MPS 是有依据但尚未验证的后续方向：它比同一进程内的线程或 stream
+调整更接近当前故障根因，但是否能接入 BaM direct 的 GPU 地址和 DMA mapping，必须
+通过最小 CUDA IPC/BaM roundtrip 逐步确认。

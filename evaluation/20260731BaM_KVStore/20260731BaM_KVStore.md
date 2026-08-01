@@ -597,6 +597,54 @@ BaM daemon
 这个架构仍然支持连续请求和细粒度预取。attention 只等待当前依赖的 KV blocks，
 不等待 daemon 清空全部请求队列。
 
+### 10.5 是否必须拆出整个 BaM
+
+不一定要把整个 BaM_IOStack 拆成独立 daemon，但必须区分 CPU thread、CUDA stream
+和 CUDA 执行资源域：
+
+```text
+当前同一进程、同一 CUDA primary context
+  service stream  -> persistent CQ poll
+  PyTorch streams -> attention compute
+```
+
+MPS active-thread percentage 的资源配额作用于 CUDA client/context，不作用于单个
+CPU thread 或单个 CUDA stream。因此当前结构即使开启 MPS，也不能在同一 context
+内得到 `service stream=10%`、`attention streams=90%` 的隔离。已经失败的
+hardware connections 和 stream priority 实验也说明普通 stream 调度参数不能提供
+所需边界。
+
+当前有三条可选路线：
+
+| 路线 | 进程边界 | GPU poll 形态 | 隔离性质 | 当前状态 |
+|---|---|---|---|---|
+| `io_active` | 同进程/同 context | IO 活跃期 resident，空闲后停止 | 生命周期避让 | 已验证可运行 |
+| finite poll slice | 同进程/同 context | host service 常驻，GPU poll kernel 周期退出并重启 | 软件调度点 | 尚未验证 |
+| 独立 service execution domain | 独立 context，优先采用独立进程 | GPU poll 可永久 resident | MPS 执行资源限制 | synthetic/PyTorch 调度层已验证 |
+
+finite poll slice 不要求所有请求完成后才能执行 attention。后台 host service 可以
+持续接收请求，每个 GPU poll kernel 只运行固定轮数或固定 cycles，退出后立即按活跃
+请求重新 launch；request/block ready 后即可唤醒对应消费者。它保留的是逻辑常驻
+service，而不是单个永不退出的 GPU kernel。优点是无需跨 context 共享 KV allocation，
+代价是增加 kernel relaunch 开销，并且没有硬件级隔离保证。
+
+同一进程创建两个 CUDA context 后，理论上也可以使用 Volta MPS 做 context 级资源
+限制，因此“独立进程”不是硬性条件。但 PyTorch KV allocation 属于 primary context，
+第二个 service context 仍需解决跨 context memory、request/completion queue、GPU
+地址和 DMA mapping；还会引入 CUDA context 切换和 PyTorch runtime 交互风险。这些
+问题与独立 daemon 的 CUDA IPC 数据面复杂度接近，但生命周期更隐蔽。
+
+因此准确判断是：
+
+```text
+不是必须拆出整个 BaM；
+严格永久 resident poll 必须拆出独立 CUDA 执行资源域。
+```
+
+若采用 daemon，只需要拆出 persistent CQ service、其 CUDA context 和必要的
+request/completion 数据面。vLLM 的 KV block table、请求调度、引用计数和策略层仍
+保留在当前进程，不需要把整个 BaM_IOStack 或 KVStore 生命周期都迁出去。
+
 ## 11. 第一优先级：解决常驻线程冲突
 
 ### 11.1 当前平台约束
@@ -669,7 +717,7 @@ attention exit
 layer0 exit
 ```
 
-### 11.5 中长期：独立 daemon 与 MPS PoC
+### 11.5 中长期：独立执行资源域与 MPS PoC
 
 如果目标是恢复真正的 resident service，同时允许 attention 持续推进，优先级应为：
 
@@ -680,12 +728,63 @@ layer0 exit
    完成一次 BaM direct IO。
 4. 最后才把 request ring、completion ring、KV block 引用计数接入 vLLM。
 
-这条路线是架构验证，不改变当前 direct 主线。若 MPS PoC 成功，说明独立 daemon
-方向有根因层面的价值；若只有独立进程而没有 MPS 仍失败，则进一步确认问题是执行
-资源隔离而非 Python 线程隔离。
+前两步的调度 PoC 已于 2026-08-01 完成。测试没有修改 BaM、vLLM 或 direct 逻辑，
+只使用 `/tmp/bam_mps_isolation_probe.cu` 构造独立 synthetic poll/compute client。
+环境：
+
+```text
+GPU=Tesla V100S 32GB, 80 SM
+driver=535.230.02
+CUDA=12.2
+MPS control daemon=user xhk
+GPU compute mode=EXCLUSIVE_PROCESS
+```
+
+MPS 配额在 V100 上确实生效：
+
+```text
+poll client:    CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=10 -> 可见 8 SM
+compute client: CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=90 -> 可见 72 SM
+```
+
+关键结果：
+
+| 场景 | poll 配置 | compute 结果 |
+|---|---:|---:|
+| synthetic compute baseline | 无 poll | `494.823 ms` |
+| synthetic full-resource 对照 | `80 blocks x 1024 threads`, poll 100% | `450.113 ms`，未等待 poll 退出 |
+| synthetic 10/90 配额 | `8 blocks x 1024 threads`, poll 10% | `416.099 ms`，未等待 poll 退出 |
+| PyTorch GEMM baseline | 无 poll，compute 90% | `0.572 s` |
+| PyTorch + 重负载 poll | `8 blocks x 1024 threads`, poll 10% | `5.145 s`，能完成但干扰明显 |
+| PyTorch + direct 同规模 poll | `1 block x 128 threads`, poll 10% | `0.565 s`，先于 poll 完成 |
+
+当前 direct persistent CQ service 的实际 launch 是 `1 block x 128 threads`。在与其
+相同规模的独立 poll client 持续运行时，PyTorch 50 次 `4096 x 4096` FP32 GEMM
+用时与 baseline 基本一致。这提供了直接证据：
+
+```text
+独立 CUDA client
+  + MPS 10% poll / 90% compute
+  + 受控的单 CTA persistent poll
+  -> PyTorch compute 能持续获得调度
+  -> 未复现同进程普通 stream 的永久 before_forward 阻塞
+```
+
+同时，重负载 poll 的 `5.145 s` 结果说明 MPS active-thread percentage 不是 Green
+Context 那样的完全无干扰固定 SM 分区；daemon 的 block/thread 数仍必须严格受控。
+当前 `1 x 128` 配置满足这一条件，但后续扩展 queue/service 并行度时必须重新测量。
+
+调度层已经验证，数据面仍未验证。下一步不是修改当前 direct 主线，而是验证固定 GPU
+buffer 的 CUDA IPC，以及 daemon context 中的 BaM GPU 地址/DMA mapping：
+
+1. 一个进程导出 CUDA allocation，另一个进程打开并完成 GPU buffer roundtrip。
+2. daemon 对该 IPC buffer 完成一次 BaM direct IO。
+3. 验证 completion event、buffer 生命周期和数据正确性。
+4. 最后才把 request ring、completion ring、KV block 引用计数接入 vLLM。
 
 在当前 CUDA 12.2 header 缺少 Green Context API 的前提下，不直接移植 AGIO Green
-Context。MPS 也暂不视为已验证能力，直到完成上述最小 PoC。
+Context。MPS 的调度隔离能力已验证，但不能据此宣称独立 BaM daemon 的 CUDA IPC
+和 NVMe DMA 数据面已经成立。
 
 ### 11.6 heartbeat 的处理顺序
 
@@ -754,15 +853,17 @@ console log path
 顺序进行：
 
 ```text
-独立 persistent poll 进程 + compute 进程
-  -> MPS 配额对比
-  -> CUDA IPC 固定 GPU buffer roundtrip
+独立 persistent poll 进程 + compute 进程  [完成]
+  -> MPS 10/90 配额对比                     [完成]
+  -> direct 同规模 poll + PyTorch compute   [完成]
+  -> CUDA IPC 固定 GPU buffer roundtrip     [待验证]
   -> BaM direct IO roundtrip
   -> request/block completion pipeline
 ```
 
-验证成功标准是 compute 进程在 daemon resident poll 持续运行时仍能稳定完成计算，
-并且 IPC buffer 的数据和 completion 顺序正确；不能只以 daemon 进程存活作为成功。
+调度阶段的成功标准已经满足：PyTorch compute 在 direct 同规模 resident poll 持续
+运行时稳定完成，耗时与 baseline 基本一致。完整 daemon 方案仍需 IPC buffer 数据、
+BaM DMA mapping 和 completion 顺序正确；不能只以 MPS 下 compute 能运行为完整成功。
 
 完整成功标准：
 
@@ -813,7 +914,7 @@ KV cache、GPU CQ completion 和 CPU 只读 DONE 均已验证。当前 V100 可�
 `io_active` 生命周期：后台 persistent poll 在 IO 活跃期保留，batch 空闲后退役，
 避免空转 service 与真实 Qwen2.5 attention 争用执行资源。
 
-当前判断分成两层：
+当前判断分成三层：
 
 ```text
 短期 V100 保底：io_active
@@ -821,10 +922,17 @@ KV cache、GPU CQ completion 和 CPU 只读 DONE 均已验证。当前 V100 可�
   batch 空闲后停止空转 service
   保证 Qwen2.5 direct KVStore 链路能跑通
 
-中长期 resident 目标：独立 BaM daemon + MPS + CUDA IPC
-  daemon 保留后台 poll
+同进程备选：finite poll slice
+  host service 逻辑常驻
+  GPU poll kernel 周期退出并重启
+  为 attention 建立明确调度点
+  尚未验证性能和稳定性
+
+严格 resident 目标：独立 CUDA execution domain
+  优先实现为最小 BaM service daemon + MPS
+  daemon 保留永久后台 GPU poll
   MPS 限制 daemon 执行资源
-  IPC 共享 KV buffer 和 completion 状态
+  CUDA IPC 共享固定 KV buffer 和 completion 状态
   vLLM 按 block/request 消费 ready 数据
 ```
 
@@ -842,6 +950,16 @@ GPU。当前 V100/CUDA 12.2 不能直接使用 AGIO 的 Green Context 实现，�
 connections 和最低优先级也不足以保证 resident service 跨 forward 共存。因此
 direct 默认采用 `io_active`，而 `resident` 只保留为实验模式。
 
-独立 daemon + MPS 是有依据但尚未验证的后续方向：它比同一进程内的线程或 stream
-调整更接近当前故障根因，但是否能接入 BaM direct 的 GPU 地址和 DMA mapping，必须
-通过最小 CUDA IPC/BaM roundtrip 逐步确认。
+独立 daemon + MPS 的调度层已在当前 V100 上完成最小验证：10% poll client 实际只
+看到 8 SM，90% PyTorch client 看到 72 SM；与 direct 相同的 `1 x 128` persistent
+poll 持续运行时，PyTorch GEMM 为 `0.565 s`，与 `0.572 s` baseline 基本一致。
+因此该方向比同一进程内调整 thread 或 stream 更接近当前故障根因，并且已经证明有
+能力解除计算永久阻塞。
+
+这不表示必须拆出整个 BaM_IOStack。真正必须拆开的是 GPU 执行资源域；只拆
+persistent CQ service 是首选边界。若不要求单个 GPU poll kernel 永久 resident，
+也可以先验证同 context 的 finite poll slice，以较小改动换取软件调度点。
+
+尚未验证的是独立 BaM daemon 的数据面：CUDA IPC allocation、daemon context 中的
+GPU 地址、NVMe DMA mapping、跨进程 completion 和 KV block 生命周期。只有最小
+CUDA IPC/BaM roundtrip 通过后，才能把该方向提升为 direct `resident` 的可替代实现。

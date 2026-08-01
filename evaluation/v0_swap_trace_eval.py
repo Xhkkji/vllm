@@ -116,6 +116,12 @@ def parse_args() -> argparse.Namespace:
                         type=int,
                         default=None,
                         help="可选，显式限制 scheduler 的单步 token budget")
+    parser.add_argument(
+        "--num-gpu-blocks-override",
+        type=int,
+        default=None,
+        help=("可选，覆盖 profiling 得到的 GPU KV block 数。用于以确定方式制造 "
+              "swap/preemption 压力，不影响未设置该参数的历史 baseline。"))
     parser.add_argument("--device",
                         default="cuda",
                         help="显式指定 vLLM 设备类型，V100 实验建议设为 cuda")
@@ -181,6 +187,26 @@ def build_token_prompts(tokenizer: AutoTokenizer, prompt_len: int,
     return prompts
 
 
+def close_runtime(llm: object) -> None:
+    """显式关闭实验 runtime，避免 Python finalization 阶段遗留 GPU service。
+
+    普通 vLLM 路径没有 ``bam_direct_kv_store``，此函数会直接跳过；新 direct
+    backend 则必须先停止 persistent CQ worker、解除 DMA mapping，再销毁 NCCL
+    process group。该顺序与生产进程的显式 shutdown 语义一致。
+    """
+    llm_engine = getattr(llm, "llm_engine", None)
+    model_executor = getattr(llm_engine, "model_executor", None)
+    driver_worker = getattr(model_executor, "driver_worker", None)
+    worker = getattr(driver_worker, "worker", None)
+    for cache_engine in getattr(worker, "cache_engine", ()):
+        direct_store = getattr(cache_engine, "bam_direct_kv_store", None)
+        if direct_store is not None:
+            direct_store.close()
+
+    from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
+    cleanup_dist_env_and_memory()
+
+
 def main() -> None:
     args = parse_args()
     setup_file_logging(Path(args.log_dir), args.model)
@@ -223,6 +249,7 @@ def main() -> None:
     print(f"best_of={args.best_of}")
     print(f"max_num_seqs={args.max_num_seqs}")
     print(f"max_num_batched_tokens={args.max_num_batched_tokens}")
+    print(f"num_gpu_blocks_override={args.num_gpu_blocks_override}")
     print(
         f"disable_async_output_proc={args.disable_async_output_proc}")
     print(f"VLLM_USE_V1={os.environ.get('VLLM_USE_V1')}")
@@ -250,6 +277,8 @@ def main() -> None:
         llm_kwargs["max_num_seqs"] = args.max_num_seqs
     if args.max_num_batched_tokens is not None:
         llm_kwargs["max_num_batched_tokens"] = args.max_num_batched_tokens
+    if args.num_gpu_blocks_override is not None:
+        llm_kwargs["num_gpu_blocks_override"] = args.num_gpu_blocks_override
 
     llm = LLM(**llm_kwargs)
 
@@ -280,6 +309,8 @@ def main() -> None:
     for idx in range(preview_count):
         text = outputs[idx].outputs[0].text
         print(f"[preview {idx}] {text[:200]!r}")
+
+    close_runtime(llm)
 
 
 if __name__ == "__main__":

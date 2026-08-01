@@ -451,6 +451,13 @@ class Worker(LocalOrDistributedWorkerBase):
                     worker_input.blocks_to_copy.shape[0],
                 )
             self.cache_engine[virtual_engine].copy(worker_input.blocks_to_copy)
+        if envs.VLLM_V0_SWAP_TRACE:
+            logger.info(
+                "[V0_SWAP_TRACE][Worker.execute] ve=%d phase=done "
+                "num_seq_groups=%d",
+                virtual_engine,
+                worker_input.num_seq_groups,
+            )
 
     def _get_cached_seq_group_metadata(
             self,

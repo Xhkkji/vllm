@@ -1845,9 +1845,18 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         token_count = (
             int(model_input.input_tokens.shape[0])
             if model_input.input_tokens is not None else 0)
+        # 【BaM KVStore 直通调用链】真实 swap 后用这个边界判断是否进入 forward。
+        virtual_engine = model_input.virtual_engine
+        if envs.VLLM_V0_SWAP_TRACE:
+            logger.info(
+                "[V0_SWAP_TRACE][ModelRunner.execute_model] phase=enter "
+                "ve=%s phase_name=%s tokens=%d",
+                str(virtual_engine),
+                phase_name,
+                token_count,
+            )
         # TODO(andoorve): We can remove this once all
         # virtual engines share the same kv cache.
-        virtual_engine = model_input.virtual_engine
         previous_hidden_states = kwargs.get("previous_hidden_states")
         if prefill_meta is None and decode_meta.use_cuda_graph:
             assert model_input.input_tokens is not None
@@ -1917,6 +1926,14 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             model_forward_start.record()
 
         if not bypass_model_exec:
+            if envs.VLLM_V0_SWAP_TRACE:
+                logger.info(
+                    "[V0_SWAP_TRACE][ModelRunner.execute_model] "
+                    "phase=before_forward ve=%s phase_name=%s tokens=%d",
+                    str(virtual_engine),
+                    phase_name,
+                    token_count,
+                )
             with _bam_nvtx_range(
                     f"vllm_forward:{phase_name}:tokens={token_count}"):
                 with set_forward_context(model_input.attn_metadata,
@@ -1930,6 +1947,14 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                         **seqlen_agnostic_kwargs,
                         **model_kwargs,
                     )
+            if envs.VLLM_V0_SWAP_TRACE:
+                logger.info(
+                    "[V0_SWAP_TRACE][ModelRunner.execute_model] "
+                    "phase=after_forward ve=%s phase_name=%s tokens=%d",
+                    str(virtual_engine),
+                    phase_name,
+                    token_count,
+                )
 
         if (self.observability_config is not None
                 and self.observability_config.collect_model_forward_time):
@@ -1967,9 +1992,25 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                     torch.tensor(model_forward_time + orig_model_forward_time))
             return hidden_or_intermediate_states
 
+        if envs.VLLM_V0_SWAP_TRACE:
+            logger.info(
+                "[V0_SWAP_TRACE][ModelRunner.execute_model] "
+                "phase=before_logits ve=%s phase_name=%s tokens=%d",
+                str(virtual_engine),
+                phase_name,
+                token_count,
+            )
         with _bam_nvtx_range(f"vllm_logits:{phase_name}:tokens={token_count}"):
             logits = self.model.compute_logits(hidden_or_intermediate_states,
                                                model_input.sampling_metadata)
+        if envs.VLLM_V0_SWAP_TRACE:
+            logger.info(
+                "[V0_SWAP_TRACE][ModelRunner.execute_model] "
+                "phase=after_logits ve=%s phase_name=%s tokens=%d",
+                str(virtual_engine),
+                phase_name,
+                token_count,
+            )
         _maybe_log_bam_logits_semantic_debug(
             model_input=model_input,
             hidden_or_intermediate_states=hidden_or_intermediate_states,
@@ -1983,10 +2024,26 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             model_input.async_callback()
 
         # Sample the next token.
+        if envs.VLLM_V0_SWAP_TRACE:
+            logger.info(
+                "[V0_SWAP_TRACE][ModelRunner.execute_model] "
+                "phase=before_sample ve=%s phase_name=%s tokens=%d",
+                str(virtual_engine),
+                phase_name,
+                token_count,
+            )
         with _bam_nvtx_range(f"vllm_sample:{phase_name}:tokens={token_count}"):
             output: SamplerOutput = self.sampler(
                 logits=logits,
                 sampling_metadata=model_input.sampling_metadata,
+            )
+        if envs.VLLM_V0_SWAP_TRACE:
+            logger.info(
+                "[V0_SWAP_TRACE][ModelRunner.execute_model] "
+                "phase=after_sample ve=%s phase_name=%s tokens=%d",
+                str(virtual_engine),
+                phase_name,
+                token_count,
             )
         if (self.observability_config is not None
                 and self.observability_config.collect_model_forward_time
@@ -2020,6 +2077,14 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
 
             output.hidden_states = hidden_states
 
+        if envs.VLLM_V0_SWAP_TRACE:
+            logger.info(
+                "[V0_SWAP_TRACE][ModelRunner.execute_model] phase=exit "
+                "ve=%s phase_name=%s tokens=%d",
+                str(virtual_engine),
+                phase_name,
+                token_count,
+            )
         return [output]
 
     def need_recv_kv(self, model_input, kv_caches) -> bool:

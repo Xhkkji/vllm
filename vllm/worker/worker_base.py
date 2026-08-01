@@ -10,6 +10,7 @@ import cloudpickle
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.config import (ObservabilityConfig, VllmConfig,
                          set_current_vllm_config)
 from vllm.distributed import broadcast_tensor_dict, get_pp_group, get_tp_group
@@ -401,6 +402,14 @@ class LocalOrDistributedWorkerBase(WorkerBase):
             kwargs["spec_step_idx"] = execute_model_req.spec_step_idx
 
         self.execute_worker(worker_input)
+        if envs.VLLM_V0_SWAP_TRACE:
+            logger.info(
+                "[V0_SWAP_TRACE][WorkerBase] phase=after_execute_worker "
+                "ve=%d num_seq_groups=%d num_steps=%d",
+                worker_input.virtual_engine,
+                worker_input.num_seq_groups,
+                worker_input.num_steps,
+            )
 
         # If there is no input, we don't need to execute the model.
         if worker_input.num_seq_groups == 0:
@@ -425,6 +434,13 @@ class LocalOrDistributedWorkerBase(WorkerBase):
             num_steps=num_steps,
             **kwargs,
         )
+        if envs.VLLM_V0_SWAP_TRACE:
+            logger.info(
+                "[V0_SWAP_TRACE][WorkerBase] phase=after_model_runner "
+                "ve=%d output_is_none=%s",
+                worker_input.virtual_engine,
+                str(output is None).lower(),
+            )
 
         model_execute_time = time.perf_counter() - start_time
         if not get_pp_group().is_last_rank:
@@ -467,6 +483,13 @@ class LocalOrDistributedWorkerBase(WorkerBase):
                 execute_model_req.seq_group_metadata_list))
 
         self.execute_worker(worker_input)
+        if envs.VLLM_V0_SWAP_TRACE:
+            logger.info(
+                "[V0_SWAP_TRACE][WorkerBaseSPMD] "
+                "phase=after_execute_worker ve=%d num_seq_groups=%d",
+                worker_input.virtual_engine,
+                worker_input.num_seq_groups,
+            )
 
         # If there is no input, we don't need to execute the model.
         if worker_input.num_seq_groups == 0:
@@ -474,13 +497,21 @@ class LocalOrDistributedWorkerBase(WorkerBase):
 
         kwargs = extract_previous_hidden_states(execute_model_req)
 
-        return self.model_runner.execute_model(
+        output = self.model_runner.execute_model(
             model_input=model_input,
             kv_caches=self.kv_cache[worker_input.virtual_engine]
             if self.kv_cache is not None else None,
             intermediate_tensors=intermediate_tensors,
             **kwargs,
         )
+        if envs.VLLM_V0_SWAP_TRACE:
+            logger.info(
+                "[V0_SWAP_TRACE][WorkerBaseSPMD] "
+                "phase=after_model_runner ve=%d output_is_none=%s",
+                worker_input.virtual_engine,
+                str(output is None).lower(),
+            )
+        return output
 
 
 class WorkerWrapperBase:

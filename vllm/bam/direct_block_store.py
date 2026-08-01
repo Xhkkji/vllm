@@ -483,7 +483,14 @@ class BaMVLLMDirectKVStore:
         """【BaM KVStore 直通调用链】分批 submit、检查 ready 并完成请求。"""
         if src_to_dst.numel() == 0:
             return
+        transfer_start = time.perf_counter()
         mappings = src_to_dst.to(device="cpu", dtype=torch.int64).tolist()
+        if envs.VLLM_V0_SWAP_TRACE:
+            logger.info(
+                "[BAM_DIRECT_KVSTORE] op=%s phase=submit blocks=%d",
+                operation,
+                len(mappings),
+            )
         for begin in range(0, len(mappings), self.max_blocks_per_batch):
             batch = mappings[begin:begin + self.max_blocks_per_batch]
             source_ids = [int(mapping[0]) for mapping in batch]
@@ -504,6 +511,14 @@ class BaMVLLMDirectKVStore:
                 raise ValueError(f"unsupported direct KV operation: {operation}")
             self._wait_until_ready(handle)
             self.block_store.finish(handle)
+        if envs.VLLM_V0_SWAP_TRACE:
+            logger.info(
+                "[BAM_DIRECT_KVSTORE] op=%s phase=done blocks=%d "
+                "elapsed_ms=%.3f",
+                operation,
+                len(mappings),
+                (time.perf_counter() - transfer_start) * 1000.0,
+            )
 
     def _wait_until_ready(self, handle: BaMDirectBlockHandle) -> None:
         """【BaM KVStore 直通调用链】CPU 仅检查 GPU request-ready flag。"""

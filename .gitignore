@@ -222,3 +222,15 @@ evaluation/logs/**/lmcache_gds/
 evaluation/logs/**/*.safetensors
 evaluation/logs/**/*.bin
 evaluation/logs/**/*.pt
+
+# 20260802 baseline: keep curated Markdown, ignore generated payload/log data
+evaluation/20260802baseline/result/*
+!evaluation/20260802baseline/result/RESULTS.md
+evaluation/20260802baseline/**/*.log
+evaluation/20260802baseline/**/*.jsonl
+evaluation/20260802baseline/**/*.bin
+evaluation/20260802baseline/**/*.pt
+evaluation/20260802baseline/**/*.safetensors
+evaluation/20260802baseline/**/*.safetensors.metadata
+evaluation/20260802baseline/**/lmcache_local_disk/
+evaluation/20260802baseline/**/lmcache_gds/

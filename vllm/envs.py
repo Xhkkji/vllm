@@ -54,6 +54,12 @@ if TYPE_CHECKING:
     VLLM_BAM_KV_FAST_PATH: bool = False
     VLLM_BAM_GPU_INITIATED_PREFETCH: bool = False
     VLLM_BAM_DIRECT_KVSTORE_ENABLE: bool = False
+    VLLM_BAM_MDS_ENABLE: bool = False
+    VLLM_BAM_MDS_IOSTACK_ROOT: Optional[str] = None
+    VLLM_BAM_MDS_CONTROL_DIR: Optional[str] = None
+    VLLM_BAM_MDS_CUDA_IPC_LIBRARY: Optional[str] = None
+    VLLM_BAM_MDS_TORCH_BRIDGE_DIR: Optional[str] = None
+    VLLM_BAM_MDS_TIMEOUT_SECONDS: float = 120.0
     VLLM_BAM_DIRECT_PLACEMENT: bool = False
     VLLM_BAM_DIRECT_PLACEMENT_IMPL: str = "lmcache"
     VLLM_BAM_DIRECT_PLACEMENT_RUNTIME_ONE_COPY: bool = False
@@ -485,6 +491,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 因此不会改变 LMCache SSD、传统 GDS、普通 V0 swap 等 baseline 的行为。
     "VLLM_BAM_DIRECT_KVSTORE_ENABLE":
     lambda: bool(int(os.getenv("VLLM_BAM_DIRECT_KVSTORE_ENABLE", "0"))),
+
+    # MDS 把 BaM controller、DMA mapping 和 persistent CQ service 放到独立
+    # process；vLLM 仅导入 daemon-owned KV allocations 并同步提交 block mapping。
+    # 默认关闭，并且与本进程 direct/legacy BaM swap 路径互斥。
+    "VLLM_BAM_MDS_ENABLE":
+    lambda: bool(int(os.getenv("VLLM_BAM_MDS_ENABLE", "0"))),
+    "VLLM_BAM_MDS_IOSTACK_ROOT":
+    lambda: os.getenv("VLLM_BAM_MDS_IOSTACK_ROOT"),
+    "VLLM_BAM_MDS_CONTROL_DIR":
+    lambda: os.getenv("VLLM_BAM_MDS_CONTROL_DIR"),
+    "VLLM_BAM_MDS_CUDA_IPC_LIBRARY":
+    lambda: os.getenv("VLLM_BAM_MDS_CUDA_IPC_LIBRARY"),
+    "VLLM_BAM_MDS_TORCH_BRIDGE_DIR":
+    lambda: os.getenv("VLLM_BAM_MDS_TORCH_BRIDGE_DIR"),
+    "VLLM_BAM_MDS_TIMEOUT_SECONDS":
+    lambda: float(os.getenv("VLLM_BAM_MDS_TIMEOUT_SECONDS", "120")),
 
     # 是否启用 Direct Placement v0。
     # 开启后 LMCache retrieve 会优先尝试：

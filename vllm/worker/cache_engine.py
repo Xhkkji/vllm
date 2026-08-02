@@ -35,17 +35,28 @@ class CacheEngine:
         self.parallel_config = parallel_config
         self.device_config = device_config
         self.bam_direct_kvstore_enabled = envs.VLLM_BAM_DIRECT_KVSTORE_ENABLE
-        if self.bam_direct_kvstore_enabled and (
+        self.bam_mds_enabled = envs.VLLM_BAM_MDS_ENABLE
+        if self.bam_direct_kvstore_enabled and self.bam_mds_enabled:
+            raise ValueError(
+                "VLLM_BAM_MDS_ENABLE and VLLM_BAM_DIRECT_KVSTORE_ENABLE are "
+                "mutually exclusive")
+        if (self.bam_direct_kvstore_enabled or self.bam_mds_enabled) and (
                 envs.VLLM_BAM_SHADOW_ENABLE
                 or envs.VLLM_BAM_SWAPIN_ENABLE):
             raise ValueError(
-                "VLLM_BAM_DIRECT_KVSTORE_ENABLE cannot be combined with the "
-                "legacy BaM cache-backed V0 swap path")
+                "MDS/direct KVStore cannot be combined with the legacy BaM "
+                "cache-backed V0 swap path")
+        if self.bam_mds_enabled and (
+                parallel_config.tensor_parallel_size != 1
+                or parallel_config.pipeline_parallel_size != 1):
+            raise ValueError(
+                "Phase 4A MDS single-slot connector requires TP=1 and PP=1")
 
         # 【BaM KVStore 直通调用链】owner / DMA region 只为真实 GPU KV cache
         # 保活。普通 vLLM、LMCache 和 GDS 路径不会创建或读取这两张表。
         self._bam_direct_gpu_cache_owners: List[torch.Tensor] = []
         self._bam_direct_gpu_cache_regions: List[torch.Tensor] = []
+        self.bam_mds_connector = None
 
         self.head_size = model_config.get_head_size()
         # Models like Jamba, have mixed typed layers, E.g Mamba
@@ -81,7 +92,7 @@ class CacheEngine:
         # storage block id，但 payload 已经落到 SSD，因此不再分配等大的 CPU
         # KV tensor。关闭新开关时仍完整保留 vLLM 原生 CPU swap baseline。
         self.cpu_cache = (
-            [] if self.bam_direct_kvstore_enabled else
+            [] if (self.bam_direct_kvstore_enabled or self.bam_mds_enabled) else
             self._allocate_kv_cache(self.num_cpu_blocks, "cpu")
         )
         self.swap_trace_enabled = envs.VLLM_V0_SWAP_TRACE
@@ -96,7 +107,11 @@ class CacheEngine:
         self.bam_swap_reader = self._init_bam_swap_reader()
 
     def initialize_bam_direct_kv_store(self) -> None:
-        """【BaM KVStore 直通调用链】在所有 CUDA warmup 后注册真实 KV cache。"""
+        """在所有 CUDA warmup 后启用当前选中的 BaM KVStore transport。"""
+        if self.bam_mds_enabled:
+            assert self.bam_mds_connector is not None
+            self.bam_mds_connector.start()
+            return
         if not self.bam_direct_kvstore_enabled:
             return
         if self.bam_direct_kv_store is not None:
@@ -182,6 +197,19 @@ class CacheEngine:
         kv_cache_allocation_shape = tuple(kv_cache_generic_shape[i]
                                           for i in kv_cache_stride_order)
 
+        if self.bam_mds_enabled and device == "cuda":
+            from vllm.bam.mds_connector import BaMMDSConnector
+            self.bam_mds_connector = BaMMDSConnector(
+                allocation_shape=kv_cache_allocation_shape,
+                stride_order=kv_cache_stride_order,
+                dtype=self.dtype,
+                device_index=self.device_config.device.index or 0,
+                num_layers=self.num_attention_layers,
+                num_gpu_blocks=num_blocks,
+                num_storage_blocks=self.num_cpu_blocks,
+            )
+            return self.bam_mds_connector.gpu_cache
+
         for _ in range(self.num_attention_layers):
             # null block in CpuGpuBlockAllocator requires at least that
             # block to be zeroed-out.
@@ -218,7 +246,9 @@ class CacheEngine:
         才会继续发起当前 engine step 的 attention。
         """
         start = time.perf_counter()
-        if self.bam_direct_kv_store is not None:
+        if self.bam_mds_connector is not None:
+            self.bam_mds_connector.swap_in(src_to_dst)
+        elif self.bam_direct_kv_store is not None:
             self.bam_direct_kv_store.swap_in(src_to_dst)
         elif self.bam_swap_reader is not None:
             self.bam_swap_reader.swap_in(self.gpu_cache, self.cpu_cache,
@@ -236,7 +266,9 @@ class CacheEngine:
         write，不再先复制到 CPU cache，也不经过 BaM payload cache。
         """
         start = time.perf_counter()
-        if self.bam_direct_kv_store is not None:
+        if self.bam_mds_connector is not None:
+            self.bam_mds_connector.swap_out(src_to_dst)
+        elif self.bam_direct_kv_store is not None:
             self.bam_direct_kv_store.swap_out(src_to_dst)
         else:
             for i in range(self.num_attention_layers):

@@ -33,6 +33,9 @@ if [[ "${EUID}" -ne 0 ]]; then
     "MAX_TOKENS=${MAX_TOKENS:-128}" \
     "TEMPERATURE=${TEMPERATURE:-0.8}" \
     "BEST_OF=${BEST_OF:-4}" \
+    "SEED=${SEED:-1234}" \
+    "OUTPUT_JSON=${OUTPUT_JSON:-}" \
+    "REQUIRE_CLEAN_EXIT=${REQUIRE_CLEAN_EXIT:-0}" \
     "MAX_MODEL_LEN=${MAX_MODEL_LEN:-4096}" \
     "GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.60}" \
     "SWAP_SPACE=${SWAP_SPACE:-4}" \
@@ -63,6 +66,11 @@ echo "[20260802baseline] service_lifetime=${VLLM_BAM_DIRECT_SERVICE_LIFETIME}"
 echo "[20260802baseline] gpu_blocks=${EFFECTIVE_GPU_BLOCKS}"
 echo "[20260802baseline] log_dir=${LOG_DIR}"
 
+OUTPUT_ARGS=()
+if [[ -n "${OUTPUT_JSON:-}" ]]; then
+  OUTPUT_ARGS+=(--output-json "${OUTPUT_JSON}")
+fi
+
 set +e
 "${PYTHON_BIN}" "${ROOT_DIR}/evaluation/v0_swap_trace_eval.py" \
   "${MODEL}" \
@@ -71,6 +79,7 @@ set +e
   --max-tokens "${MAX_TOKENS:-128}" \
   --temperature "${TEMPERATURE:-0.8}" \
   --best-of "${BEST_OF:-4}" \
+  --seed "${SEED:-1234}" \
   --n 1 \
   --max-model-len "${MAX_MODEL_LEN:-4096}" \
   --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.60}" \
@@ -82,6 +91,7 @@ set +e
   --num-gpu-blocks-override "${EFFECTIVE_GPU_BLOCKS}" \
   --enforce-eager \
   --log-dir "${LOG_DIR}" \
+  "${OUTPUT_ARGS[@]}" \
   >"${CONSOLE_LOG}" 2>&1
 PY_STATUS=$?
 set -e
@@ -111,6 +121,10 @@ echo "[20260802baseline] log=${LOG_PATH}"
 echo "[20260802baseline] python_exit_status=${PY_STATUS}"
 echo "[20260802baseline] swap_out=${SWAP_OUT_COUNT} swap_in=${SWAP_IN_COUNT}"
 if [[ "${PY_STATUS}" -ne 0 ]]; then
+  if [[ "${REQUIRE_CLEAN_EXIT:-0}" == "1" ]]; then
+    echo "[20260802baseline] FAIL: python exited with ${PY_STATUS}" >&2
+    exit "${PY_STATUS}"
+  fi
   echo "[20260802baseline] WARN: python exited with ${PY_STATUS} after required trace events were recorded"
 fi
 echo "[20260802baseline] PASS"

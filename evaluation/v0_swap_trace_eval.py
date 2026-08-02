@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import hashlib
+import json
 import os
 import sys
 import time
@@ -42,6 +44,35 @@ class TeeStream:
                    for stream in self.streams)
 
 
+class LoggingSession:
+    """显式管理 TeeStream 与日志文件的关闭顺序。
+
+    必须先把 ``sys.stdout/sys.stderr`` 恢复为原始 stream，再关闭 log file。
+    旧逻辑只在 atexit 关闭文件，解释器随后 flush TeeStream 时会访问已关闭文件，
+    触发 ``sys.unraisablehook`` 并把正常运行的最终退出码改成 120。
+    """
+
+    def __init__(self, original_stdout: TextIO, original_stderr: TextIO,
+                 log_file: TextIO) -> None:
+        self.original_stdout = original_stdout
+        self.original_stderr = original_stderr
+        self.log_file = log_file
+        self.closed = False
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        finally:
+            sys.stdout = self.original_stdout
+            sys.stderr = self.original_stderr
+        self.log_file.flush()
+        self.log_file.close()
+
+
 def _sanitize_name(name: str) -> str:
     safe = []
     for ch in name:
@@ -49,7 +80,8 @@ def _sanitize_name(name: str) -> str:
     return "".join(safe).strip("_") or "model"
 
 
-def setup_file_logging(log_dir: Path, model_name: str) -> Path:
+def setup_file_logging(log_dir: Path,
+                       model_name: str) -> tuple[Path, LoggingSession]:
     """将 stdout/stderr 同步写入 evaluation/logs 下的文件。"""
     log_dir.mkdir(parents=True, exist_ok=True)
     model_stub = _sanitize_name(Path(model_name).name)
@@ -57,12 +89,14 @@ def setup_file_logging(log_dir: Path, model_name: str) -> Path:
     log_path = log_dir / f"v0_swap_trace_{model_stub}_{timestamp}.log"
 
     log_file = log_path.open("w", encoding="utf-8")
-    atexit.register(log_file.close)
-
-    sys.stdout = TeeStream(sys.stdout, log_file)
-    sys.stderr = TeeStream(sys.stderr, log_file)
+    session = LoggingSession(sys.stdout, sys.stderr, log_file)
+    sys.stdout = TeeStream(session.original_stdout, log_file)
+    sys.stderr = TeeStream(session.original_stderr, log_file)
+    # 异常路径仍由 atexit 收口；正常路径会在 main 末尾提前 close。close 幂等，
+    # 因而不依赖 atexit handler 的注销或执行顺序。
+    atexit.register(session.close)
     print(f"Logs will be written to: {log_path}", flush=True)
-    return log_path
+    return log_path, session
 
 
 def parse_args() -> argparse.Namespace:
@@ -128,6 +162,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-dir",
                         default=str(REPO_ROOT / "evaluation" / "logs"),
                         help="日志目录，默认写到 evaluation/logs")
+    parser.add_argument(
+        "--output-json",
+        default=None,
+        help="可选，保存完整生成 token IDs 和确定性 SHA256，用于后端一致性比较")
     parser.add_argument("--seed",
                         type=int,
                         default=1234,
@@ -207,9 +245,64 @@ def close_runtime(llm: object) -> None:
     cleanup_dist_env_and_memory()
 
 
+def write_output_json(path: Path, args: argparse.Namespace,
+                      prompts: List[dict[str, List[int]]], outputs: list,
+                      elapsed_s: float) -> str:
+    """原子写入完整 token IDs，并返回只依赖 token 序列的稳定摘要。"""
+    requests = []
+    digest_payload = []
+    for request_index, (prompt, output) in enumerate(zip(prompts, outputs)):
+        prompt_ids = prompt["prompt_token_ids"]
+        candidates = []
+        digest_candidates = []
+        for candidate in output.outputs:
+            token_ids = [int(token_id) for token_id in candidate.token_ids]
+            candidates.append({
+                "token_ids": token_ids,
+                "text": candidate.text,
+                "finish_reason": candidate.finish_reason,
+            })
+            digest_candidates.append(token_ids)
+        prompt_digest = hashlib.sha256(
+            json.dumps(prompt_ids, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        requests.append({
+            "request_index": request_index,
+            "request_id": str(output.request_id),
+            "prompt_token_ids_sha256": prompt_digest,
+            "candidates": candidates,
+        })
+        digest_payload.append(digest_candidates)
+
+    token_digest = hashlib.sha256(
+        json.dumps(digest_payload, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    payload = {
+        "schema_version": 1,
+        "model": args.model,
+        "seed": args.seed,
+        "temperature": args.temperature,
+        "n": args.n,
+        "best_of": args.best_of,
+        "prompt_len": args.prompt_len,
+        "max_tokens": args.max_tokens,
+        "elapsed_s": elapsed_s,
+        "token_ids_sha256": token_digest,
+        "requests": requests,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with temporary.open("w", encoding="utf-8") as output_file:
+        json.dump(payload, output_file, ensure_ascii=False, sort_keys=True)
+        output_file.flush()
+        os.fsync(output_file.fileno())
+    os.replace(temporary, path)
+    return token_digest
+
+
 def main() -> None:
     args = parse_args()
-    setup_file_logging(Path(args.log_dir), args.model)
+    _, logging_session = setup_file_logging(Path(args.log_dir), args.model)
 
     # 这套实验只针对 V0 路径；如果外部没设置，这里给出安全默认值。
     os.environ.setdefault("VLLM_USE_V1", "0")
@@ -310,7 +403,19 @@ def main() -> None:
         text = outputs[idx].outputs[0].text
         print(f"[preview {idx}] {text[:200]!r}")
 
-    close_runtime(llm)
+    if args.output_json:
+        output_path = Path(args.output_json).resolve()
+        token_digest = write_output_json(output_path, args, prompts, outputs,
+                                         elapsed_s)
+        print(
+            f"[DETERMINISTIC_OUTPUT] path={output_path} "
+            f"sha256={token_digest} requests={len(outputs)}",
+            flush=True)
+
+    try:
+        close_runtime(llm)
+    finally:
+        logging_session.close()
 
 
 if __name__ == "__main__":

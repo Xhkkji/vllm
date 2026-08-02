@@ -198,7 +198,7 @@ class CacheEngine:
                                           for i in kv_cache_stride_order)
 
         if self.bam_mds_enabled and device == "cuda":
-            from vllm.bam.mds_connector import BaMMDSConnector
+            from vllm.bam.mds.connector import BaMMDSConnector
             self.bam_mds_connector = BaMMDSConnector(
                 allocation_shape=kv_cache_allocation_shape,
                 stride_order=kv_cache_stride_order,

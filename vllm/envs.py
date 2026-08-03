@@ -54,6 +54,8 @@ if TYPE_CHECKING:
     VLLM_BAM_KV_FAST_PATH: bool = False
     VLLM_BAM_GPU_INITIATED_PREFETCH: bool = False
     VLLM_BAM_DIRECT_KVSTORE_ENABLE: bool = False
+    VLLM_BAM_DIRECT_READ_MODE: str = "direct"
+    VLLM_BAM_SYNC_CACHE_SIZE_MB: int = 64
     VLLM_BAM_MDS_ENABLE: bool = False
     VLLM_BAM_MDS_IOSTACK_ROOT: Optional[str] = None
     VLLM_BAM_MDS_CONTROL_DIR: Optional[str] = None
@@ -491,6 +493,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 因此不会改变 LMCache SSD、传统 GDS、普通 V0 swap 等 baseline 的行为。
     "VLLM_BAM_DIRECT_KVSTORE_ENABLE":
     lambda: bool(int(os.getenv("VLLM_BAM_DIRECT_KVSTORE_ENABLE", "0"))),
+    # 仅改变 direct KVStore 的 swap-in 实现。默认 direct 完整保留当前路径；
+    # bam_sync 使用原生 BaM page cache，并在单次 kernel 内同步轮询 CQ。
+    "VLLM_BAM_DIRECT_READ_MODE":
+    lambda: os.getenv("VLLM_BAM_DIRECT_READ_MODE", "direct"),
+    "VLLM_BAM_SYNC_CACHE_SIZE_MB":
+    lambda: int(os.getenv("VLLM_BAM_SYNC_CACHE_SIZE_MB", "64")),
 
     # MDS 把 BaM controller、DMA mapping 和 persistent CQ service 放到独立
     # process；vLLM 仅导入 daemon-owned KV allocations 并同步提交 block mapping。

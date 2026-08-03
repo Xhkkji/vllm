@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import importlib
+import os
 from pathlib import Path
 import sys
 import time
@@ -378,6 +379,30 @@ def _import_bam_direct_kv_io() -> Any:
     raise ImportError("Failed to import BaMDirectKVIO:\n" + "\n".join(errors))
 
 
+def _import_bam_sync_reader() -> Any:
+    """只在显式 baseline 模式下定位隔离的同步 reader。"""
+    candidate_paths: list[Path] = []
+    if envs.VLLM_BAM_IMPORT_PATH:
+        import_path = Path(envs.VLLM_BAM_IMPORT_PATH).resolve()
+        candidate_paths.append(import_path.parent / "vllm_evaluation"
+                               / "BaM_sync_baseline")
+    candidate_paths.append(
+        Path(__file__).resolve().parents[3] / "BaM_IOStack"
+        / "vllm_evaluation" / "BaM_sync_baseline")
+
+    errors: list[str] = []
+    for path in candidate_paths:
+        path_string = str(path)
+        if path.exists() and path_string not in sys.path:
+            sys.path.insert(0, path_string)
+        try:
+            module = importlib.import_module("bam_sync_reader")
+            return module.BaMSyncKVReader
+        except Exception as exc:  # pragma: no cover - 依赖部署环境
+            errors.append(f"{path_string}: {type(exc).__name__}: {exc}")
+    raise ImportError("Failed to import BaMSyncKVReader:\n" + "\n".join(errors))
+
+
 def _parse_direct_ssd_list() -> tuple[int, ...]:
     """【BaM KVStore 直通调用链】复用现有 BaM SSD 选择配置。"""
     value = envs.VLLM_BAM_SSD_LIST
@@ -417,6 +442,18 @@ class BaMVLLMDirectKVStore:
             queue_depth=DIRECT_IO_QUEUE_DEPTH,
             num_queues=DIRECT_IO_NUM_QUEUES,
         )
+        self.sync_reader = None
+        self.read_mode = str(envs.VLLM_BAM_DIRECT_READ_MODE).strip().lower()
+        if self.read_mode not in ("direct", "bam_sync"):
+            self.direct_io.close()
+            raise ValueError(
+                "VLLM_BAM_DIRECT_READ_MODE must be direct or bam_sync")
+        if (self.read_mode == "bam_sync" and
+                os.getenv("VLLM_BAM_DIRECT_SERVICE_LIFETIME",
+                          "io_active").strip().lower() == "resident"):
+            self.direct_io.close()
+            raise ValueError(
+                "bam_sync read requires direct service lifetime io_active")
         try:
             layout = BaMDirectKVLayout.from_gpu_cache(gpu_cache)
             storage_bytes = int(num_storage_blocks) * layout.logical_block_bytes
@@ -431,10 +468,30 @@ class BaMVLLMDirectKVStore:
             # 同时留出 64MB 尾部 guard。该布局与已经验证稳定的 direct block
             # roundtrip 一致，既不覆盖旧 row/page baseline 从低地址开始使用的
             # 数据，也不把 NVMe command 压到 namespace 最后一个 LBA 边界。
+            ssd_alignment = (layout.fragment_bytes
+                             if self.read_mode == "bam_sync"
+                             else SSD_IO_ALIGNMENT)
             ssd_base_offset = (
-                (namespace_bytes - required_bytes) // SSD_IO_ALIGNMENT
-                * SSD_IO_ALIGNMENT
+                (namespace_bytes - required_bytes) // ssd_alignment
+                * ssd_alignment
             )
+            self.num_storage_blocks = int(num_storage_blocks)
+            fragments_per_block = layout.num_layers * 2
+            self.max_blocks_per_batch = max(
+                1, int(self.direct_io.request_capacity) // fragments_per_block
+            )
+            # BaM page cache、layer pointer table 和 mapping buffer 都会触发
+            # cudaMalloc，必须在下面 direct DMA region registration 之前完成。
+            if self.read_mode == "bam_sync":
+                sync_reader_class = _import_bam_sync_reader()
+                self.sync_reader = sync_reader_class(
+                    gpu_cache=gpu_cache,
+                    controllers=self.direct_io.controllers,
+                    ssd_base_offset=ssd_base_offset,
+                    num_storage_blocks=num_storage_blocks,
+                    max_blocks_per_batch=self.max_blocks_per_batch,
+                    cache_size_mb=int(envs.VLLM_BAM_SYNC_CACHE_SIZE_MB),
+                )
             self.block_store = BaMDirectBlockStore(
                 direct_io=self.direct_io,
                 gpu_cache=gpu_cache,
@@ -444,22 +501,19 @@ class BaMVLLMDirectKVStore:
         except Exception:
             self.direct_io.close()
             raise
-
-        self.num_storage_blocks = int(num_storage_blocks)
-        fragments_per_block = self.block_store.layout.num_layers * 2
-        self.max_blocks_per_batch = max(
-            1, int(self.direct_io.request_capacity) // fragments_per_block
-        )
         logger.info(
             "[BAM_DIRECT_KVSTORE] initialized layers=%d gpu_blocks=%d "
             "storage_blocks=%d logical_block_bytes=%d ssd_base_offset=%d "
-            "max_blocks_per_batch=%d bam_page_cache=0 staging=0 refill=0",
+            "max_blocks_per_batch=%d read_mode=%s bam_page_cache=%d "
+            "staging=0 refill=0",
             self.block_store.layout.num_layers,
             self.block_store.layout.num_gpu_blocks,
             self.num_storage_blocks,
             self.block_store.layout.logical_block_bytes,
             self.block_store.ssd_base_offset,
             self.max_blocks_per_batch,
+            self.read_mode,
+            int(self.sync_reader is not None),
         )
 
     def swap_out(self, src_to_dst: torch.Tensor) -> None:
@@ -472,6 +526,7 @@ class BaMVLLMDirectKVStore:
 
     def close(self) -> None:
         """【BaM KVStore 直通调用链】停止 persistent worker 并解除 DMA map。"""
+        self.sync_reader = None
         direct_io = getattr(self, "direct_io", None)
         if direct_io is not None:
             direct_io.close()
@@ -491,6 +546,15 @@ class BaMVLLMDirectKVStore:
                 operation,
                 len(mappings),
             )
+        if operation == "read" and self.sync_reader is not None:
+            reset_ms = self.sync_reader.prepare_read()
+            if envs.VLLM_V0_SWAP_TRACE:
+                logger.info(
+                    "[BAM_SYNC_BASELINE] op=read phase=cache_reset "
+                    "blocks=%d elapsed_ms=%.3f",
+                    len(mappings),
+                    reset_ms,
+                )
         for begin in range(0, len(mappings), self.max_blocks_per_batch):
             batch = mappings[begin:begin + self.max_blocks_per_batch]
             source_ids = [int(mapping[0]) for mapping in batch]
@@ -503,6 +567,22 @@ class BaMVLLMDirectKVStore:
                 )
             elif operation == "read":
                 self._validate_storage_block_ids(source_ids)
+                if self.sync_reader is not None:
+                    kernel_ms, total_ms = self.sync_reader.read_blocks(
+                        storage_block_ids=source_ids,
+                        gpu_block_ids=destination_ids,
+                    )
+                    if envs.VLLM_V0_SWAP_TRACE:
+                        logger.info(
+                            "[BAM_SYNC_BASELINE] op=read phase=done "
+                            "blocks=%d fragments=%d kernel_ms=%.3f "
+                            "elapsed_ms=%.3f",
+                            len(batch),
+                            len(batch) * self.block_store.layout.num_layers * 2,
+                            kernel_ms,
+                            total_ms,
+                        )
+                    continue
                 handle = self.block_store.read_blocks(
                     storage_block_ids=source_ids,
                     gpu_block_ids=destination_ids,

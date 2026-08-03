@@ -20,7 +20,7 @@ else
   EFFECTIVE_GPU_BLOCKS="${REQUESTED_GPU_BLOCKS}"
 fi
 
-if [[ "${EUID}" -ne 0 ]]; then
+if [[ "${EUID}" -ne 0 && "${BAM_SKIP_SUDO:-0}" != "1" ]]; then
   exec sudo -n env \
     "BAM_ROOT=${BAM_ROOT}" \
     "PYTHON_BIN=${PYTHON_BIN}" \
@@ -42,6 +42,8 @@ if [[ "${EUID}" -ne 0 ]]; then
     "MAX_NUM_SEQS=${MAX_NUM_SEQS:-8}" \
     "CUDA_DEVICE=${CUDA_DEVICE:-0}" \
     "VLLM_BAM_DIRECT_SERVICE_LIFETIME=${VLLM_BAM_DIRECT_SERVICE_LIFETIME:-io_active}" \
+    "VLLM_BAM_DIRECT_READ_MODE=${VLLM_BAM_DIRECT_READ_MODE:-direct}" \
+    "VLLM_BAM_SYNC_CACHE_SIZE_MB=${VLLM_BAM_SYNC_CACHE_SIZE_MB:-64}" \
     "VLLM_BAM_SSD_LIST=${VLLM_BAM_SSD_LIST:-0}" \
     "PYTHONPATH=${PYTHONPATH:-}" \
     "LD_LIBRARY_PATH=${BAM_ROOT}/bam/build/lib:${LD_LIBRARY_PATH:-}" \
@@ -55,6 +57,8 @@ export VLLM_ATTENTION_BACKEND=XFORMERS
 export VLLM_V0_SWAP_TRACE=1
 export VLLM_BAM_DIRECT_KVSTORE_ENABLE=1
 export VLLM_BAM_DIRECT_SERVICE_LIFETIME="${VLLM_BAM_DIRECT_SERVICE_LIFETIME:-io_active}"
+export VLLM_BAM_DIRECT_READ_MODE="${VLLM_BAM_DIRECT_READ_MODE:-direct}"
+export VLLM_BAM_SYNC_CACHE_SIZE_MB="${VLLM_BAM_SYNC_CACHE_SIZE_MB:-64}"
 export VLLM_BAM_SHADOW_ENABLE=0
 export VLLM_BAM_SWAPIN_ENABLE=0
 export VLLM_BAM_IMPORT_PATH="${BAM_ROOT}/gids_module"
@@ -63,6 +67,7 @@ export VLLM_BAM_SSD_LIST="${VLLM_BAM_SSD_LIST:-0}"
 echo "[20260802baseline] backend=bam_direct_serial"
 echo "[20260802baseline] model=${MODEL}"
 echo "[20260802baseline] service_lifetime=${VLLM_BAM_DIRECT_SERVICE_LIFETIME}"
+echo "[20260802baseline] read_mode=${VLLM_BAM_DIRECT_READ_MODE}"
 echo "[20260802baseline] gpu_blocks=${EFFECTIVE_GPU_BLOCKS}"
 echo "[20260802baseline] log_dir=${LOG_DIR}"
 

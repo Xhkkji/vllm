@@ -2128,14 +2128,20 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             return False
 
         prefill_meta = model_input.attn_metadata.prefill_metadata
+        decode_meta = model_input.attn_metadata.decode_metadata
 
         # check if the current run is profiling
         is_profile_run = (kv_caches[0].numel() == 0)
         # check if the current run is prefill
         is_prefill_run = prefill_meta is not None
+        # Experimental LMCache path: by default vLLM V0 only sends KV on
+        # prefill/mixed-prefill batches. Allow decode-only batches only when
+        # explicitly requested, so normal vLLM behavior stays unchanged.
+        is_decode_send_run = (
+            envs.VLLM_LMCACHE_SEND_DECODE_KV and decode_meta is not None)
 
         return self.vllm_config.kv_transfer_config.is_kv_producer and (
-            not is_profile_run) and is_prefill_run
+            not is_profile_run) and (is_prefill_run or is_decode_send_run)
 
 
 # NOTE: this is nn.Module so the profiler can properly capture/group

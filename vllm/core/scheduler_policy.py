@@ -121,18 +121,26 @@ class AsyncKVSchedulePolicy:
         return request
 
     def activate_next(self) -> Tuple[AsyncKVTransferRequest, ...]:
-        """按入队顺序激活不超过 MDS 槽位容量的请求。"""
+        """优先激活 critical read，再用剩余槽位处理 deferred write。
+
+        单槽下不能抢占已经 IN_FLIGHT 的 write，但只要当前槽归还，后到的
+        read 会越过尚未提交的 write。这样不会复制两套队列状态机，同时
+        保持 request 在各自优先级内的 FIFO 顺序。
+        """
         capacity = self.max_in_flight - self.in_flight_count
         if capacity <= 0:
             return ()
         activated = []
-        for transfer in self._transfers.values():
-            if transfer.state != AsyncKVTransferState.QUEUED:
-                continue
-            transfer.state = AsyncKVTransferState.PENDING
-            activated.append(transfer.request)
-            if len(activated) == capacity:
-                break
+        for operation in (AsyncKVTransferOperation.READ,
+                          AsyncKVTransferOperation.WRITE):
+            for transfer in self._transfers.values():
+                if (transfer.state != AsyncKVTransferState.QUEUED
+                        or transfer.request.operation != operation):
+                    continue
+                transfer.state = AsyncKVTransferState.PENDING
+                activated.append(transfer.request)
+                if len(activated) == capacity:
+                    return tuple(activated)
         return tuple(activated)
 
     def apply_event(self, event: AsyncKVTransferEvent) -> None:

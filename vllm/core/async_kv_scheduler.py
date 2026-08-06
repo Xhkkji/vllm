@@ -276,7 +276,7 @@ class AsyncKVScheduler(Scheduler):
         再执行一次同步写。源 GPU block 在 write READY 前仍由 reservation
         持有，因此本轮调度不会错误地把相同地址分给其他 sequence。
         """
-        if not self.block_manager.can_swap_out(seq_group):
+        if not self.block_manager.can_reserve_swap_out(seq_group):
             raise RuntimeError(
                 "Aborted due to the lack of storage swap space. Please "
                 "increase the swap space to avoid this error.")
@@ -287,11 +287,22 @@ class AsyncKVScheduler(Scheduler):
             seq.status = SequenceStatus.SWAPPED
         logger.debug(
             "[ASYNC_KV_SCHEDULER] queued operation=write request_id=%s "
-            "seq_group=%s blocks=%d",
+            "seq_group=%s dirty_blocks=%d reused_clean_blocks=%d",
             request.request_id,
             seq_group.request_id,
             len(reservation.block_mapping),
+            reservation.num_reused_blocks,
         )
+        if envs.VLLM_V0_SWAP_TRACE and reservation.num_reused_blocks:
+            logger.info(
+                "[V0_SWAP_TRACE][AsyncKV][Scheduler] phase=avoid_write "
+                "request_id=%s seq_group_id=%s clean_blocks=%d "
+                "dirty_blocks=%d",
+                request.request_id,
+                seq_group.request_id,
+                reservation.num_reused_blocks,
+                len(reservation.block_mapping),
+            )
 
     def _schedule_swapped(
         self,
@@ -313,13 +324,17 @@ class AsyncKVScheduler(Scheduler):
         read/write 可以提前排队，但同一时刻只激活一个 MDS transfer。
         """
         empty = SchedulerSwappedInOutputs.create_empty()
-        # resident MDS 当前只有一个控制槽；队列里存在 read/write 时，不再
-        # 建立新的 read reservation。write 完成后对应 seq 仍在 swapped
-        # 队列，下一轮会自然进入这里恢复。
-        if self.async_kv_policy.has_outstanding or not self.swapped:
+        # 只允许一个 read reservation，避免单槽系统提前占满 GPU target。
+        # write 请求可以继续留在 saving/swapped 中；从其后找到真正位于
+        # storage 的 seq，提前建立 critical read，待槽空闲后优先提交。
+        if self.loading or not self.swapped:
             return empty
 
-        seq_group = self.swapped[0]
+        saving_group_ids = {id(group) for group in self.saving.values()}
+        seq_group = next((group for group in self.swapped
+                          if id(group) not in saving_group_ids), None)
+        if seq_group is None:
+            return empty
         is_prefill = seq_group.is_prefill()
         alloc_status = self.block_manager.can_swap_in(
             seq_group,
@@ -333,7 +348,7 @@ class AsyncKVScheduler(Scheduler):
                 "cache space for async swap-in.",
                 seq_group.request_id,
             )
-            self.swapped.popleft()
+            self.swapped.remove(seq_group)
             for seq in seq_group.get_seqs():
                 seq.status = SequenceStatus.FINISHED_IGNORED
             empty.infeasible_seq_groups.append(seq_group)
@@ -341,7 +356,7 @@ class AsyncKVScheduler(Scheduler):
 
         # 异步恢复本身不消耗当前 forward 的 token budget；真正进入 running
         # 后，父类会在下一轮按普通 decode/prefill 规则更新 budget。
-        self.swapped.popleft()
+        self.swapped.remove(seq_group)
         reservation = self.block_manager.reserve_swap_in(seq_group)
         request = self._enqueue_async_kv_transfer(
             seq_group, reservation, AsyncKVTransferOperation.READ)

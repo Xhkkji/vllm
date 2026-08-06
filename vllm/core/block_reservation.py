@@ -27,3 +27,6 @@ class BlockSwapReservation:
     source_device: Device
     target_device: Device
     block_mapping: BlockMapping
+    # write reservation 可以直接复用 read 后保留的 clean SSD block；这些
+    # block 不出现在 I/O mapping 中，但会在 commit 时进入正式 storage 表。
+    num_reused_blocks: int = 0

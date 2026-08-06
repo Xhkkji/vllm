@@ -37,6 +37,24 @@ def _sync_swap_out(scheduler: AsyncKVScheduler, seq_group) -> None:
     Scheduler._swap_out(scheduler, seq_group, [])
 
 
+def _restore_with_clean_storage_replica(scheduler: AsyncKVScheduler,
+                                        request_id: str):
+    """构造 GPU 正式表和 SSD clean replica 同时存在的 decode 请求。"""
+    seq, seq_group = create_dummy_prompt(
+        request_id, prompt_length=8, block_size=4)
+    scheduler._allocate_and_set_running(seq_group)
+    _sync_swap_out(scheduler, seq_group)
+    scheduler._add_seq_group_to_swapped(seq_group)
+    scheduler._schedule_swapped(
+        SchedulingBudget(token_budget=32, max_num_seqs=8), None)
+    request = scheduler.drain_async_kv_transfers_to_submit()[0]
+    scheduler.apply_async_kv_event(
+        AsyncKVTransferEvent(request.request_id,
+                             AsyncKVTransferState.READY))
+    scheduler.complete_ready_async_kv_transfers()
+    return seq, seq_group
+
+
 def test_async_scheduler_requires_chunked_prefill():
     """异步恢复必须依赖有界的 chunk 调度边界。"""
     scheduler_config = SchedulerConfig(
@@ -275,3 +293,78 @@ def test_abort_active_write_keeps_gpu_source_until_completion():
     scheduler.complete_ready_async_kv_transfers()
     assert seq.seq_id not in scheduler.block_manager.block_tables
     assert not scheduler.has_unfinished_seqs()
+
+
+def test_clean_storage_replica_avoids_write_io():
+    """GPU 内容未变化时，swap-out 应直接复用 SSD replica。"""
+    scheduler = _create_scheduler()
+    seq, seq_group = _restore_with_clean_storage_replica(scheduler, "50")
+    assert scheduler.block_manager.get_num_clean_storage_replicas(seq) == 2
+
+    scheduler._swap_out(seq_group, [])
+    scheduler._add_seq_group_to_swapped(seq_group)
+    request = scheduler.drain_async_kv_transfers_to_submit()[0]
+    assert request.operation == AsyncKVTransferOperation.WRITE
+    assert request.block_mapping == ()
+
+    scheduler.apply_async_kv_event(
+        AsyncKVTransferEvent(request.request_id,
+                             AsyncKVTransferState.READY))
+    scheduler.complete_ready_async_kv_transfers()
+    assert seq.status == SequenceStatus.SWAPPED
+    assert scheduler.block_manager.get_num_free_gpu_blocks() == 16
+
+
+def test_only_dirty_suffix_is_written():
+    """decode 新增尾块后，只写 dirty suffix，不重写 clean prefix。"""
+    scheduler = _create_scheduler()
+    seq, seq_group = _restore_with_clean_storage_replica(scheduler, "51")
+    append_new_token_seq_group(8, seq_group, 303)
+    scheduler.block_manager.append_slots(seq, num_lookahead_slots=0)
+    assert len(scheduler.block_manager.get_block_table(seq)) == 3
+
+    scheduler._swap_out(seq_group, [])
+    request = scheduler.drain_async_kv_transfers_to_submit()[0]
+    assert len(request.block_mapping) == 1
+    scheduler.apply_async_kv_event(
+        AsyncKVTransferEvent(request.request_id,
+                             AsyncKVTransferState.READY))
+    scheduler.complete_ready_async_kv_transfers()
+    assert len(scheduler.block_manager.get_block_table(seq)) == 3
+
+
+def test_free_gpu_sequence_releases_storage_replicas():
+    """sequence 结束时，正式 GPU 表和目录中的 SSD replica 都必须释放。"""
+    scheduler = _create_scheduler()
+    seq, _ = _restore_with_clean_storage_replica(scheduler, "52")
+    assert scheduler.block_manager.get_num_free_cpu_blocks() == 14
+    scheduler.free_seq(seq)
+    assert scheduler.block_manager.get_num_free_cpu_blocks() == 16
+    assert scheduler.block_manager.get_num_free_gpu_blocks() == 16
+
+
+def test_queued_read_precedes_deferred_write():
+    """active write 完成后，应先提交已排队的 critical read。"""
+    scheduler = _create_scheduler()
+    _, write_group = create_dummy_prompt(
+        "60", prompt_length=8, block_size=4)
+    scheduler._allocate_and_set_running(write_group)
+    scheduler._swap_out(write_group, [])
+    scheduler._add_seq_group_to_swapped(write_group)
+    active_write = scheduler.drain_async_kv_transfers_to_submit()[0]
+
+    _, read_group = create_dummy_prompt(
+        "61", prompt_length=8, block_size=4)
+    scheduler._allocate_and_set_running(read_group)
+    _sync_swap_out(scheduler, read_group)
+    scheduler._add_seq_group_to_swapped(read_group)
+    scheduler._schedule_swapped(
+        SchedulingBudget(token_budget=32, max_num_seqs=8), None)
+
+    scheduler.apply_async_kv_event(
+        AsyncKVTransferEvent(active_write.request_id,
+                             AsyncKVTransferState.READY))
+    scheduler.complete_ready_async_kv_transfers()
+    next_request = scheduler.drain_async_kv_transfers_to_submit()[0]
+    assert next_request.operation == AsyncKVTransferOperation.READ
+    assert next_request.seq_group_id == read_group.request_id

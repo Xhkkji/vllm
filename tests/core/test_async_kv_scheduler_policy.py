@@ -34,25 +34,25 @@ def test_async_kv_policy_lifecycle():
 
 def test_async_kv_policy_errors_and_capacity():
     policy = AsyncKVSchedulePolicy(max_in_flight=1)
-    request = policy.enqueue("seq-group-0", "reservation-0",
-                             AsyncKVTransferOperation.WRITE, [])
-    queued = policy.enqueue("seq-group-1", "reservation-1",
-                            AsyncKVTransferOperation.READ, [])
+    queued_write = policy.enqueue("seq-group-0", "reservation-0",
+                                  AsyncKVTransferOperation.WRITE, [])
+    critical_read = policy.enqueue("seq-group-1", "reservation-1",
+                                   AsyncKVTransferOperation.READ, [])
 
-    assert policy.activate_next() == (request,)
+    assert policy.activate_next() == (critical_read,)
     assert policy.activate_next() == ()
-    assert policy.queued_request_ids == (queued.request_id,)
+    assert policy.queued_request_ids == (queued_write.request_id,)
 
     policy.apply_event(
-        AsyncKVTransferEvent(request.request_id,
+        AsyncKVTransferEvent(critical_read.request_id,
                              AsyncKVTransferState.ERROR,
-                             error="store failed"))
+                             error="restore failed"))
     failed = policy.pop_errors()
     assert len(failed) == 1
-    assert failed[0].request == request
-    assert failed[0].error == "store failed"
+    assert failed[0].request == critical_read
+    assert failed[0].error == "restore failed"
     assert policy.in_flight_count == 0
-    assert policy.activate_next() == (queued,)
+    assert policy.activate_next() == (queued_write,)
 
 
 def test_async_kv_policy_rejects_duplicate_completion():

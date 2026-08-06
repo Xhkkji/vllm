@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""vLLM V0 与 BaM_IOStack MDSClient 之间的同步 KVStore connector。"""
+"""vLLM V0 与 BaM_IOStack resident MDS 之间的 KVStore connector。"""
 
 from __future__ import annotations
 
@@ -60,6 +60,8 @@ class BaMMDSConnector:
             timeout_seconds=float(envs.VLLM_BAM_MDS_TIMEOUT_SECONDS))
         self.max_blocks_per_batch = 0
         self.gpu_cache: list[torch.Tensor] = []
+        self._pending_read_handle = None
+        self._pending_read_mapping: tuple[tuple[int, int], ...] | None = None
         try:
             self.gpu_cache = self._allocate_and_wrap()
         except Exception:
@@ -118,7 +120,8 @@ class BaMMDSConnector:
 
     def start(self) -> None:
         self.client.start()
-        logger.info("[BAM_MDS] synchronous service enabled after model warmup")
+        logger.info(
+            "[BAM_MDS] resident async service enabled after model warmup")
 
     def swap_out(self, src_to_dst: torch.Tensor) -> None:
         self._transfer_mapping(src_to_dst, operation="write")
@@ -126,25 +129,77 @@ class BaMMDSConnector:
     def swap_in(self, src_to_dst: torch.Tensor) -> None:
         self._transfer_mapping(src_to_dst, operation="read")
 
+    def swap_in_async(self, src_to_dst: torch.Tensor) -> bool:
+        """推进一个跨 engine iteration 存活的 logical swap-in。
+
+        同一个 scheduler output 被 defer 后会在下一轮重试，因此这里用完整 block
+        mapping 识别 live request，严禁重复提交。MDS daemon 内部负责按 native
+        descriptor 容量拆批；只有所有 batch 完成后，本函数才返回 True。
+        """
+        if src_to_dst.numel() == 0:
+            if self._pending_read_handle is not None:
+                raise RuntimeError(
+                    "empty mapping cannot replace a pending MDS read")
+            return True
+        mapping, payload = self._mapping_payload(src_to_dst, operation="read")
+        if self._pending_read_handle is None:
+            self._pending_read_handle = self.client.submit_read_async(payload)
+            self._pending_read_mapping = mapping
+            logger.debug(
+                "[BAM_MDS] submitted async swap-in request_id=%d blocks=%d",
+                self._pending_read_handle.request_id,
+                len(mapping),
+            )
+        elif mapping != self._pending_read_mapping:
+            raise RuntimeError(
+                "MDS swap-in mapping changed while a request was in flight")
+
+        if not self.client.poll(self._pending_read_handle):
+            return False
+
+        request_id = self._pending_read_handle.request_id
+        io_elapsed_ns = self.client.finish(self._pending_read_handle)
+        self._pending_read_handle = None
+        self._pending_read_mapping = None
+        logger.info(
+            "[BAM_MDS] async swap-in done request_id=%d blocks=%d "
+            "io_elapsed_ms=%.3f",
+            request_id,
+            len(mapping),
+            io_elapsed_ns / 1.0e6,
+        )
+        return True
+
     def _transfer_mapping(self, src_to_dst: torch.Tensor, *, operation: str) -> None:
         if src_to_dst.numel() == 0:
             return
-        mappings = src_to_dst.to(device="cpu", dtype=torch.int64).tolist()
-        for begin in range(0, len(mappings), self.max_blocks_per_batch):
-            batch = mappings[begin:begin + self.max_blocks_per_batch]
-            source_ids = [int(mapping[0]) for mapping in batch]
-            destination_ids = [int(mapping[1]) for mapping in batch]
-            if operation == "write":
-                gpu_ids, storage_ids = source_ids, destination_ids
-            elif operation == "read":
-                storage_ids, gpu_ids = source_ids, destination_ids
-            else:
-                raise ValueError(f"unsupported MDS operation: {operation}")
-            payload = {
-                "gpu_block_ids": gpu_ids,
-                "storage_block_ids": storage_ids,
-            }
-            if operation == "write":
-                self.client.submit_write(payload)
-            else:
-                self.client.submit_read(payload)
+        if self._pending_read_handle is not None:
+            raise RuntimeError("cannot run a blocking MDS transfer while read is pending")
+        _, payload = self._mapping_payload(src_to_dst, operation=operation)
+        if operation == "write":
+            self.client.submit_write(payload)
+        else:
+            self.client.submit_read(payload)
+
+    @staticmethod
+    def _mapping_payload(
+        src_to_dst: torch.Tensor,
+        *,
+        operation: str,
+    ) -> tuple[tuple[tuple[int, int], ...], dict[str, list[int]]]:
+        mappings = tuple(
+            (int(source), int(destination))
+            for source, destination in src_to_dst.to(
+                device="cpu", dtype=torch.int64).tolist())
+        source_ids = [mapping[0] for mapping in mappings]
+        destination_ids = [mapping[1] for mapping in mappings]
+        if operation == "write":
+            gpu_ids, storage_ids = source_ids, destination_ids
+        elif operation == "read":
+            storage_ids, gpu_ids = source_ids, destination_ids
+        else:
+            raise ValueError(f"unsupported MDS operation: {operation}")
+        return mappings, {
+            "gpu_block_ids": gpu_ids,
+            "storage_block_ids": storage_ids,
+        }

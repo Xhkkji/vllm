@@ -28,6 +28,7 @@ from vllm.utils import (GiB_bytes, MemorySnapshot, bind_kv_cache,
 from vllm.worker.cache_engine import CacheEngine
 from vllm.worker.enc_dec_model_runner import EncoderDecoderModelRunner
 from vllm.worker.model_runner import GPUModelRunnerBase, ModelRunner
+from vllm.worker.model_runner_base import DeferredModelExecution
 from vllm.worker.pooling_model_runner import PoolingModelRunner
 from vllm.worker.worker_base import (LocalOrDistributedWorkerBase, WorkerBase,
                                      WorkerInput)
@@ -428,8 +429,21 @@ class Worker(LocalOrDistributedWorkerBase):
                     virtual_engine,
                     worker_input.blocks_to_swap_in.shape[0],
                 )
-            self.cache_engine[virtual_engine].swap_in(
-                worker_input.blocks_to_swap_in)
+            cache_engine = self.cache_engine[virtual_engine]
+            if cache_engine.bam_mds_connector is not None:
+                if not cache_engine.swap_in_async(
+                        worker_input.blocks_to_swap_in):
+                    # 当前 scheduler output 已经为 swap-in 分配了目标 GPU
+                    # blocks。在 MDS logical request 完成前，必须保留同一批输入
+                    # 并禁止 attention 读取尚未恢复完整的 KV。
+                    raise DeferredModelExecution(
+                        request_ids=[],
+                        message=(
+                            "resident MDS swap-in is still in flight; retry "
+                            f"virtual_engine={virtual_engine}"),
+                    )
+            else:
+                cache_engine.swap_in(worker_input.blocks_to_swap_in)
         if (worker_input.blocks_to_swap_out is not None
                 and worker_input.blocks_to_swap_out.numel() > 0):
             if envs.VLLM_V0_SWAP_TRACE:

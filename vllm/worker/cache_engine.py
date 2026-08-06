@@ -57,6 +57,7 @@ class CacheEngine:
         self._bam_direct_gpu_cache_owners: List[torch.Tensor] = []
         self._bam_direct_gpu_cache_regions: List[torch.Tensor] = []
         self.bam_mds_connector = None
+        self._bam_mds_swap_in_started_at: float | None = None
 
         self.head_size = model_config.get_head_size()
         # Models like Jamba, have mixed typed layers, E.g Mamba
@@ -258,6 +259,25 @@ class CacheEngine:
                 self.attn_backend.swap_blocks(self.cpu_cache[i],
                                               self.gpu_cache[i], src_to_dst)
         self._log_swap_event("swap_in", src_to_dst, time.perf_counter() - start)
+
+    def swap_in_async(self, src_to_dst: torch.Tensor) -> bool:
+        """推进 resident MDS swap-in，未完成时由 engine defer 当前 batch。
+
+        该接口只服务 MDS direct 路径。目标 GPU block 在返回 True 前不能被
+        attention 消费；SSD completion 和数据可见性由 daemon 内的常驻 GPU CQ
+        service 保证。
+        """
+        if self.bam_mds_connector is None:
+            raise RuntimeError("async swap-in is only supported by resident MDS")
+        if self._bam_mds_swap_in_started_at is None:
+            self._bam_mds_swap_in_started_at = time.perf_counter()
+        ready = self.bam_mds_connector.swap_in_async(src_to_dst)
+        if not ready:
+            return False
+        elapsed_s = time.perf_counter() - self._bam_mds_swap_in_started_at
+        self._bam_mds_swap_in_started_at = None
+        self._log_swap_event("swap_in", src_to_dst, elapsed_s)
+        return True
 
     def swap_out(self, src_to_dst: torch.Tensor) -> None:
         """把 scheduler 的 GPU->storage block mapping 写出。

@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     VLLM_PP_LAYER_PARTITION: Optional[str] = None
     VLLM_CPU_KVCACHE_SPACE: int = 0
     VLLM_V0_SWAP_TRACE: bool = False
+    VLLM_LMCACHE_SEND_DECODE_KV: bool = False
     VLLM_BAM_SHADOW_ENABLE: bool = False
     VLLM_BAM_SWAPIN_ENABLE: bool = False
     VLLM_BAM_SWAPIN_VERIFY: bool = False
@@ -417,6 +418,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 仅用于本地实验排查，默认关闭，避免污染正常推理日志。
     "VLLM_V0_SWAP_TRACE":
     lambda: bool(int(os.getenv("VLLM_V0_SWAP_TRACE", "0"))),
+
+    # 实验开关：允许 V0 在 decode-only step 也调用 LMCache KV send/store。
+    # 默认关闭，保持原生 vLLM 只在 prefill/mixed-prefill 批次发送 KV 的语义。
+    "VLLM_LMCACHE_SEND_DECODE_KV":
+    lambda: bool(int(os.getenv("VLLM_LMCACHE_SEND_DECODE_KV", "0"))),
 
     # 是否在 V0 swap_out 后额外执行一次 GPU -> SSD(BaM) 影子写出。
     "VLLM_BAM_SHADOW_ENABLE":

@@ -1006,7 +1006,162 @@ group_size=4/7 是否比单层 prefetch 有更好的 IO 粒度与同步开销平
    Tutti-like scheduler。
 ```
 
-## 5. 阶段性判断
+## 5. 当前分支已经完成的工作
+
+这一分支现在不只是“想法”，而是已经把几条关键链路补到能做对照实验的状态。
+
+### 5.1 vLLM / LMCache / BaM 路径区分已经补齐
+
+当前已经明确区分了三类路径：
+
+```text
+1. vLLM 原生 swap：
+   GPU KV <-> CPU swap space
+
+2. LMCache SSD 路径：
+   chunk 级 prefix / decode cache 读写
+
+3. BaM / MDS 路径：
+   以 SSD 为后端的同步或半同步 KV restore / store
+```
+
+这件事的意义是：后续不再把“decode 慢”笼统归因，而是能分清到底是
+vLLM 原生 preemption、LMCache chunk I/O，还是 BaM/MDS runtime 在起作用。
+
+### 5.2 已加的实验开关
+
+已经加了一个默认关闭的实验开关，用来只在需要时允许 LMCache 在
+decode-only batch 上发送 KV：
+
+```text
+VLLM_LMCACHE_SEND_DECODE_KV
+```
+
+它默认关闭，和原生 vLLM 行为保持一致；实验时再显式打开，用于验证
+decode cache 写盘 / 读盘路径是否真的会被触发。
+
+### 5.3 已补的统计口径
+
+当前已经把 LMCache 的 retrieve / disk_read / disk_write 结果按 phase 拆开，
+至少区分成：
+
+```text
+prefill
+mixed
+decode
+```
+
+这样后续如果真的打到 decode cache I/O，就不会再把它误归到 prefill 里。
+
+### 5.4 已跑出的代表性结果
+
+这条分支已经积累了几组能直接支撑判断的结果：
+
+```text
+1. 连续到达 / 在线服务曲线
+   能看到 TTFT p95 和 TPOT p95 的变化，以及 read-heavy 压力下的尾延迟放大。
+
+2. 代表性的 I/O 压力表
+   能拆出 prefill compute / prefill read / decode compute / decode read / decode write。
+
+3. 原生 vLLM swap 相关 trace
+   说明当前默认 swap 还是 CPU tier，不是 SSD tier。
+
+4. LMCache decode-send 探针
+   已验证 decode-only batch 侧的发送开关确实能把路径打通，但 decode I/O 是否出现，
+   仍然受 chunk 边界、cache 命中和调度形态影响。
+```
+
+### 5.5 当前已经能确定的一点
+
+现在可以明确一点：
+
+```text
+vLLM scheduler 负责“什么时候让某个 seq_group 跑”
+LMCache / BaM 负责“这一轮 KV 到底怎么搬、搬到哪一层、何时落盘”
+```
+
+所以后续如果要做更强的 SSD-aware 调度，不能只停在 scheduler 层；但
+scheduler 层已经足够承载第一版 policy 实验。
+
+## 6. 后续延伸路线
+
+### 6.1 第一层：vLLM scheduler-aware policy
+
+这是最容易先落地的一层。目标不是复刻 SolidAttention，而是先在 serving
+层把“swap 太贵”和“waiting 太久”这对矛盾显式化。
+
+可做的策略包括：
+
+```text
+1. preemption 优先级改成 SLO aware；
+2. 根据 seq 长度 / 剩余 token / KV block 数估计 swap 成本；
+3. 在 waiting / swapped / running 之间做更主动的 admission control；
+4. 用更合理的 chunked prefill 配比减少后续请求饥饿。
+```
+
+这一层适合验证一个核心命题：
+
+```text
+如果 swap 成本下降，scheduler 是否会更愿意把请求切换成 swap，
+从而减少长期 waiting 和尾延迟？
+```
+
+### 6.2 第二层：layer-group prefetch
+
+如果只是 request-level 调度，仍然会卡在“整段 KV restore 完成后再 forward”。
+更自然的下一步是把 readiness 从 request/chunk 往下拆到 layer-group。
+
+目标形态是：
+
+```text
+当前 layer 计算时
+  -> 提前发起后续 layer-group 的 KV restore
+  -> 让 SSD I/O 和 GPU compute overlap
+```
+
+这层和 SolidAttention 的思路最接近，但不需要一次性把 attention kernel 全拆掉。
+
+### 6.3 第三层：attention-inner microtask 调度
+
+如果要继续往 SolidAttention 靠，就不能只在 ModelRunner 外围做文章，而要往
+attention 执行内部走。
+
+可以逐步演进成：
+
+```text
+SSD KV block ready
+  -> attention 先拿到已就绪的 block
+  -> missing block 再补读
+  -> 新 KV 再写回 SSD
+```
+
+这一步的本质是把“store / retrieve / compute”从串行变成可重叠的 microtask
+流，而不是传统的整请求 blocking restore。
+
+### 6.4 第四层：BaM / MDS 作为底层 I/O substrate
+
+如果目标是把上述调度真正做起来，BaM / MDS 比 LMCache chunk 路径更像一个
+可持续演进的底座，因为它更接近 block 级、layer 级和异步 I/O 的控制面。
+
+更具体地说：
+
+```text
+LMCache 负责证明 SSD backend 的存在感；
+BaM / MDS 负责把 SSD I/O 变成可调度、可 overlap 的底层能力；
+vLLM scheduler 负责把 serving 侧的压力、SLO 和公平性纳入决策。
+```
+
+### 6.5 一个比较稳的推进顺序
+
+```text
+1. 先把 vLLM scheduler 层的策略做出来，验证是否能缓解 waiting / TTFT 尾延迟；
+2. 再把 layer-group prefetch 接进去，验证能否把 SSD I/O 藏到 compute 后面；
+3. 再评估是否要继续往 attention-inner microtask 调度推进；
+4. 最后再考虑把更复杂的 SSD-aware scheduler 收束成完整系统。
+```
+
+## 7. 阶段性判断
 
 当前最稳妥的路线是：
 

@@ -1313,19 +1313,19 @@ class LLMEngine:
         return events
 
     def _poll_async_kv_scheduler(self, virtual_engine: int) -> None:
-        """调度前轮询 Worker，并把完成事件应用到新 Scheduler。
+        """调度前轮询 Worker，并提交完成的 block reservation。
 
         使用 duck typing 而不是导入 AsyncKVScheduler，保持 Engine 与具体
-        调度实现解耦。原生 Scheduler 没有 ``has_pending_async_kv_loads``，
+        调度实现解耦。原生 Scheduler 没有 ``has_active_async_kv_transfer``，
         因此默认路径会直接返回，不增加任何 RPC 开销。
         """
         scheduler = self.scheduler[virtual_engine]
-        has_pending = getattr(scheduler, "has_pending_async_kv_loads", None)
+        has_pending = getattr(scheduler, "has_active_async_kv_transfer", None)
         if has_pending is None or not has_pending():
             return
 
         worker_results = self.model_executor.collective_rpc(
-            "poll_async_kv_loads", args=(virtual_engine, ))
+            "poll_async_kv_transfers", args=(virtual_engine, ))
         events = self._merge_async_kv_worker_events(worker_results)
         apply_event = getattr(scheduler, "apply_async_kv_event")
         for event in events:
@@ -1341,13 +1341,13 @@ class LLMEngine:
 
         # 即使本次 Worker 返回空列表，也要执行提升：submit RPC 可能已经
         # 立即返回 READY，状态会保存在 Scheduler 中等待本轮统一迁移。
-        getattr(scheduler, "promote_ready_async_kv_loads")()
+        getattr(scheduler, "complete_ready_async_kv_transfers")()
 
-    def _submit_async_kv_scheduler_loads(self,
-                                         virtual_engine: int) -> None:
-        """把新 Scheduler 本轮生成的 load request 非阻塞提交给 Worker。"""
+    def _submit_async_kv_scheduler_transfers(self,
+                                             virtual_engine: int) -> None:
+        """把下一笔 queued read/write 非阻塞提交给 Worker。"""
         scheduler = self.scheduler[virtual_engine]
-        drain = getattr(scheduler, "drain_async_kv_loads_to_submit", None)
+        drain = getattr(scheduler, "drain_async_kv_transfers_to_submit", None)
         if drain is None:
             return
         requests = drain()
@@ -1355,11 +1355,14 @@ class LLMEngine:
             return
 
         worker_results = self.model_executor.collective_rpc(
-            "submit_async_kv_loads", args=(virtual_engine, requests))
+            "submit_async_kv_transfers", args=(virtual_engine, requests))
         events = self._merge_async_kv_worker_events(worker_results)
         apply_event = getattr(scheduler, "apply_async_kv_event")
         for event in events:
             apply_event(event)
+        # 空 mapping 会在 submit RPC 内直接返回 READY；这类请求没有后续
+        # Worker poll，因此必须在当前边界立即提交 reservation。
+        getattr(scheduler, "complete_ready_async_kv_transfers")()
 
     def step(self) -> List[Union[RequestOutput, PoolingRequestOutput]]:
         """Performs one decoding iteration and returns newly generated results.
@@ -1483,7 +1486,7 @@ class LLMEngine:
         # 选中的 B/C 可以继续进入下面的 execute_model，实现 I/O-compute
         # overlap。若当前没有计算 batch，submit 仍会发生，Engine 下一轮会
         # 依靠 loading 状态继续 poll。
-        self._submit_async_kv_scheduler_loads(virtual_engine)
+        self._submit_async_kv_scheduler_transfers(virtual_engine)
 
         if not scheduler_outputs.is_empty():
 

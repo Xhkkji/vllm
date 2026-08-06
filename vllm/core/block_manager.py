@@ -1,16 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """A block manager that manages token blocks."""
-import vllm.envs as envs
+import itertools
+from dataclasses import dataclass
 from typing import Dict, List, Optional
 from typing import Sequence as GenericSequence
 from typing import Tuple
 
+import vllm.envs as envs
 from vllm.core.block.block_table import BlockTable
 from vllm.core.block.cpu_gpu_block_allocator import CpuGpuBlockAllocator
 from vllm.core.block.interfaces import Block
 from vllm.core.block.prefix_caching_block import (ComputedBlocksTracker,
                                                   LastAccessBlocksTracker)
 from vllm.core.block.utils import check_no_caching_or_swa_for_blockmgr_encdec
+from vllm.core.block_reservation import BlockSwapReservation
 from vllm.core.interfaces import AllocStatus, BlockSpaceManager
 from vllm.logger import init_logger
 from vllm.sequence import Sequence, SequenceGroup, SequenceStatus
@@ -20,6 +23,23 @@ SeqId = int
 EncoderSeqId = str
 
 logger = init_logger(__name__)
+
+
+@dataclass(frozen=True)
+class _ReservedBlockTable:
+    """一个 sequence 在 reservation 前后的两份 block table 内容。"""
+
+    seq_id: SeqId
+    source_blocks: Tuple[Block, ...]
+    target_blocks: Tuple[Block, ...]
+
+
+@dataclass(frozen=True)
+class _BlockSwapReservationRecord:
+    """BlockSpaceManager 私有保存的 reservation 资源所有权。"""
+
+    public: BlockSwapReservation
+    tables: Tuple[_ReservedBlockTable, ...]
 
 
 class SelfAttnBlockSpaceManager(BlockSpaceManager):
@@ -109,6 +129,13 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             self.block_allocator, self.block_size, self.enable_caching)
         self._last_access_blocks_tracker = LastAccessBlocksTracker(
             self.block_allocator)
+
+        # reservation 中的目标 block 已经从目标 allocator 分配，但尚未
+        # 发布到正式 block table。只要记录仍在这里，源和目标两份物理
+        # block 就都不能被复用；commit/abort 必须且只能消费一次记录。
+        self._reservation_counter = itertools.count()
+        self._block_swap_reservations: Dict[
+            str, _BlockSwapReservationRecord] = {}
 
     def can_allocate(self,
                      seq_group: SequenceGroup,
@@ -407,6 +434,12 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
 
         return physical_block_id_mapping
 
+    def reserve_swap_in(self,
+                        seq_group: SequenceGroup) -> BlockSwapReservation:
+        """预留 SSD/storage -> GPU 的目标 block，但不发布 block table。"""
+        return self._reserve_swap(seq_group, SequenceStatus.SWAPPED,
+                                  Device.CPU, Device.GPU)
+
     def can_swap_out(self, seq_group: SequenceGroup) -> bool:
         """Returns whether we can swap out the given sequence_group 
         with num_lookahead_slots.
@@ -468,6 +501,147 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             )
 
         return physical_block_id_mapping
+
+    def reserve_swap_out(self,
+                         seq_group: SequenceGroup) -> BlockSwapReservation:
+        """预留 GPU -> SSD/storage 的目标 block，但不释放 GPU source。"""
+        return self._reserve_swap(seq_group, SequenceStatus.RUNNING,
+                                  Device.GPU, Device.CPU)
+
+    def commit_block_swap(self, reservation_id: str) -> None:
+        """在后端 I/O 完成后发布目标 block，并释放原设备 block。
+
+        更新顺序刻意固定为“先让 block table 指向目标对象，再释放源对象”。
+        Scheduler 只会在本方法返回后改变 SequenceStatus，因此 attention
+        不会观察到源已释放而目标尚未发布的中间状态。
+        """
+        record = self._get_block_swap_reservation(reservation_id)
+        for table_record in record.tables:
+            block_table = self.block_tables.get(table_record.seq_id)
+            if block_table is None:
+                raise RuntimeError(
+                    "cannot commit block reservation after table removal: "
+                    f"{reservation_id}")
+            current_blocks = tuple(block_table.blocks)
+            if current_blocks != table_record.source_blocks:
+                raise RuntimeError(
+                    "source block table changed before reservation commit: "
+                    f"{reservation_id}")
+        # 所有 source table 都验证通过后才消费记录；校验失败时调用方仍可
+        # abort，避免目标 block 因记录提前弹出而泄漏。
+        del self._block_swap_reservations[reservation_id]
+        for table_record in record.tables:
+            block_table = self.block_tables[table_record.seq_id]
+            block_table.update(list(table_record.target_blocks))
+            for source_block in table_record.source_blocks:
+                self.block_allocator.free(source_block)
+
+    def abort_block_swap(self, reservation_id: str) -> None:
+        """取消 reservation，只释放未发布的目标 block，源表保持不变。"""
+        record = self._pop_block_swap_reservation(reservation_id)
+        for table_record in record.tables:
+            for target_block in table_record.target_blocks:
+                self.block_allocator.free(target_block)
+
+    def _reserve_swap(
+        self,
+        seq_group: SequenceGroup,
+        sequence_status: SequenceStatus,
+        source_device: Device,
+        target_device: Device,
+    ) -> BlockSwapReservation:
+        """建立一笔双副本 block 事务，并返回后端可直接执行的 mapping。
+
+        目标 block 使用 allocator 的普通公开接口分配，因此 refcount、prefix
+        hash 和 block object pool 仍由原生实现维护。发生部分分配失败时，
+        已分配目标会在抛出异常前全部回收，源 block table 不受影响。
+        """
+        table_records: List[_ReservedBlockTable] = []
+        physical_mapping: List[Tuple[int, int]] = []
+        try:
+            for seq in seq_group.get_seqs(status=sequence_status):
+                source_blocks = tuple(self.block_tables[seq.seq_id].blocks)
+                target_blocks = tuple(
+                    self._clone_blocks_to_device(source_blocks,
+                                                 target_device))
+                table_records.append(
+                    _ReservedBlockTable(seq_id=seq.seq_id,
+                                        source_blocks=source_blocks,
+                                        target_blocks=target_blocks))
+                for source_block, target_block in zip(source_blocks,
+                                                      target_blocks):
+                    assert source_block.block_id is not None
+                    assert target_block.block_id is not None
+                    physical_mapping.append((
+                        self.block_allocator.get_physical_block_id(
+                            source_device, source_block.block_id),
+                        self.block_allocator.get_physical_block_id(
+                            target_device, target_block.block_id),
+                    ))
+        except Exception:
+            for table_record in table_records:
+                for target_block in table_record.target_blocks:
+                    self.block_allocator.free(target_block)
+            raise
+
+        reservation_id = f"block-swap-{next(self._reservation_counter)}"
+        public = BlockSwapReservation(
+            reservation_id=reservation_id,
+            seq_group_id=seq_group.request_id,
+            source_device=source_device,
+            target_device=target_device,
+            block_mapping=tuple(physical_mapping),
+        )
+        self._block_swap_reservations[reservation_id] = (
+            _BlockSwapReservationRecord(public=public,
+                                        tables=tuple(table_records)))
+        return public
+
+    def _clone_blocks_to_device(self, source_blocks: Tuple[Block, ...],
+                                target_device: Device) -> List[Block]:
+        """按原 token 链在目标设备分配一份尚未发布的 block 对象。"""
+        target_blocks: List[Block] = []
+        previous_target = (source_blocks[0].prev_block
+                           if source_blocks else None)
+        try:
+            for source_block in source_blocks:
+                extra_hash = getattr(source_block, "extra_hash", None)
+                if source_block.is_full:
+                    target_block = self.block_allocator.allocate_immutable_block(
+                        previous_target,
+                        list(source_block.token_ids),
+                        target_device,
+                        extra_hash=extra_hash,
+                    )
+                else:
+                    target_block = self.block_allocator.allocate_mutable_block(
+                        previous_target,
+                        target_device,
+                        extra_hash=extra_hash,
+                    )
+                    target_block.append_token_ids(
+                        list(source_block.token_ids))
+                target_blocks.append(target_block)
+                previous_target = target_block
+        except Exception:
+            for target_block in target_blocks:
+                self.block_allocator.free(target_block)
+            raise
+        return target_blocks
+
+    def _pop_block_swap_reservation(
+            self, reservation_id: str) -> _BlockSwapReservationRecord:
+        record = self._block_swap_reservations.pop(reservation_id, None)
+        if record is None:
+            raise KeyError(f"unknown block reservation: {reservation_id}")
+        return record
+
+    def _get_block_swap_reservation(
+            self, reservation_id: str) -> _BlockSwapReservationRecord:
+        record = self._block_swap_reservations.get(reservation_id)
+        if record is None:
+            raise KeyError(f"unknown block reservation: {reservation_id}")
+        return record
 
     def get_num_free_gpu_blocks(self) -> int:
         return self.block_allocator.get_num_free_blocks(Device.GPU)

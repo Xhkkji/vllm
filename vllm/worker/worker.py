@@ -9,9 +9,9 @@ import torch.distributed
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
-from vllm.core.scheduler_policy import (AsyncKVLoadEvent,
-                                        AsyncKVLoadRequest,
-                                        AsyncKVLoadState)
+from vllm.core.scheduler_policy import (AsyncKVTransferEvent,
+                                        AsyncKVTransferRequest,
+                                        AsyncKVTransferState)
 from vllm.device_allocator.cumem import CuMemAllocator
 from vllm.distributed import (ensure_model_parallel_initialized,
                               init_distributed_environment,
@@ -65,7 +65,7 @@ class Worker(LocalOrDistributedWorkerBase):
         # 新异步调度路径使用独立控制表保存跨 engine iteration 的 mapping。
         # key 中包含 virtual_engine，避免未来扩展 PP stream 时发生串槽。
         # 当前 MDS 强制 TP=1、PP=1，因此同一时刻最多只有一个表项。
-        self._async_kv_load_mappings: Dict[
+        self._async_kv_transfer_mappings: Dict[
             Tuple[int, str], torch.Tensor] = {}
         if self.model_config.trust_remote_code:
             # note: lazy import to avoid importing torch before initializing
@@ -481,12 +481,12 @@ class Worker(LocalOrDistributedWorkerBase):
                 worker_input.num_seq_groups,
             )
 
-    def submit_async_kv_loads(
+    def submit_async_kv_transfers(
         self,
         virtual_engine: int,
-        requests: Sequence[AsyncKVLoadRequest],
-    ) -> List[AsyncKVLoadEvent]:
-        """提交 Scheduler 本轮生成的异步 KV 恢复请求。
+        requests: Sequence[AsyncKVTransferRequest],
+    ) -> List[AsyncKVTransferEvent]:
+        """提交 Scheduler 本轮激活的一笔异步 KV read/write。
 
         该 RPC 只执行非阻塞 submit。mapping 转成 CPU int64 tensor 后保存在
         Worker 内，后续 poll 必须使用完全相同的 tensor 内容。单槽 MDS
@@ -497,44 +497,44 @@ class Worker(LocalOrDistributedWorkerBase):
             raise RuntimeError(
                 "resident MDS currently accepts one async KV load at a time")
         cache_engine = self.cache_engine[virtual_engine]
-        events: List[AsyncKVLoadEvent] = []
+        events: List[AsyncKVTransferEvent] = []
         for request in requests:
             key = (virtual_engine, request.request_id)
-            if key in self._async_kv_load_mappings:
+            if key in self._async_kv_transfer_mappings:
                 raise RuntimeError(
                     f"duplicate async KV submit: {request.request_id}")
-            if self._async_kv_load_mappings:
+            if self._async_kv_transfer_mappings:
                 raise RuntimeError(
-                    "resident MDS Worker already has a pending KV load")
+                    "resident MDS Worker already has a pending KV transfer")
 
             mapping = torch.tensor(
                 request.block_mapping,
                 device="cpu",
                 dtype=torch.int64,
             ).view(-1, 2)
-            event = cache_engine.submit_async_kv_load(
-                request.request_id, mapping)
+            event = cache_engine.submit_async_kv_transfer(
+                request.request_id, request.operation, mapping)
             events.append(event)
-            if event.state == AsyncKVLoadState.PENDING:
-                self._async_kv_load_mappings[key] = mapping
+            if event.state == AsyncKVTransferState.PENDING:
+                self._async_kv_transfer_mappings[key] = mapping
         return events
 
-    def poll_async_kv_loads(
-            self, virtual_engine: int) -> List[AsyncKVLoadEvent]:
-        """非阻塞轮询当前 virtual engine 的异步 KV 恢复请求。"""
+    def poll_async_kv_transfers(
+            self, virtual_engine: int) -> List[AsyncKVTransferEvent]:
+        """非阻塞轮询当前 virtual engine 占用 MDS 单槽的 transfer。"""
         cache_engine = self.cache_engine[virtual_engine]
-        events: List[AsyncKVLoadEvent] = []
+        events: List[AsyncKVTransferEvent] = []
         keys = [
-            key for key in self._async_kv_load_mappings
+            key for key in self._async_kv_transfer_mappings
             if key[0] == virtual_engine
         ]
         for key in keys:
             _, request_id = key
-            mapping = self._async_kv_load_mappings[key]
-            event = cache_engine.poll_async_kv_load(request_id, mapping)
+            mapping = self._async_kv_transfer_mappings[key]
+            event = cache_engine.poll_async_kv_transfer(request_id, mapping)
             events.append(event)
-            if event.state != AsyncKVLoadState.PENDING:
-                del self._async_kv_load_mappings[key]
+            if event.state != AsyncKVTransferState.PENDING:
+                del self._async_kv_transfer_mappings[key]
         return events
 
     def _get_cached_seq_group_metadata(

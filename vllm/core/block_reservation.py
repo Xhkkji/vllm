@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: Apache-2.0
+
+"""异步 KV 换入换出使用的最小 block reservation 描述。"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Tuple
+
+from vllm.utils import Device
+
+
+BlockMapping = Tuple[Tuple[int, int], ...]
+
+
+@dataclass(frozen=True)
+class BlockSwapReservation:
+    """一次尚未提交到正式 block table 的设备间 block 转换。
+
+    reservation 只暴露后端执行 I/O 所需的物理 block mapping。源 block、
+    目标 block 对象以及 refcount 的具体处理仍由 BlockSpaceManager 私有
+    持有，避免 Scheduler 或 MDS connector 直接依赖 vLLM allocator 实现。
+    """
+
+    reservation_id: str
+    seq_group_id: str
+    source_device: Device
+    target_device: Device
+    block_mapping: BlockMapping

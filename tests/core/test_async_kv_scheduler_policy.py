@@ -4,23 +4,29 @@
 
 import pytest
 
-from vllm.core.scheduler_policy import (AsyncKVLoadEvent,
-                                        AsyncKVLoadState,
-                                        AsyncKVSchedulePolicy)
+from vllm.core.scheduler_policy import (AsyncKVSchedulePolicy,
+                                        AsyncKVTransferEvent,
+                                        AsyncKVTransferOperation,
+                                        AsyncKVTransferState)
 
 
 def test_async_kv_policy_lifecycle():
     policy = AsyncKVSchedulePolicy(max_in_flight=2)
-    request = policy.submit("seq-group-0", [(1, 7), (2, 8)])
+    request = policy.enqueue("seq-group-0", "reservation-0",
+                             AsyncKVTransferOperation.READ,
+                             [(1, 7), (2, 8)])
 
     assert request.request_id == "async-kv-0"
     assert request.block_mapping == ((1, 7), (2, 8))
-    assert policy.loading_request_ids == (request.request_id,)
+    assert policy.queued_request_ids == (request.request_id,)
+    assert policy.activate_next() == (request,)
+    assert policy.pending_request_ids == (request.request_id,)
     assert policy.ready_request_ids == ()
 
     policy.apply_event(
-        AsyncKVLoadEvent(request.request_id, AsyncKVLoadState.READY))
-    assert policy.loading_request_ids == ()
+        AsyncKVTransferEvent(request.request_id,
+                             AsyncKVTransferState.READY))
+    assert policy.pending_request_ids == ()
     assert policy.ready_request_ids == (request.request_id,)
     assert policy.pop_ready() == (request,)
     assert policy.ready_request_ids == ()
@@ -28,25 +34,34 @@ def test_async_kv_policy_lifecycle():
 
 def test_async_kv_policy_errors_and_capacity():
     policy = AsyncKVSchedulePolicy(max_in_flight=1)
-    request = policy.submit("seq-group-0", [])
+    request = policy.enqueue("seq-group-0", "reservation-0",
+                             AsyncKVTransferOperation.WRITE, [])
+    queued = policy.enqueue("seq-group-1", "reservation-1",
+                            AsyncKVTransferOperation.READ, [])
 
-    with pytest.raises(RuntimeError):
-        policy.submit("seq-group-1", [])
+    assert policy.activate_next() == (request,)
+    assert policy.activate_next() == ()
+    assert policy.queued_request_ids == (queued.request_id,)
 
     policy.apply_event(
-        AsyncKVLoadEvent(request.request_id, AsyncKVLoadState.ERROR,
-                         error="restore failed"))
+        AsyncKVTransferEvent(request.request_id,
+                             AsyncKVTransferState.ERROR,
+                             error="store failed"))
     failed = policy.pop_errors()
     assert len(failed) == 1
     assert failed[0].request == request
-    assert failed[0].error == "restore failed"
+    assert failed[0].error == "store failed"
     assert policy.in_flight_count == 0
+    assert policy.activate_next() == (queued,)
 
 
 def test_async_kv_policy_rejects_duplicate_completion():
     policy = AsyncKVSchedulePolicy()
-    request = policy.submit("seq-group-0", [])
-    event = AsyncKVLoadEvent(request.request_id, AsyncKVLoadState.READY)
+    request = policy.enqueue("seq-group-0", "reservation-0",
+                             AsyncKVTransferOperation.READ, [])
+    policy.activate_next()
+    event = AsyncKVTransferEvent(request.request_id,
+                                 AsyncKVTransferState.READY)
     policy.apply_event(event)
 
     with pytest.raises(RuntimeError):

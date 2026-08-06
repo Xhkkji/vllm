@@ -6,9 +6,10 @@ import pytest
 
 from vllm.config import CacheConfig, SchedulerConfig
 from vllm.core.async_kv_scheduler import AsyncKVScheduler
-from vllm.core.scheduler import SchedulingBudget
-from vllm.core.scheduler_policy import (AsyncKVLoadEvent,
-                                        AsyncKVLoadState)
+from vllm.core.scheduler import Scheduler, SchedulingBudget
+from vllm.core.scheduler_policy import (AsyncKVTransferEvent,
+                                        AsyncKVTransferOperation,
+                                        AsyncKVTransferState)
 from vllm.sequence import SequenceStatus
 
 from .utils import (append_new_token_seq_group, create_dummy_prompt,
@@ -29,6 +30,11 @@ def _create_scheduler() -> AsyncKVScheduler:
     cache_config.num_cpu_blocks = 16
     cache_config.num_gpu_blocks = 16
     return AsyncKVScheduler(scheduler_config, cache_config, None)
+
+
+def _sync_swap_out(scheduler: AsyncKVScheduler, seq_group) -> None:
+    """只用于构造已有 SSD 副本；被测异步路径仍由 AsyncKVScheduler 执行。"""
+    Scheduler._swap_out(scheduler, seq_group, [])
 
 
 def test_async_scheduler_requires_chunked_prefill():
@@ -56,39 +62,46 @@ def test_swapped_request_waits_for_async_kv_ready():
     # 先构造一个已经完成 prefill、随后被 swap-out 的 decode 请求。
     scheduler._allocate_and_set_running(seq_group)
     append_new_token_seq_group(8, seq_group, 99)
-    blocks_to_swap_out: list[tuple[int, int]] = []
-    scheduler._swap_out(seq_group, blocks_to_swap_out)
+    _sync_swap_out(scheduler, seq_group)
     scheduler._add_seq_group_to_swapped(seq_group)
     assert seq.status == SequenceStatus.SWAPPED
 
     # 新策略只预留 GPU block 并生成异步请求，不能把该请求放进当前 batch。
+    storage_block_ids = list(scheduler.block_manager.get_block_table(seq))
+    free_gpu_before_reserve = scheduler.block_manager.get_num_free_gpu_blocks()
     output = scheduler._schedule_swapped(
         SchedulingBudget(token_budget=32, max_num_seqs=8), None)
-    requests = scheduler.drain_async_kv_loads_to_submit()
+    requests = scheduler.drain_async_kv_transfers_to_submit()
     assert not output.decode_seq_groups
     assert not output.prefill_seq_groups
     assert not output.blocks_to_swap_in
     assert len(requests) == 1
     assert requests[0].seq_group_id == seq_group.request_id
+    assert requests[0].operation == AsyncKVTransferOperation.READ
     assert requests[0].block_mapping
+    # reserve 阶段正式表仍指向 storage，目标 GPU block 只是被预留。
+    assert scheduler.block_manager.get_block_table(seq) == storage_block_ids
+    assert (scheduler.block_manager.get_num_free_gpu_blocks()
+            < free_gpu_before_reserve)
     assert seq.status == SequenceStatus.SWAPPED
-    assert scheduler.has_pending_async_kv_loads()
+    assert scheduler.has_active_async_kv_transfer()
     assert scheduler.get_num_unfinished_seq_groups() == 1
 
     # PENDING 事件不得改变队列或 SequenceStatus。
     scheduler.apply_async_kv_event(
-        AsyncKVLoadEvent(requests[0].request_id,
-                         AsyncKVLoadState.PENDING))
-    scheduler.promote_ready_async_kv_loads()
+        AsyncKVTransferEvent(requests[0].request_id,
+                             AsyncKVTransferState.PENDING))
+    scheduler.complete_ready_async_kv_transfers()
     assert seq.status == SequenceStatus.SWAPPED
     assert not scheduler.running
 
     # READY 后先完成 swapped -> running，再由父类普通调度执行 decode。
     scheduler.apply_async_kv_event(
-        AsyncKVLoadEvent(requests[0].request_id,
-                         AsyncKVLoadState.READY))
-    scheduler.promote_ready_async_kv_loads()
+        AsyncKVTransferEvent(requests[0].request_id,
+                             AsyncKVTransferState.READY))
+    scheduler.complete_ready_async_kv_transfers()
     assert seq.status == SequenceStatus.RUNNING
+    assert scheduler.block_manager.get_block_table(seq) != storage_block_ids
     assert list(scheduler.running) == [seq_group]
     assert not scheduler.loading
 
@@ -116,12 +129,12 @@ def test_abort_loading_request_defers_block_free_until_ready():
         "2", prompt_length=8, block_size=4)
     scheduler._allocate_and_set_running(seq_group)
     append_new_token_seq_group(8, seq_group, 100)
-    scheduler._swap_out(seq_group, [])
+    _sync_swap_out(scheduler, seq_group)
     scheduler._add_seq_group_to_swapped(seq_group)
 
     scheduler._schedule_swapped(
         SchedulingBudget(token_budget=32, max_num_seqs=8), None)
-    request = scheduler.drain_async_kv_loads_to_submit()[0]
+    request = scheduler.drain_async_kv_transfers_to_submit()[0]
 
     scheduler.abort_seq_group(seq_group.request_id)
     assert seq.status == SequenceStatus.FINISHED_ABORTED
@@ -130,8 +143,9 @@ def test_abort_loading_request_defers_block_free_until_ready():
 
     # MDS 完成后才真正释放 block 并移除 loading 生命周期。
     scheduler.apply_async_kv_event(
-        AsyncKVLoadEvent(request.request_id, AsyncKVLoadState.READY))
-    scheduler.promote_ready_async_kv_loads()
+        AsyncKVTransferEvent(request.request_id,
+                             AsyncKVTransferState.READY))
+    scheduler.complete_ready_async_kv_transfers()
     assert not scheduler.loading
     assert not scheduler.running
     assert not scheduler.has_unfinished_seqs()
@@ -145,7 +159,7 @@ def test_ready_decode_runs_with_remaining_prefill_chunk():
         "10", prompt_length=8, block_size=4)
     scheduler._allocate_and_set_running(restored_group)
     append_new_token_seq_group(8, restored_group, 101)
-    scheduler._swap_out(restored_group, [])
+    _sync_swap_out(scheduler, restored_group)
     scheduler._add_seq_group_to_swapped(restored_group)
 
     _, prefill_group = create_dummy_prompt(
@@ -155,7 +169,7 @@ def test_ready_decode_runs_with_remaining_prefill_chunk():
     # 第一轮提交异步恢复，同时只计算长 prompt 的第一个 32-token chunk。
     first_metadata, first_output = schedule_and_update_computed_tokens(
         scheduler)
-    requests = scheduler.drain_async_kv_loads_to_submit()
+    requests = scheduler.drain_async_kv_transfers_to_submit()
     assert len(requests) == 1
     assert [item.seq_group
             for item in first_output.scheduled_seq_groups] == [prefill_group]
@@ -164,9 +178,9 @@ def test_ready_decode_runs_with_remaining_prefill_chunk():
     assert prefill_group.is_prefill()
 
     scheduler.apply_async_kv_event(
-        AsyncKVLoadEvent(requests[0].request_id,
-                         AsyncKVLoadState.READY))
-    scheduler.promote_ready_async_kv_loads()
+        AsyncKVTransferEvent(requests[0].request_id,
+                             AsyncKVTransferState.READY))
+    scheduler.complete_ready_async_kv_transfers()
 
     # 第二轮优先恢复 decode，但 32-token budget 仍足以容纳剩余 8-token
     # prefill；SchedulerOutputs 为 attention backend 保持 prefill 在前。
@@ -180,3 +194,84 @@ def test_ready_decode_runs_with_remaining_prefill_chunk():
     assert [metadata.token_chunk_size
             for metadata in second_metadata] == [8, 1]
     assert restored_seq.status == SequenceStatus.RUNNING
+
+
+def test_async_swap_out_keeps_gpu_blocks_until_write_ready():
+    """异步 write 完成前 GPU source 不得从正式 block table 释放。"""
+    scheduler = _create_scheduler()
+    seq, seq_group = create_dummy_prompt(
+        "20", prompt_length=8, block_size=4)
+    scheduler._allocate_and_set_running(seq_group)
+    append_new_token_seq_group(8, seq_group, 202)
+
+    gpu_block_ids = list(scheduler.block_manager.get_block_table(seq))
+    free_gpu_before = scheduler.block_manager.get_num_free_gpu_blocks()
+    scheduler._swap_out(seq_group, [])
+    scheduler._add_seq_group_to_swapped(seq_group)
+    request = scheduler.drain_async_kv_transfers_to_submit()[0]
+
+    assert request.operation == AsyncKVTransferOperation.WRITE
+    assert seq.status == SequenceStatus.SWAPPED
+    assert scheduler.block_manager.get_block_table(seq) == gpu_block_ids
+    assert scheduler.block_manager.get_num_free_gpu_blocks() == free_gpu_before
+    assert request.request_id in scheduler.saving
+
+    scheduler.apply_async_kv_event(
+        AsyncKVTransferEvent(request.request_id,
+                             AsyncKVTransferState.READY))
+    scheduler.complete_ready_async_kv_transfers()
+
+    assert request.request_id not in scheduler.saving
+    assert scheduler.block_manager.get_block_table(seq) != gpu_block_ids
+    assert scheduler.block_manager.get_num_free_gpu_blocks() > free_gpu_before
+    assert list(scheduler.swapped) == [seq_group]
+
+
+def test_async_writes_share_one_mds_slot():
+    """多个 write 可以先 reserve，但 Worker/MDS 每次只接收一个。"""
+    scheduler = _create_scheduler()
+    groups = []
+    for index in range(2):
+        _, seq_group = create_dummy_prompt(
+            str(30 + index), prompt_length=8, block_size=4)
+        scheduler._allocate_and_set_running(seq_group)
+        scheduler._swap_out(seq_group, [])
+        scheduler._add_seq_group_to_swapped(seq_group)
+        groups.append(seq_group)
+
+    first = scheduler.drain_async_kv_transfers_to_submit()
+    assert len(first) == 1
+    assert scheduler.drain_async_kv_transfers_to_submit() == ()
+    assert len(scheduler.async_kv_policy.queued_request_ids) == 1
+
+    scheduler.apply_async_kv_event(
+        AsyncKVTransferEvent(first[0].request_id,
+                             AsyncKVTransferState.READY))
+    scheduler.complete_ready_async_kv_transfers()
+    second = scheduler.drain_async_kv_transfers_to_submit()
+    assert len(second) == 1
+    assert second[0].seq_group_id == groups[1].request_id
+
+
+def test_abort_active_write_keeps_gpu_source_until_completion():
+    """取消 write 时不能让父类提前释放 MDS 正在读取的 GPU 地址。"""
+    scheduler = _create_scheduler()
+    seq, seq_group = create_dummy_prompt(
+        "40", prompt_length=8, block_size=4)
+    scheduler._allocate_and_set_running(seq_group)
+    gpu_block_ids = list(scheduler.block_manager.get_block_table(seq))
+    scheduler._swap_out(seq_group, [])
+    scheduler._add_seq_group_to_swapped(seq_group)
+    request = scheduler.drain_async_kv_transfers_to_submit()[0]
+
+    scheduler.abort_seq_group(seq_group.request_id)
+    assert seq.status == SequenceStatus.FINISHED_ABORTED
+    assert scheduler.block_manager.get_block_table(seq) == gpu_block_ids
+    assert request.request_id in scheduler.saving
+
+    scheduler.apply_async_kv_event(
+        AsyncKVTransferEvent(request.request_id,
+                             AsyncKVTransferState.READY))
+    scheduler.complete_ready_async_kv_transfers()
+    assert seq.seq_id not in scheduler.block_manager.block_tables
+    assert not scheduler.has_unfinished_seqs()

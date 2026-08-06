@@ -151,6 +151,11 @@ def parse_args() -> argparse.Namespace:
                         default=None,
                         help="可选，显式限制 scheduler 的单步 token budget")
     parser.add_argument(
+        "--enable-chunked-prefill",
+        action="store_true",
+        help=("启用 V0 chunked prefill。异步 KV 调度实验使用该开关缩短 "
+              "Engine 数据依赖同步点之间的最长 forward 时间。"))
+    parser.add_argument(
         "--num-gpu-blocks-override",
         type=int,
         default=None,
@@ -181,6 +186,11 @@ def parse_args() -> argparse.Namespace:
         choices=["auto", "swap", "recompute"],
         default="auto",
         help="V0 抢占模式。auto 使用 vLLM 默认策略；swap 可强制走换入换出。")
+    parser.add_argument(
+        "--scheduler-cls",
+        default=None,
+        help=("可选 Scheduler 类的完整导入路径。未设置时继续使用 vLLM "
+              "默认 Scheduler，用于隔离异步 KV 调度实验。"))
     parser.add_argument("--n",
                         type=int,
                         default=1,
@@ -338,10 +348,12 @@ def main() -> None:
     print(f"swap_space={args.swap_space} GiB")
     print(f"device={args.device}")
     print(f"preemption_mode={args.preemption_mode}")
+    print(f"scheduler_cls={args.scheduler_cls}")
     print(f"n={args.n}")
     print(f"best_of={args.best_of}")
     print(f"max_num_seqs={args.max_num_seqs}")
     print(f"max_num_batched_tokens={args.max_num_batched_tokens}")
+    print(f"enable_chunked_prefill={args.enable_chunked_prefill}")
     print(f"num_gpu_blocks_override={args.num_gpu_blocks_override}")
     print(
         f"disable_async_output_proc={args.disable_async_output_proc}")
@@ -366,10 +378,14 @@ def main() -> None:
     # 只在显式指定时覆盖 vLLM 默认 scheduler 配置，方便做对照实验。
     if args.preemption_mode != "auto":
         llm_kwargs["preemption_mode"] = args.preemption_mode
+    if args.scheduler_cls is not None:
+        llm_kwargs["scheduler_cls"] = args.scheduler_cls
     if args.max_num_seqs is not None:
         llm_kwargs["max_num_seqs"] = args.max_num_seqs
     if args.max_num_batched_tokens is not None:
         llm_kwargs["max_num_batched_tokens"] = args.max_num_batched_tokens
+    if args.enable_chunked_prefill:
+        llm_kwargs["enable_chunked_prefill"] = True
     if args.num_gpu_blocks_override is not None:
         llm_kwargs["num_gpu_blocks_override"] = args.num_gpu_blocks_override
 

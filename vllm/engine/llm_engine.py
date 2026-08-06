@@ -1295,6 +1295,72 @@ class LLMEngine:
                 else:
                     seq.append_token_id(sample.output_token, sample.logprobs)
 
+    @staticmethod
+    def _merge_async_kv_worker_events(worker_results: List[Any]) -> List[Any]:
+        """合并各 Worker 返回的异步 KV 事件。
+
+        Phase 4A resident MDS 当前强制 TP=1、PP=1，正常情况下这里只会
+        收到一份结果。保留一致性检查是为了将来扩展多个 Worker 时，避免
+        同一个 request_id 被重复应用，或者不同 rank 对完成状态产生分歧。
+        """
+        if not worker_results:
+            return []
+        events = worker_results[0]
+        for rank_events in worker_results[1:]:
+            if rank_events != events:
+                raise RuntimeError(
+                    "async KV event mismatch between workers")
+        return events
+
+    def _poll_async_kv_scheduler(self, virtual_engine: int) -> None:
+        """调度前轮询 Worker，并把完成事件应用到新 Scheduler。
+
+        使用 duck typing 而不是导入 AsyncKVScheduler，保持 Engine 与具体
+        调度实现解耦。原生 Scheduler 没有 ``has_pending_async_kv_loads``，
+        因此默认路径会直接返回，不增加任何 RPC 开销。
+        """
+        scheduler = self.scheduler[virtual_engine]
+        has_pending = getattr(scheduler, "has_pending_async_kv_loads", None)
+        if has_pending is None or not has_pending():
+            return
+
+        worker_results = self.model_executor.collective_rpc(
+            "poll_async_kv_loads", args=(virtual_engine, ))
+        events = self._merge_async_kv_worker_events(worker_results)
+        apply_event = getattr(scheduler, "apply_async_kv_event")
+        for event in events:
+            if (envs.VLLM_V0_SWAP_TRACE
+                    and event.state.name == "READY"):
+                logger.info(
+                    "[V0_SWAP_TRACE][AsyncKV][Engine] phase=ready_event "
+                    "request_id=%s ready_event_monotonic_ns=%d",
+                    event.request_id,
+                    time.monotonic_ns(),
+                )
+            apply_event(event)
+
+        # 即使本次 Worker 返回空列表，也要执行提升：submit RPC 可能已经
+        # 立即返回 READY，状态会保存在 Scheduler 中等待本轮统一迁移。
+        getattr(scheduler, "promote_ready_async_kv_loads")()
+
+    def _submit_async_kv_scheduler_loads(self,
+                                         virtual_engine: int) -> None:
+        """把新 Scheduler 本轮生成的 load request 非阻塞提交给 Worker。"""
+        scheduler = self.scheduler[virtual_engine]
+        drain = getattr(scheduler, "drain_async_kv_loads_to_submit", None)
+        if drain is None:
+            return
+        requests = drain()
+        if not requests:
+            return
+
+        worker_results = self.model_executor.collective_rpc(
+            "submit_async_kv_loads", args=(virtual_engine, requests))
+        events = self._merge_async_kv_worker_events(worker_results)
+        apply_event = getattr(scheduler, "apply_async_kv_event")
+        for event in events:
+            apply_event(event)
+
     def step(self) -> List[Union[RequestOutput, PoolingRequestOutput]]:
         """Performs one decoding iteration and returns newly generated results.
 
@@ -1367,6 +1433,10 @@ class LLMEngine:
         # Clear outputs for each new scheduler iteration
         ctx.request_outputs.clear()
 
+        # 新 Scheduler 的 READY 请求必须在本轮 schedule 之前进入 running；
+        # 这样 Scheduler 才会为它构造正确的 block table 和 token budget。
+        self._poll_async_kv_scheduler(virtual_engine)
+
         # Skip the scheduler if there are any remaining steps in the seq groups.
         # This ensures that the scheduler is only called again when the current
         # batch has completed.
@@ -1409,6 +1479,12 @@ class LLMEngine:
         assert seq_group_metadata_list is not None
         assert scheduler_outputs is not None
 
+        # submit 与模型执行分离：A 的 SSD->GPU 恢复在这里启动，而本轮已经
+        # 选中的 B/C 可以继续进入下面的 execute_model，实现 I/O-compute
+        # overlap。若当前没有计算 batch，submit 仍会发生，Engine 下一轮会
+        # 依靠 loading 状态继续 poll。
+        self._submit_async_kv_scheduler_loads(virtual_engine)
+
         if not scheduler_outputs.is_empty():
 
             # Check if we have a cached last_output from the previous iteration.
@@ -1433,6 +1509,35 @@ class LLMEngine:
             if allow_async_output_proc:
                 execute_model_req.async_callback = self.async_callbacks[
                     virtual_engine]
+
+            # 只在真正 dispatch 当前 batch 前记录首次执行时间。这个时间点
+            # 不改变模型执行和调度逻辑，用于拆分 READY -> first execute。
+            consume_markers = getattr(
+                self.scheduler[virtual_engine],
+                "consume_async_kv_execution_markers", None)
+            if consume_markers is not None:
+                seq_group_ids = [
+                    metadata.request_id
+                    for metadata in seq_group_metadata_list
+                    if hasattr(metadata, "request_id")
+                ]
+                markers = consume_markers(seq_group_ids)
+                if envs.VLLM_V0_SWAP_TRACE:
+                    first_execute_ns = time.monotonic_ns()
+                    for marker in markers:
+                        logger.info(
+                            "[V0_SWAP_TRACE][AsyncKV][Engine] "
+                            "phase=first_execute request_id=%s "
+                            "seq_group_id=%s promoted_monotonic_ns=%d "
+                            "first_execute_monotonic_ns=%d "
+                            "ready_to_first_execute_ms=%.3f",
+                            marker.request_id,
+                            marker.seq_group_id,
+                            marker.promoted_monotonic_ns,
+                            first_execute_ns,
+                            (first_execute_ns -
+                             marker.promoted_monotonic_ns) / 1.0e6,
+                        )
 
             try:
                 with _bam_nvtx_range("vllm_engine_execute_model"):

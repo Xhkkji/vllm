@@ -218,6 +218,17 @@ evaluation/lmcache_ssd_read_paths_baseline/**/*.kvcache.safetensors
 evaluation/lmcache_ssd_read_paths_baseline/**/*.kvcache.safetensors.metadata
 evaluation/lmcache_ssd_read_paths_baseline/**/*.nsys-rep
 evaluation/lmcache_ssd_read_paths_baseline/**/*.sqlite
+
+# Profiling / generated KV-cache artifacts
+*.nsys-rep
+*.sqlite
+*.sqlite-journal
+lmcache_local_disk/
+**/lmcache_local_disk/
+payload/
+payloads/
+**/payload/
+**/payloads/
 evaluation/logs/**/lmcache_gds/
 evaluation/logs/**/*.safetensors
 evaluation/logs/**/*.bin

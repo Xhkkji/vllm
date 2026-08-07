@@ -49,8 +49,10 @@ class AsyncKVScheduler(Scheduler):
                          pipeline_parallel_size, output_proc_callback)
         # read 请求从 swapped 队列取出后暂存在 loading；write 请求仍保留
         # 在 swapped 队列，但在 SSD 副本提交前记录于 saving，禁止被重新
-        # swap-in。两个方向共用同一个单槽状态机。
-        self.async_kv_policy = AsyncKVSchedulePolicy()
+        # swap-in。两个方向共用同一个多槽状态机，容量必须与 MDS request
+        # table 一致；小于 1 时直接失败，避免运行中出现隐式单槽回退。
+        self.async_kv_policy = AsyncKVSchedulePolicy(
+            max_in_flight=envs.VLLM_BAM_MDS_MAX_IN_FLIGHT)
         self.loading: dict[str, SequenceGroup] = {}
         self.saving: dict[str, SequenceGroup] = {}
         # READY 请求先进入 running，真正被 Engine dispatch 前保留一个观测
@@ -72,12 +74,13 @@ class AsyncKVScheduler(Scheduler):
         reservation: BlockSwapReservation,
         operation: AsyncKVTransferOperation,
     ) -> AsyncKVTransferRequest:
-        """把 block reservation 登记为等待 MDS 单槽的 transfer。"""
+        """把 block reservation 登记为等待 MDS transfer slot。"""
         request = self.async_kv_policy.enqueue(
             seq_group.request_id,
             reservation.reservation_id,
             operation,
             reservation.block_mapping,
+            reservation.logical_blocks,
         )
         lifecycle = (self.loading if operation == AsyncKVTransferOperation.READ
                      else self.saving)
@@ -85,7 +88,7 @@ class AsyncKVScheduler(Scheduler):
         return request
 
     def has_active_async_kv_transfer(self) -> bool:
-        """只有已经占用 Worker/MDS 单槽的请求才需要 Engine poll。"""
+        """只要至少一笔 transfer 已提交，Engine 就需要轮询 Worker。"""
         return self.async_kv_policy.in_flight_count > 0
 
     def has_unfinished_seqs(self) -> bool:
@@ -216,7 +219,7 @@ class AsyncKVScheduler(Scheduler):
 
         原生 Scheduler 只扫描 waiting/running/swapped 三个队列；loading
         请求不在这些队列中，因此需要在调用父类逻辑后单独检查。这里不
-        尝试伪造 MDS cancel 协议，而是让 resident MDS 完成当前单槽 I/O，
+        尝试伪造 MDS cancel 协议，而是让 resident MDS 完成对应 slot 的 I/O，
         再由 ``complete_ready_async_kv_transfers`` 执行最终清理。
         """
         if isinstance(request_id, str):
@@ -262,7 +265,7 @@ class AsyncKVScheduler(Scheduler):
 
     def drain_async_kv_transfers_to_submit(
             self) -> Tuple[AsyncKVTransferRequest, ...]:
-        """只激活当前 MDS 单槽能够接收的下一笔 queued transfer。"""
+        """按后端容量批量激活 queued transfer。"""
         return self.async_kv_policy.activate_next()
 
     def _swap_out(
@@ -321,13 +324,14 @@ class AsyncKVScheduler(Scheduler):
         4. 等待 Worker/MDS 返回 READY；
         5. 下一轮才进入 running。
 
-        read/write 可以提前排队，但同一时刻只激活一个 MDS transfer。
+        read/write 可以提前排队，并由统一 policy 按 MDS slot 容量激活。
         """
         empty = SchedulerSwappedInOutputs.create_empty()
-        # 只允许一个 read reservation，避免单槽系统提前占满 GPU target。
-        # write 请求可以继续留在 saving/swapped 中；从其后找到真正位于
-        # storage 的 seq，提前建立 critical read，待槽空闲后优先提交。
-        if self.loading or not self.swapped:
+        # read reservation 会占用真实 GPU target，因此最多保留与后端 slot
+        # 数相同的 loading 请求。write 继续留在 saving/swapped；从其后
+        # 找到真正位于 storage 的 seq，避免对尚未写完的 GPU source 读回。
+        if (len(self.loading) >= self.async_kv_policy.max_in_flight
+                or not self.swapped):
             return empty
 
         saving_group_ids = {id(group) for group in self.saving.values()}

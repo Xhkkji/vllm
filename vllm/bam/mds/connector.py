@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib
 import os
+from dataclasses import dataclass
 from pathlib import Path
 import sys
 import time
@@ -18,6 +19,16 @@ from vllm.logger import init_logger
 
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class _PendingTransfer:
+    """Connector 对一笔 logical transfer 的本地控制面记录。"""
+
+    handle: object
+    mapping: tuple[tuple[int, int], ...]
+    operation: str
+    submitted_at_ns: int
 
 
 class BaMMDSConnector:
@@ -60,15 +71,11 @@ class BaMMDSConnector:
             device_index=device_index,
             timeout_seconds=float(envs.VLLM_BAM_MDS_TIMEOUT_SECONDS))
         self.max_blocks_per_batch = 0
+        self.max_in_flight = 0
         self.gpu_cache: list[torch.Tensor] = []
-        self._pending_transfer_handle = None
-        self._pending_transfer_mapping: tuple[tuple[int, int], ...] | None = None
-        # scheduler request_id 与底层 MDS handle 的 request_id 属于两个
-        # 命名空间。前者用于 Engine/Worker 事件关联，后者由 MDSClient
-        # 写入控制槽；必须同时保存，不能用其中一个替代另一个。
-        self._pending_transfer_scheduler_request_id: str | None = None
-        self._pending_transfer_operation: str | None = None
-        self._pending_transfer_submitted_at_ns: int | None = None
+        # scheduler request_id 与底层 MDS handle 属于两个命名空间；每个
+        # scheduler request 独立保存 mapping 和 handle，completion 可乱序。
+        self._pending_transfers: dict[str, _PendingTransfer] = {}
         try:
             self.gpu_cache = self._allocate_and_wrap()
         except Exception:
@@ -97,6 +104,12 @@ class BaMMDSConnector:
         self.layout.validate_manifest(result.manifest)
         self.max_blocks_per_batch = int(
             result.manifest["max_blocks_per_batch"])
+        self.max_in_flight = int(result.manifest["request_slot_count"])
+        if self.max_in_flight != envs.VLLM_BAM_MDS_MAX_IN_FLIGHT:
+            raise RuntimeError(
+                "MDS request-slot mismatch: daemon="
+                f"{self.max_in_flight}, vLLM="
+                f"{envs.VLLM_BAM_MDS_MAX_IN_FLIGHT}")
         tensors: list[torch.Tensor] = []
         for region in result.regions:
             tensor = self.bridge.tensor_from_cuda_ptr(
@@ -119,10 +132,11 @@ class BaMMDSConnector:
         torch.cuda.synchronize(self.layout.device_index)
         logger.info(
             "[BAM_MDS] imported daemon KV cache layers=%d gpu_blocks=%d "
-            "storage_blocks=%d fragment_bytes=%d max_blocks_per_batch=%d",
+            "storage_blocks=%d fragment_bytes=%d max_blocks_per_batch=%d "
+            "max_in_flight=%d",
             self.layout.num_layers, self.layout.num_gpu_blocks,
             self.layout.num_storage_blocks, self.layout.fragment_bytes,
-            self.max_blocks_per_batch)
+            self.max_blocks_per_batch, self.max_in_flight)
         return tensors
 
     def start(self) -> None:
@@ -145,7 +159,7 @@ class BaMMDSConnector:
         同一份 read mapping 不会被重复提交。
         """
         legacy_request_id = "legacy-deferred-swap-in"
-        if self._pending_transfer_handle is None:
+        if "legacy-deferred-swap-in" not in self._pending_transfers:
             if self.submit_transfer_async(
                     legacy_request_id, src_to_dst, operation="read"):
                 return True
@@ -154,44 +168,38 @@ class BaMMDSConnector:
     def submit_transfer_async(self, scheduler_request_id: str,
                               src_to_dst: torch.Tensor, *,
                               operation: str) -> bool:
-        """只提交一次 MDS logical read/write，不等待完成。
+        """提交一笔 MDS logical read/write，不等待完成。
 
-        返回 True 仅表示 mapping 为空、无需 I/O；正常提交返回 False。
-        当前 resident MDS 是单槽协议，因此已有 live request 时只接受完全
-        相同的 scheduler request_id 和 block mapping，其他请求立即报错，
-        防止新请求覆盖正在使用的控制槽。
+        返回 True 仅表示 mapping 为空、无需 I/O；正常提交返回 False。MDS
+        request table 负责 slot backpressure，本层只维护 request identity。
         """
         if not scheduler_request_id:
             raise ValueError("scheduler_request_id must not be empty")
         if operation not in ("read", "write"):
             raise ValueError(f"unsupported async MDS operation: {operation}")
         if src_to_dst.numel() == 0:
-            if self._pending_transfer_handle is not None:
-                raise RuntimeError(
-                    "empty mapping cannot replace a pending MDS transfer")
             return True
+        if scheduler_request_id in self._pending_transfers:
+            pending = self._pending_transfers[scheduler_request_id]
+            mapping, _ = self._mapping_payload(src_to_dst,
+                                                operation=operation)
+            if (mapping != pending.mapping
+                    or operation != pending.operation):
+                raise RuntimeError(
+                    "MDS transfer changed while request was in flight")
+            return False
 
         mapping, payload = self._mapping_payload(src_to_dst,
                                                  operation=operation)
-        if self._pending_transfer_handle is not None:
-            if (scheduler_request_id !=
-                    self._pending_transfer_scheduler_request_id):
-                raise RuntimeError(
-                    "MDS single-slot transfer already belongs to another "
-                    "scheduler request")
-            if (mapping != self._pending_transfer_mapping
-                    or operation != self._pending_transfer_operation):
-                raise RuntimeError(
-                    "MDS transfer changed while a request was in flight")
-            return False
-
         submit = (self.client.submit_read_async
                   if operation == "read" else self.client.submit_write_async)
-        self._pending_transfer_handle = submit(payload)
-        self._pending_transfer_mapping = mapping
-        self._pending_transfer_scheduler_request_id = scheduler_request_id
-        self._pending_transfer_operation = operation
-        self._pending_transfer_submitted_at_ns = time.monotonic_ns()
+        handle = submit(payload)
+        submitted_at_ns = time.monotonic_ns()
+        self._pending_transfers[scheduler_request_id] = _PendingTransfer(
+            handle=handle,
+            mapping=mapping,
+            operation=operation,
+            submitted_at_ns=submitted_at_ns)
         if envs.VLLM_V0_SWAP_TRACE:
             logger.info(
                 "[V0_SWAP_TRACE][AsyncKV][Connector] phase=submit "
@@ -199,8 +207,8 @@ class BaMMDSConnector:
                 "submit_monotonic_ns=%d blocks=%d",
                 operation,
                 scheduler_request_id,
-                self._pending_transfer_handle.request_id,
-                self._pending_transfer_submitted_at_ns,
+                handle.request_id,
+                submitted_at_ns,
                 len(mapping),
             )
         logger.debug(
@@ -208,41 +216,35 @@ class BaMMDSConnector:
             "mds_request_id=%d blocks=%d",
             operation,
             scheduler_request_id,
-            self._pending_transfer_handle.request_id,
+            handle.request_id,
             len(mapping),
         )
         return False
 
     def poll_transfer_async(self, scheduler_request_id: str) -> bool:
-        """非阻塞查询指定 scheduler request 的 MDS 完成状态。
-
-        PENDING 时返回 False，不修改控制槽；DONE 时调用 MDSClient.finish
-        归还单槽，并清除 connector 内的三项身份记录。只有本方法返回 True
-        后，Scheduler 才能把对应 sequence group 提升到 running。
-        """
-        if self._pending_transfer_handle is None:
+        """非阻塞查询指定 scheduler request 的 MDS 完成状态。"""
+        pending = self._pending_transfers.get(scheduler_request_id)
+        if pending is None:
             raise RuntimeError(
                 "cannot poll MDS transfer without a pending request")
-        if scheduler_request_id != self._pending_transfer_scheduler_request_id:
-            raise RuntimeError(
-                "MDS transfer scheduler request identity mismatch")
 
-        if not self.client.poll(self._pending_transfer_handle):
-            return False
+        try:
+            if not self.client.poll(pending.handle):
+                return False
+        except Exception:
+            # completion 已经失败，后续不能再用同一个 scheduler request
+            # 轮询；释放 client/connector identity，由 Scheduler abort block
+            # reservation。daemon 若进入全局 ERROR 会阻止后续 submit。
+            self.client.discard(pending.handle)
+            del self._pending_transfers[scheduler_request_id]
+            raise
 
-        request_id = self._pending_transfer_handle.request_id
-        mapping = self._pending_transfer_mapping
-        operation = self._pending_transfer_operation
-        assert mapping is not None
-        assert operation is not None
+        request_id = pending.handle.request_id
+        mapping = pending.mapping
+        operation = pending.operation
         observed_done_ns = time.monotonic_ns()
-        io_elapsed_ns = self.client.finish(self._pending_transfer_handle)
-        self._pending_transfer_handle = None
-        self._pending_transfer_mapping = None
-        self._pending_transfer_scheduler_request_id = None
-        self._pending_transfer_operation = None
-        submitted_at_ns = self._pending_transfer_submitted_at_ns
-        self._pending_transfer_submitted_at_ns = None
+        io_elapsed_ns = self.client.finish(pending.handle)
+        del self._pending_transfers[scheduler_request_id]
         if envs.VLLM_V0_SWAP_TRACE:
             logger.info(
                 "[V0_SWAP_TRACE][AsyncKV][Connector] phase=ready "
@@ -253,8 +255,7 @@ class BaMMDSConnector:
                 scheduler_request_id,
                 request_id,
                 observed_done_ns,
-                ((observed_done_ns - submitted_at_ns) / 1.0e6
-                 if submitted_at_ns is not None else -1.0),
+                (observed_done_ns - pending.submitted_at_ns) / 1.0e6,
                 io_elapsed_ns / 1.0e6,
             )
         logger.info(
@@ -271,10 +272,6 @@ class BaMMDSConnector:
     def _transfer_mapping(self, src_to_dst: torch.Tensor, *, operation: str) -> None:
         if src_to_dst.numel() == 0:
             return
-        if self._pending_transfer_handle is not None:
-            raise RuntimeError(
-                "cannot run a blocking MDS transfer while another transfer "
-                "is pending")
         _, payload = self._mapping_payload(src_to_dst, operation=operation)
         if operation == "write":
             self.client.submit_write(payload)

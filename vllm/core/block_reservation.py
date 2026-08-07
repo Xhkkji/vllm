@@ -5,12 +5,30 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Optional, Tuple
 
 from vllm.utils import Device
 
 
 BlockMapping = Tuple[Tuple[int, int], ...]
+
+
+@dataclass(frozen=True, order=True)
+class LogicalBlockKey:
+    """稳定的 scheduler-visible block 身份，不包含可复用的物理地址。"""
+
+    seq_id: int
+    logical_index: int
+
+
+@dataclass(frozen=True)
+class BlockResidency:
+    """一个逻辑 KV block 当前可供上层策略查询的副本状态。"""
+
+    key: LogicalBlockKey
+    storage_block_id: Optional[int]
+    storage_replica_clean: bool
+    pin_count: int
 
 
 @dataclass(frozen=True)
@@ -30,3 +48,6 @@ class BlockSwapReservation:
     # write reservation 可以直接复用 read 后保留的 clean SSD block；这些
     # block 不出现在 I/O mapping 中，但会在 commit 时进入正式 storage 表。
     num_reused_blocks: int = 0
+    # I/O mapping 与逻辑 block 一一对应；后续策略可以在不解析 allocator
+    # 私有对象的前提下，把 completion 关联回 residency directory。
+    logical_blocks: Tuple[LogicalBlockKey, ...] = ()

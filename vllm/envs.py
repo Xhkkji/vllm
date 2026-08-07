@@ -63,6 +63,7 @@ if TYPE_CHECKING:
     VLLM_BAM_MDS_CUDA_IPC_LIBRARY: Optional[str] = None
     VLLM_BAM_MDS_TORCH_BRIDGE_DIR: Optional[str] = None
     VLLM_BAM_MDS_TIMEOUT_SECONDS: float = 120.0
+    VLLM_BAM_MDS_MAX_IN_FLIGHT: int = 4
     VLLM_BAM_DIRECT_PLACEMENT: bool = False
     VLLM_BAM_DIRECT_PLACEMENT_IMPL: str = "lmcache"
     VLLM_BAM_DIRECT_PLACEMENT_RUNTIME_ONE_COPY: bool = False
@@ -521,6 +522,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.getenv("VLLM_BAM_MDS_TORCH_BRIDGE_DIR"),
     "VLLM_BAM_MDS_TIMEOUT_SECONDS":
     lambda: float(os.getenv("VLLM_BAM_MDS_TIMEOUT_SECONDS", "120")),
+    "VLLM_BAM_MDS_MAX_IN_FLIGHT":
+    lambda: int(os.getenv("VLLM_BAM_MDS_MAX_IN_FLIGHT", "4")),
 
     # 是否启用 Direct Placement v0。
     # 开启后 LMCache retrieve 会优先尝试：

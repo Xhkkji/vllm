@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Dict, Optional, Sequence, Tuple
 
-from vllm.core.block_reservation import BlockMapping
+from vllm.core.block_reservation import BlockMapping, LogicalBlockKey
 
 
 class AsyncKVTransferOperation(Enum):
@@ -17,6 +17,17 @@ class AsyncKVTransferOperation(Enum):
 
     READ = "read"
     WRITE = "write"
+
+
+class AsyncKVTransferPriority(Enum):
+    """后端无关的最小 I/O 优先级。
+
+    restore read 位于请求恢复关键路径；write 已经拥有 GPU source，可以
+    留在队列中等待。应用层以后可以改变入队顺序，但不需要修改 Worker/MDS。
+    """
+
+    CRITICAL_READ = 0
+    DEFERRED_WRITE = 1
 
 
 class AsyncKVTransferState(Enum):
@@ -37,6 +48,8 @@ class AsyncKVTransferRequest:
     reservation_id: str
     operation: AsyncKVTransferOperation
     block_mapping: BlockMapping
+    logical_blocks: Tuple[LogicalBlockKey, ...]
+    priority: AsyncKVTransferPriority
 
 
 @dataclass(frozen=True)
@@ -67,11 +80,11 @@ class PendingAsyncKVTransfer:
 
 
 class AsyncKVSchedulePolicy:
-    """管理 queued -> pending -> ready/error 的轻量单槽状态机。
+    """管理 queued -> pending -> ready/error 的轻量多槽状态机。
 
-    Scheduler 可以提前建立多个 block reservation 并排入队列，但只有
-    ``activate_next`` 返回的请求才会占用 MDS 控制槽。这样异步 write
-    尚未完成时，新产生的 reservation 不会覆盖 resident MDS 单槽。
+    Scheduler 可以提前建立多个 block reservation；``activate_next`` 只按
+    ``max_in_flight`` 激活后端能够容纳的请求。所有 slot 共用一套状态表，
+    completion 可以乱序返回，request identity 不依赖提交顺序。
     """
 
     def __init__(self, max_in_flight: int = 1) -> None:
@@ -98,6 +111,11 @@ class AsyncKVSchedulePolicy:
         return len(self.pending_request_ids)
 
     @property
+    def available_capacity(self) -> int:
+        """返回当前还可提交给后端的 logical transfer slot 数。"""
+        return self.max_in_flight - self.in_flight_count
+
+    @property
     def has_outstanding(self) -> bool:
         return bool(self._transfers)
 
@@ -107,8 +125,14 @@ class AsyncKVSchedulePolicy:
         reservation_id: str,
         operation: AsyncKVTransferOperation,
         block_mapping: Sequence[Tuple[int, int]],
+        logical_blocks: Sequence[LogicalBlockKey] = (),
+        priority: Optional[AsyncKVTransferPriority] = None,
     ) -> AsyncKVTransferRequest:
-        """登记 reservation，但暂不占用 Worker/MDS 单槽。"""
+        """登记 reservation，但暂不占用 Worker/MDS request slot。"""
+        if priority is None:
+            priority = (AsyncKVTransferPriority.CRITICAL_READ
+                        if operation == AsyncKVTransferOperation.READ else
+                        AsyncKVTransferPriority.DEFERRED_WRITE)
         request_id = f"async-kv-{next(self._request_counter)}"
         request = AsyncKVTransferRequest(
             request_id=request_id,
@@ -116,6 +140,8 @@ class AsyncKVSchedulePolicy:
             reservation_id=reservation_id,
             operation=operation,
             block_mapping=tuple(tuple(pair) for pair in block_mapping),
+            logical_blocks=tuple(logical_blocks),
+            priority=priority,
         )
         self._transfers[request_id] = PendingAsyncKVTransfer(request=request)
         return request
@@ -123,19 +149,17 @@ class AsyncKVSchedulePolicy:
     def activate_next(self) -> Tuple[AsyncKVTransferRequest, ...]:
         """优先激活 critical read，再用剩余槽位处理 deferred write。
 
-        单槽下不能抢占已经 IN_FLIGHT 的 write，但只要当前槽归还，后到的
-        read 会越过尚未提交的 write。这样不会复制两套队列状态机，同时
-        保持 request 在各自优先级内的 FIFO 顺序。
+        已经 IN_FLIGHT 的 write 不会被伪取消；后到 read 只越过仍为 QUEUED
+        的 write。这样不复制两套队列状态机，同时保持同优先级 FIFO。
         """
-        capacity = self.max_in_flight - self.in_flight_count
+        capacity = self.available_capacity
         if capacity <= 0:
             return ()
         activated = []
-        for operation in (AsyncKVTransferOperation.READ,
-                          AsyncKVTransferOperation.WRITE):
+        for priority in AsyncKVTransferPriority:
             for transfer in self._transfers.values():
                 if (transfer.state != AsyncKVTransferState.QUEUED
-                        or transfer.request.operation != operation):
+                        or transfer.request.priority != priority):
                     continue
                 transfer.state = AsyncKVTransferState.PENDING
                 activated.append(transfer.request)

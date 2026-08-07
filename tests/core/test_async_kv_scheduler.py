@@ -97,6 +97,7 @@ def test_swapped_request_waits_for_async_kv_ready():
     assert requests[0].seq_group_id == seq_group.request_id
     assert requests[0].operation == AsyncKVTransferOperation.READ
     assert requests[0].block_mapping
+    assert len(requests[0].logical_blocks) == len(requests[0].block_mapping)
     # reserve 阶段正式表仍指向 storage，目标 GPU block 只是被预留。
     assert scheduler.block_manager.get_block_table(seq) == storage_block_ids
     assert (scheduler.block_manager.get_num_free_gpu_blocks()
@@ -245,8 +246,8 @@ def test_async_swap_out_keeps_gpu_blocks_until_write_ready():
     assert list(scheduler.swapped) == [seq_group]
 
 
-def test_async_writes_share_one_mds_slot():
-    """多个 write 可以先 reserve，但 Worker/MDS 每次只接收一个。"""
+def test_async_writes_use_multiple_mds_slots():
+    """多笔 write 应在同一轮按 request identity 独立激活和完成。"""
     scheduler = _create_scheduler()
     groups = []
     for index in range(2):
@@ -257,18 +258,23 @@ def test_async_writes_share_one_mds_slot():
         scheduler._add_seq_group_to_swapped(seq_group)
         groups.append(seq_group)
 
-    first = scheduler.drain_async_kv_transfers_to_submit()
-    assert len(first) == 1
+    activated = scheduler.drain_async_kv_transfers_to_submit()
+    assert len(activated) == 2
     assert scheduler.drain_async_kv_transfers_to_submit() == ()
-    assert len(scheduler.async_kv_policy.queued_request_ids) == 1
+    assert not scheduler.async_kv_policy.queued_request_ids
 
+    # completion 不要求遵循提交顺序；每笔 reservation 由 request_id 定位。
     scheduler.apply_async_kv_event(
-        AsyncKVTransferEvent(first[0].request_id,
+        AsyncKVTransferEvent(activated[1].request_id,
                              AsyncKVTransferState.READY))
     scheduler.complete_ready_async_kv_transfers()
-    second = scheduler.drain_async_kv_transfers_to_submit()
-    assert len(second) == 1
-    assert second[0].seq_group_id == groups[1].request_id
+    assert activated[1].request_id not in scheduler.saving
+    assert activated[0].request_id in scheduler.saving
+    scheduler.apply_async_kv_event(
+        AsyncKVTransferEvent(activated[0].request_id,
+                             AsyncKVTransferState.READY))
+    scheduler.complete_ready_async_kv_transfers()
+    assert not scheduler.saving
 
 
 def test_abort_active_write_keeps_gpu_source_until_completion():
@@ -306,6 +312,7 @@ def test_clean_storage_replica_avoids_write_io():
     request = scheduler.drain_async_kv_transfers_to_submit()[0]
     assert request.operation == AsyncKVTransferOperation.WRITE
     assert request.block_mapping == ()
+    assert request.logical_blocks == ()
 
     scheduler.apply_async_kv_event(
         AsyncKVTransferEvent(request.request_id,
@@ -326,6 +333,7 @@ def test_only_dirty_suffix_is_written():
     scheduler._swap_out(seq_group, [])
     request = scheduler.drain_async_kv_transfers_to_submit()[0]
     assert len(request.block_mapping) == 1
+    assert [key.logical_index for key in request.logical_blocks] == [2]
     scheduler.apply_async_kv_event(
         AsyncKVTransferEvent(request.request_id,
                              AsyncKVTransferState.READY))
@@ -341,6 +349,27 @@ def test_free_gpu_sequence_releases_storage_replicas():
     scheduler.free_seq(seq)
     assert scheduler.block_manager.get_num_free_cpu_blocks() == 16
     assert scheduler.block_manager.get_num_free_gpu_blocks() == 16
+
+
+def test_per_block_residency_and_pin_control():
+    """调度策略可以查询、pin 并释放任意逻辑 block。"""
+    scheduler = _create_scheduler()
+    seq, seq_group = _restore_with_clean_storage_replica(scheduler, "53")
+
+    residency = scheduler.block_manager.get_block_residency(seq)
+    assert [item.key.logical_index for item in residency] == [0, 1]
+    assert all(item.storage_replica_clean for item in residency)
+    assert all(item.storage_block_id is not None for item in residency)
+
+    scheduler.block_manager.pin_blocks(seq, [1])
+    residency = scheduler.block_manager.get_block_residency(seq)
+    assert [item.pin_count for item in residency] == [0, 1]
+    assert not scheduler.block_manager.can_reserve_swap_out(seq_group)
+
+    scheduler.block_manager.unpin_blocks(seq, [1])
+    assert scheduler.block_manager.can_reserve_swap_out(seq_group)
+    with pytest.raises(RuntimeError, match="not pinned"):
+        scheduler.block_manager.unpin_blocks(seq, [1])
 
 
 def test_queued_read_precedes_deferred_write():

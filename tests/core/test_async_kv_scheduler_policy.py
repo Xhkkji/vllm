@@ -66,3 +66,19 @@ def test_async_kv_policy_rejects_duplicate_completion():
 
     with pytest.raises(RuntimeError):
         policy.apply_event(event)
+
+
+def test_async_kv_policy_accepts_out_of_order_completions():
+    """多槽完成顺序不应与激活顺序绑定。"""
+    policy = AsyncKVSchedulePolicy(max_in_flight=2)
+    first = policy.enqueue("seq-group-0", "reservation-0",
+                           AsyncKVTransferOperation.READ, [(1, 2)])
+    second = policy.enqueue("seq-group-1", "reservation-1",
+                            AsyncKVTransferOperation.READ, [(3, 4)])
+    assert policy.activate_next() == (first, second)
+
+    policy.apply_event(
+        AsyncKVTransferEvent(second.request_id,
+                             AsyncKVTransferState.READY))
+    assert policy.pop_ready() == (second,)
+    assert policy.pending_request_ids == (first.request_id,)

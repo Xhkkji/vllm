@@ -13,7 +13,8 @@ from vllm.core.block.interfaces import Block
 from vllm.core.block.prefix_caching_block import (ComputedBlocksTracker,
                                                   LastAccessBlocksTracker)
 from vllm.core.block.utils import check_no_caching_or_swa_for_blockmgr_encdec
-from vllm.core.block_reservation import BlockSwapReservation
+from vllm.core.block_reservation import (BlockResidency, BlockSwapReservation,
+                                         LogicalBlockKey)
 from vllm.core.interfaces import AllocStatus, BlockSpaceManager
 from vllm.logger import init_logger
 from vllm.sequence import Sequence, SequenceGroup, SequenceStatus
@@ -35,7 +36,6 @@ class _ReservedBlockTable:
     # 只有 newly_allocated_targets 归当前 reservation 临时所有；复用的
     # clean storage prefix 仍由 residency directory 持有，abort 时不能释放。
     newly_allocated_targets: Tuple[Block, ...]
-    stale_storage_replicas: Tuple[Block, ...]
 
 
 @dataclass(frozen=True)
@@ -140,10 +140,11 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         self._reservation_counter = itertools.count()
         self._block_swap_reservations: Dict[
             str, _BlockSwapReservationRecord] = {}
-        # 正式 block table 指向 GPU 时，这里持有最近一次 read 后仍有效的
-        # storage 副本。自回归 decode 只会修改尾部，因此后续 write 可以
-        # 复用最长 clean prefix，只为 dirty suffix 分配和提交 SSD I/O。
-        self._storage_replicas: Dict[SeqId, Tuple[Block, ...]] = {}
+        # 正式 block table 指向 GPU 时，这里按逻辑位置持有有效 storage
+        # 副本。物理 block id 会被 allocator 复用，不能作为跨调度身份；
+        # `(seq_id, logical_index)` 才是 residency 和 pin 的稳定键。
+        self._storage_replicas: Dict[LogicalBlockKey, Block] = {}
+        self._pinned_gpu_blocks: Dict[LogicalBlockKey, int] = {}
 
     def can_allocate(self,
                      seq_group: SequenceGroup,
@@ -306,8 +307,11 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
 
         # storage replica 不属于正式 block table，sequence 结束时必须单独
         # 回收；若 table 当前就在 storage，directory 中不会保存重复所有权。
-        for replica in self._storage_replicas.pop(seq_id, ()):
+        for replica in self._pop_storage_replicas(seq_id):
             self.block_allocator.free(replica)
+        for key in tuple(self._pinned_gpu_blocks):
+            if key.seq_id == seq_id:
+                del self._pinned_gpu_blocks[key]
 
         # Free table/blocks
         self.block_tables[seq_id].free()
@@ -531,9 +535,14 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         required = 0
         for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
             source_blocks = tuple(self.block_tables[seq.seq_id].blocks)
-            replicas = self._storage_replicas.get(seq.seq_id, ())
-            required += len(source_blocks) - self._clean_replica_prefix_length(
-                source_blocks, replicas)
+            if any(
+                    self._pinned_gpu_blocks.get(
+                        LogicalBlockKey(seq.seq_id, logical_index), 0)
+                    for logical_index in range(len(source_blocks))):
+                return False
+            required += (len(source_blocks)
+                         - self._clean_storage_prefix_length(
+                             seq.seq_id, source_blocks))
         return required <= self.get_num_free_cpu_blocks()
 
     def commit_block_swap(self, reservation_id: str) -> None:
@@ -564,23 +573,29 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             block_table = self.block_tables[table_record.seq_id]
             block_table.update(list(table_record.target_blocks))
             if is_read:
-                # read 后正式表切到 GPU，但 SSD source 继续由 directory
-                # 持有。只要 decode 尚未修改对应 block，它就是 clean replica。
-                old_replicas = self._storage_replicas.pop(
-                    table_record.seq_id, ())
+                # read 后正式表切到 GPU，但 SSD source 逐 block 转交给
+                # residency directory。只要 token 内容未变，它就是 clean。
+                old_replicas = self._pop_storage_replicas(
+                    table_record.seq_id)
                 for replica in old_replicas:
                     self.block_allocator.free(replica)
-                self._storage_replicas[table_record.seq_id] = (
-                    table_record.source_blocks)
+                for logical_index, source_block in enumerate(
+                        table_record.source_blocks):
+                    key = LogicalBlockKey(table_record.seq_id, logical_index)
+                    self._storage_replicas[key] = source_block
             else:
                 # write 后 target storage blocks 转交给正式 block table。
-                # clean prefix 原来由 directory 持有，删除目录项只转移所有权；
-                # 被 dirty suffix 替换的旧 replica 才需要真正释放。
-                self._storage_replicas.pop(table_record.seq_id, None)
+                # 复用的 clean block 原来由 directory 持有，删除目录项只
+                # 转移所有权；被 dirty block 替换的旧 replica 才真正释放。
+                previous_replicas = self._pop_storage_replicas(
+                    table_record.seq_id)
                 for source_block in table_record.source_blocks:
                     self.block_allocator.free(source_block)
-                for replica in table_record.stale_storage_replicas:
-                    self.block_allocator.free(replica)
+                retained_ids = {id(block)
+                                for block in table_record.target_blocks}
+                for replica in previous_replicas:
+                    if id(replica) not in retained_ids:
+                        self.block_allocator.free(replica)
 
     def abort_block_swap(self, reservation_id: str) -> None:
         """取消 reservation，只释放未发布的目标 block，源表保持不变。"""
@@ -604,42 +619,33 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         """
         table_records: List[_ReservedBlockTable] = []
         physical_mapping: List[Tuple[int, int]] = []
+        physical_logical_keys: List[LogicalBlockKey] = []
         reused_blocks = 0
         try:
             for seq in seq_group.get_seqs(status=sequence_status):
                 source_blocks = tuple(self.block_tables[seq.seq_id].blocks)
                 if source_device == Device.GPU:
-                    replicas = self._storage_replicas.get(seq.seq_id, ())
-                    clean_prefix = self._clean_replica_prefix_length(
-                        source_blocks, replicas)
-                    reused_prefix = replicas[:clean_prefix]
-                    dirty_source = source_blocks[clean_prefix:]
-                    new_targets = tuple(
-                        self._clone_blocks_to_device(
-                            dirty_source,
-                            target_device,
-                            previous_target=(reused_prefix[-1]
-                                             if reused_prefix else None)))
-                    target_blocks = reused_prefix + new_targets
-                    stale_replicas = replicas[clean_prefix:]
-                    reused_blocks += clean_prefix
-                    mapping_sources = dirty_source
-                    mapping_targets = new_targets
+                    (target_blocks, new_targets,
+                     mapping_sources, mapping_targets, logical_keys,
+                     reused_for_seq) = self._build_storage_targets(
+                         seq.seq_id, source_blocks, target_device)
+                    reused_blocks += reused_for_seq
                 else:
                     new_targets = tuple(
                         self._clone_blocks_to_device(source_blocks,
                                                      target_device))
                     target_blocks = new_targets
-                    stale_replicas = ()
                     mapping_sources = source_blocks
                     mapping_targets = new_targets
+                    logical_keys = [
+                        LogicalBlockKey(seq.seq_id, logical_index)
+                        for logical_index in range(len(source_blocks))
+                    ]
                 table_records.append(
                     _ReservedBlockTable(seq_id=seq.seq_id,
                                         source_blocks=source_blocks,
                                         target_blocks=target_blocks,
-                                        newly_allocated_targets=new_targets,
-                                        stale_storage_replicas=
-                                        stale_replicas))
+                                        newly_allocated_targets=new_targets))
                 for source_block, target_block in zip(mapping_sources,
                                                       mapping_targets):
                     assert source_block.block_id is not None
@@ -650,6 +656,7 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
                         self.block_allocator.get_physical_block_id(
                             target_device, target_block.block_id),
                     ))
+                physical_logical_keys.extend(logical_keys)
         except Exception:
             for table_record in table_records:
                 for target_block in table_record.newly_allocated_targets:
@@ -664,11 +671,61 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             target_device=target_device,
             block_mapping=tuple(physical_mapping),
             num_reused_blocks=reused_blocks,
+            logical_blocks=tuple(physical_logical_keys),
         )
         self._block_swap_reservations[reservation_id] = (
             _BlockSwapReservationRecord(public=public,
                                         tables=tuple(table_records)))
         return public
+
+    def _build_storage_targets(
+        self,
+        seq_id: SeqId,
+        source_blocks: Tuple[Block, ...],
+        target_device: Device,
+    ) -> Tuple[Tuple[Block, ...], Tuple[Block, ...], Tuple[Block, ...],
+               Tuple[Block, ...],
+               List[LogicalBlockKey], int]:
+        """为 GPU->SSD write 复用 clean prefix，只分配 dirty suffix。
+
+        residency 按 block 建索引，但 vLLM Block 的 ``prev_block`` 仍形成链。
+        第一个脏块之后重新建立目标链，避免复用一个仍指向旧 predecessor 的
+        storage Block。函数内部负责部分失败回收，调用方只接收完整计划。
+        """
+        targets: List[Block] = []
+        new_targets: List[Block] = []
+        mapping_sources: List[Block] = []
+        mapping_targets: List[Block] = []
+        logical_keys: List[LogicalBlockKey] = []
+        previous_target: Optional[Block] = None
+        reused = 0
+        clean_prefix = True
+        try:
+            for logical_index, source_block in enumerate(source_blocks):
+                key = LogicalBlockKey(seq_id, logical_index)
+                replica = self._storage_replicas.get(key)
+                if (clean_prefix
+                        and self._is_clean_storage_replica(key, source_block)):
+                    assert replica is not None
+                    target_block = replica
+                    reused += 1
+                else:
+                    clean_prefix = False
+                    target_block = self._clone_blocks_to_device(
+                        (source_block,), target_device,
+                        previous_target=previous_target)[0]
+                    new_targets.append(target_block)
+                    mapping_sources.append(source_block)
+                    mapping_targets.append(target_block)
+                    logical_keys.append(key)
+                targets.append(target_block)
+                previous_target = target_block
+        except Exception:
+            for target in new_targets:
+                self.block_allocator.free(target)
+            raise
+        return (tuple(targets), tuple(new_targets), tuple(mapping_sources),
+                tuple(mapping_targets), logical_keys, reused)
 
     def _clone_blocks_to_device(
         self,
@@ -704,30 +761,87 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             raise
         return target_blocks
 
-    @staticmethod
-    def _clean_replica_prefix_length(
-        source_blocks: Tuple[Block, ...],
-        replicas: Tuple[Block, ...],
-    ) -> int:
-        """返回 GPU 与 SSD 内容一致的最长 block 前缀长度。
+    def _is_clean_storage_replica(self, key: LogicalBlockKey,
+                                  source: Block) -> bool:
+        """按逻辑位置和内容判断 SSD replica 是否仍与 GPU 一致。"""
+        replica = self._storage_replicas.get(key)
+        return (replica is not None
+                and source.token_ids == replica.token_ids
+                and source.extra_hash == replica.extra_hash)
 
-        对同一 seq_id，block 的位置和 token 内容共同构成最小逻辑身份。
-        decode 只向尾部追加 token，因此一旦发现不匹配，后面的 replica
-        都按 dirty suffix 处理，既保持 block 链正确，也避免逐项复杂修补。
-        """
-        clean_prefix = 0
-        for source, replica in zip(source_blocks, replicas):
-            if (source.token_ids != replica.token_ids
-                    or source.extra_hash != replica.extra_hash):
+    def _clean_storage_prefix_length(
+            self, seq_id: SeqId,
+            source_blocks: Tuple[Block, ...]) -> int:
+        """在 per-block 目录上计算仍可安全拼接到正式表的 clean prefix。"""
+        clean = 0
+        for logical_index, source in enumerate(source_blocks):
+            if not self._is_clean_storage_replica(
+                    LogicalBlockKey(seq_id, logical_index), source):
                 break
-            clean_prefix += 1
-        return clean_prefix
+            clean += 1
+        return clean
+
+    def _pop_storage_replicas(self, seq_id: SeqId) -> Tuple[Block, ...]:
+        """移除一条 sequence 的目录项，并把 block 所有权返回给调用方。"""
+        keys = sorted(key for key in self._storage_replicas
+                      if key.seq_id == seq_id)
+        return tuple(self._storage_replicas.pop(key) for key in keys)
 
     def get_num_clean_storage_replicas(self, seq: Sequence) -> int:
-        """返回指定 GPU sequence 当前仍有效的 clean SSD prefix 长度。"""
-        replicas = self._storage_replicas.get(seq.seq_id, ())
+        """返回指定 GPU sequence 当前仍有效的 clean SSD block 数。"""
         blocks = tuple(self.block_tables[seq.seq_id].blocks)
-        return self._clean_replica_prefix_length(blocks, replicas)
+        return sum(
+            self._is_clean_storage_replica(
+                LogicalBlockKey(seq.seq_id, logical_index), block)
+            for logical_index, block in enumerate(blocks))
+
+    def get_block_residency(self,
+                            seq: Sequence) -> Tuple[BlockResidency, ...]:
+        """返回稳定、只读的 per-block residency 快照供调度策略使用。"""
+        blocks = tuple(self.block_tables[seq.seq_id].blocks)
+        result = []
+        for logical_index, block in enumerate(blocks):
+            key = LogicalBlockKey(seq.seq_id, logical_index)
+            replica = self._storage_replicas.get(key)
+            storage_block_id = None
+            if replica is not None:
+                assert replica.block_id is not None
+                storage_block_id = self.block_allocator.get_physical_block_id(
+                    Device.CPU, replica.block_id)
+            result.append(
+                BlockResidency(
+                    key=key,
+                    storage_block_id=storage_block_id,
+                    storage_replica_clean=self._is_clean_storage_replica(
+                        key, block),
+                    pin_count=self._pinned_gpu_blocks.get(key, 0),
+                ))
+        return tuple(result)
+
+    def pin_blocks(self, seq: Sequence,
+                   logical_indices: GenericSequence[int]) -> None:
+        """阻止选中的 GPU block 被异步 swap-out，支持嵌套 pin。"""
+        block_count = len(self.block_tables[seq.seq_id].blocks)
+        for logical_index in logical_indices:
+            if logical_index < 0 or logical_index >= block_count:
+                raise IndexError(f"logical block index out of range: "
+                                 f"{logical_index}")
+            key = LogicalBlockKey(seq.seq_id, logical_index)
+            self._pinned_gpu_blocks[key] = (
+                self._pinned_gpu_blocks.get(key, 0) + 1)
+
+    def unpin_blocks(self, seq: Sequence,
+                     logical_indices: GenericSequence[int]) -> None:
+        """释放一次 block pin；未 pin 或重复 unpin 直接报错。"""
+        for logical_index in logical_indices:
+            key = LogicalBlockKey(seq.seq_id, logical_index)
+            count = self._pinned_gpu_blocks.get(key, 0)
+            if count <= 0:
+                raise RuntimeError(f"logical block is not pinned: {key}")
+            if count == 1:
+                del self._pinned_gpu_blocks[key]
+            else:
+                self._pinned_gpu_blocks[key] = count - 1
 
     def _pop_block_swap_reservation(
             self, reservation_id: str) -> _BlockSwapReservationRecord:

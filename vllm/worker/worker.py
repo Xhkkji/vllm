@@ -63,8 +63,8 @@ class Worker(LocalOrDistributedWorkerBase):
         self.distributed_init_method = distributed_init_method
         self.is_driver_worker = is_driver_worker
         # 新异步调度路径使用独立控制表保存跨 engine iteration 的 mapping。
-        # key 中包含 virtual_engine，避免未来扩展 PP stream 时发生串槽。
-        # 当前 MDS 强制 TP=1、PP=1，因此同一时刻最多只有一个表项。
+        # key 中包含 virtual_engine，多个 request slot 的 mapping 可以跨
+        # engine iteration 同时存活；completion 不依赖提交顺序。
         self._async_kv_transfer_mappings: Dict[
             Tuple[int, str], torch.Tensor] = {}
         if self.model_config.trust_remote_code:
@@ -486,16 +486,12 @@ class Worker(LocalOrDistributedWorkerBase):
         virtual_engine: int,
         requests: Sequence[AsyncKVTransferRequest],
     ) -> List[AsyncKVTransferEvent]:
-        """提交 Scheduler 本轮激活的一笔异步 KV read/write。
+        """批量提交 Scheduler 本轮激活的异步 KV read/write。
 
         该 RPC 只执行非阻塞 submit。mapping 转成 CPU int64 tensor 后保存在
-        Worker 内，后续 poll 必须使用完全相同的 tensor 内容。单槽 MDS
-        当前只接受一个请求，提前检查可以让错误停留在控制面，而不是进入
-        CUDA/SSD 数据路径后才暴露。
+        Worker 内，后续 poll 必须使用完全相同的 tensor 内容。后端容量由
+        scheduler policy 与 MDS request table 共同限制。
         """
-        if len(requests) > 1:
-            raise RuntimeError(
-                "resident MDS currently accepts one async KV load at a time")
         cache_engine = self.cache_engine[virtual_engine]
         events: List[AsyncKVTransferEvent] = []
         for request in requests:
@@ -503,10 +499,6 @@ class Worker(LocalOrDistributedWorkerBase):
             if key in self._async_kv_transfer_mappings:
                 raise RuntimeError(
                     f"duplicate async KV submit: {request.request_id}")
-            if self._async_kv_transfer_mappings:
-                raise RuntimeError(
-                    "resident MDS Worker already has a pending KV transfer")
-
             mapping = torch.tensor(
                 request.block_mapping,
                 device="cpu",
@@ -521,7 +513,7 @@ class Worker(LocalOrDistributedWorkerBase):
 
     def poll_async_kv_transfers(
             self, virtual_engine: int) -> List[AsyncKVTransferEvent]:
-        """非阻塞轮询当前 virtual engine 占用 MDS 单槽的 transfer。"""
+        """非阻塞轮询当前 virtual engine 的全部 outstanding transfer。"""
         cache_engine = self.cache_engine[virtual_engine]
         events: List[AsyncKVTransferEvent] = []
         keys = [

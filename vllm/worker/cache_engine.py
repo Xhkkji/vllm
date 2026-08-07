@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """CacheEngine class for managing the KV cache."""
 import time
-from typing import List
+from dataclasses import dataclass
+from typing import Dict, List
 
 import torch
 
@@ -16,6 +17,16 @@ from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, LayerBlockType,
                         get_dtype_size, is_pin_memory_available)
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class _AsyncKVTrace:
+    """一笔 transfer 的观测时间线；不参与 I/O 正确性判断。"""
+
+    operation: AsyncKVTransferOperation
+    started_at: float
+    submitted_at_ns: int
+    first_poll_at_ns: int | None = None
 
 
 class CacheEngine:
@@ -53,18 +64,17 @@ class CacheEngine:
                 parallel_config.tensor_parallel_size != 1
                 or parallel_config.pipeline_parallel_size != 1):
             raise ValueError(
-                "Phase 4A MDS single-slot connector requires TP=1 and PP=1")
+                "MDS connector currently requires TP=1 and PP=1")
 
         # 【BaM KVStore 直通调用链】owner / DMA region 只为真实 GPU KV cache
         # 保活。普通 vLLM、LMCache 和 GDS 路径不会创建或读取这两张表。
         self._bam_direct_gpu_cache_owners: List[torch.Tensor] = []
         self._bam_direct_gpu_cache_regions: List[torch.Tensor] = []
         self.bam_mds_connector = None
+        # legacy deferred swap-in 仍是单个 model-execution dependency；新的
+        # AsyncKVScheduler 使用下面按 request_id 索引的多槽 trace 表。
         self._bam_mds_transfer_started_at: float | None = None
-        # 以下字段只用于异步 KV 延迟分解，不参与 block 或 I/O 状态管理。
-        self._bam_mds_async_kv_submitted_at_ns: int | None = None
-        self._bam_mds_async_kv_first_poll_at_ns: int | None = None
-        self._bam_mds_async_kv_operation: AsyncKVTransferOperation | None = None
+        self._bam_mds_async_kv_traces: Dict[str, _AsyncKVTrace] = {}
 
         self.head_size = model_config.get_head_size()
         # Models like Jamba, have mixed typed layers, E.g Mamba
@@ -301,14 +311,12 @@ class CacheEngine:
         if self.bam_mds_connector is None:
             raise RuntimeError(
                 "async KV scheduling requires the resident MDS connector")
-        if self._bam_mds_transfer_started_at is not None:
-            raise RuntimeError(
-                "CacheEngine already has a pending async KV transfer")
-
-        self._bam_mds_transfer_started_at = time.perf_counter()
-        self._bam_mds_async_kv_submitted_at_ns = time.monotonic_ns()
-        self._bam_mds_async_kv_first_poll_at_ns = None
-        self._bam_mds_async_kv_operation = operation
+        if request_id in self._bam_mds_async_kv_traces:
+            raise RuntimeError(f"duplicate async KV transfer: {request_id}")
+        trace = _AsyncKVTrace(operation=operation,
+                              started_at=time.perf_counter(),
+                              submitted_at_ns=time.monotonic_ns())
+        self._bam_mds_async_kv_traces[request_id] = trace
         if self.swap_trace_enabled:
             logger.info(
                 "[V0_SWAP_TRACE][AsyncKV][CacheEngine] phase=submit "
@@ -316,20 +324,17 @@ class CacheEngine:
                 "mappings=%d",
                 operation.value,
                 request_id,
-                self._bam_mds_async_kv_submitted_at_ns,
+                trace.submitted_at_ns,
                 src_to_dst.shape[0],
             )
         try:
             ready = self.bam_mds_connector.submit_transfer_async(
                 request_id, src_to_dst, operation=operation.value)
-        except Exception:
-            # submit 失败时没有一个可继续 poll 的逻辑请求，必须复位计时
-            # 状态，否则后续合法请求会被误判为“已有 pending transfer”。
-            self._bam_mds_transfer_started_at = None
-            self._bam_mds_async_kv_submitted_at_ns = None
-            self._bam_mds_async_kv_first_poll_at_ns = None
-            self._bam_mds_async_kv_operation = None
-            raise
+        except Exception as exc:
+            del self._bam_mds_async_kv_traces[request_id]
+            return AsyncKVTransferEvent(request_id,
+                                        AsyncKVTransferState.ERROR,
+                                        error=str(exc))
         if ready:
             self._finish_async_kv_transfer_trace(request_id, src_to_dst)
             return AsyncKVTransferEvent(request_id,
@@ -343,24 +348,30 @@ class CacheEngine:
         if self.bam_mds_connector is None:
             raise RuntimeError(
                 "async KV scheduling requires the resident MDS connector")
-        if self._bam_mds_transfer_started_at is None:
-            raise RuntimeError("CacheEngine has no pending async KV transfer")
-        if self._bam_mds_async_kv_operation is None:
-            raise RuntimeError("CacheEngine lost async KV operation state")
+        trace = self._bam_mds_async_kv_traces.get(request_id)
+        if trace is None:
+            raise RuntimeError(
+                f"CacheEngine has no async KV transfer: {request_id}")
 
-        if self._bam_mds_async_kv_first_poll_at_ns is None:
-            self._bam_mds_async_kv_first_poll_at_ns = time.monotonic_ns()
+        if trace.first_poll_at_ns is None:
+            trace.first_poll_at_ns = time.monotonic_ns()
             if self.swap_trace_enabled:
                 logger.info(
                     "[V0_SWAP_TRACE][AsyncKV][CacheEngine] "
                     "phase=first_poll operation=%s request_id=%s "
                     "first_poll_monotonic_ns=%d",
-                    self._bam_mds_async_kv_operation.value,
+                    trace.operation.value,
                     request_id,
-                    self._bam_mds_async_kv_first_poll_at_ns,
+                    trace.first_poll_at_ns,
                 )
 
-        ready = self.bam_mds_connector.poll_transfer_async(request_id)
+        try:
+            ready = self.bam_mds_connector.poll_transfer_async(request_id)
+        except Exception as exc:
+            del self._bam_mds_async_kv_traces[request_id]
+            return AsyncKVTransferEvent(request_id,
+                                        AsyncKVTransferState.ERROR,
+                                        error=str(exc))
         if not ready:
             return AsyncKVTransferEvent(request_id,
                                         AsyncKVTransferState.PENDING)
@@ -369,33 +380,28 @@ class CacheEngine:
 
     def _finish_async_kv_transfer_trace(self, request_id: str,
                                         src_to_dst: torch.Tensor) -> None:
-        """在异步 read/write 完成后记录耗时并复位单槽状态。"""
-        assert self._bam_mds_transfer_started_at is not None
-        assert self._bam_mds_async_kv_submitted_at_ns is not None
-        assert self._bam_mds_async_kv_operation is not None
+        """在异步 read/write 完成后记录耗时并删除对应 trace。"""
+        trace = self._bam_mds_async_kv_traces.pop(request_id, None)
+        if trace is None:
+            raise RuntimeError(f"missing async KV trace: {request_id}")
         ready_ns = time.monotonic_ns()
-        elapsed_s = time.perf_counter() - self._bam_mds_transfer_started_at
+        elapsed_s = time.perf_counter() - trace.started_at
         if self.swap_trace_enabled:
             logger.info(
                 "[V0_SWAP_TRACE][AsyncKV][CacheEngine] phase=ready "
                 "operation=%s request_id=%s submitted_monotonic_ns=%d "
                 "first_poll_monotonic_ns=%s ready_monotonic_ns=%d "
                 "submit_to_ready_ms=%.3f",
-                self._bam_mds_async_kv_operation.value,
+                trace.operation.value,
                 request_id,
-                self._bam_mds_async_kv_submitted_at_ns,
-                self._bam_mds_async_kv_first_poll_at_ns,
+                trace.submitted_at_ns,
+                trace.first_poll_at_ns,
                 ready_ns,
-                (ready_ns - self._bam_mds_async_kv_submitted_at_ns) / 1.0e6,
+                (ready_ns - trace.submitted_at_ns) / 1.0e6,
             )
-        operation = self._bam_mds_async_kv_operation
-        self._bam_mds_transfer_started_at = None
         self._log_swap_event(
-            "swap_in" if operation == AsyncKVTransferOperation.READ else
+            "swap_in" if trace.operation == AsyncKVTransferOperation.READ else
             "swap_out", src_to_dst, elapsed_s)
-        self._bam_mds_async_kv_submitted_at_ns = None
-        self._bam_mds_async_kv_first_poll_at_ns = None
-        self._bam_mds_async_kv_operation = None
 
     def swap_out(self, src_to_dst: torch.Tensor) -> None:
         """把 scheduler 的 GPU->storage block mapping 写出。

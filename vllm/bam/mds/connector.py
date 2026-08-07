@@ -70,7 +70,8 @@ class BaMMDSConnector:
             cuda_library=self._resolve_cuda_library(),
             device_index=device_index,
             timeout_seconds=float(envs.VLLM_BAM_MDS_TIMEOUT_SECONDS))
-        self.max_blocks_per_batch = 0
+        self.descriptor_pool_capacity = 0
+        self.max_blocks_per_pool = 0
         self.max_in_flight = 0
         self.gpu_cache: list[torch.Tensor] = []
         # scheduler request_id 与底层 MDS handle 属于两个命名空间；每个
@@ -102,8 +103,10 @@ class BaMMDSConnector:
         result = self.client.allocate(
             self.layout.allocation_payload(client_pid=os.getpid()))
         self.layout.validate_manifest(result.manifest)
-        self.max_blocks_per_batch = int(
-            result.manifest["max_blocks_per_batch"])
+        self.descriptor_pool_capacity = int(
+            result.manifest["descriptor_pool_capacity"])
+        self.max_blocks_per_pool = int(
+            result.manifest["max_blocks_per_pool"])
         self.max_in_flight = int(result.manifest["request_slot_count"])
         if self.max_in_flight != envs.VLLM_BAM_MDS_MAX_IN_FLIGHT:
             raise RuntimeError(
@@ -132,11 +135,12 @@ class BaMMDSConnector:
         torch.cuda.synchronize(self.layout.device_index)
         logger.info(
             "[BAM_MDS] imported daemon KV cache layers=%d gpu_blocks=%d "
-            "storage_blocks=%d fragment_bytes=%d max_blocks_per_batch=%d "
-            "max_in_flight=%d",
+            "storage_blocks=%d fragment_bytes=%d pool_capacity=%d "
+            "max_blocks_per_pool=%d max_in_flight=%d",
             self.layout.num_layers, self.layout.num_gpu_blocks,
             self.layout.num_storage_blocks, self.layout.fragment_bytes,
-            self.max_blocks_per_batch, self.max_in_flight)
+            self.descriptor_pool_capacity, self.max_blocks_per_pool,
+            self.max_in_flight)
         return tensors
 
     def start(self) -> None:

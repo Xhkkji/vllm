@@ -9,9 +9,8 @@ import torch
 import vllm.envs as envs
 from vllm.attention import get_attn_backend
 from vllm.config import CacheConfig, DeviceConfig, ModelConfig, ParallelConfig
-from vllm.core.scheduler_policy import (AsyncKVTransferEvent,
-                                        AsyncKVTransferOperation,
-                                        AsyncKVTransferState)
+from vllm.core.custom_schedulers.async_kv_transfer import (
+    AsyncKVTransferEvent, AsyncKVTransferOperation, AsyncKVTransferState)
 from vllm.logger import init_logger
 from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, LayerBlockType,
                         get_dtype_size, is_pin_memory_available)

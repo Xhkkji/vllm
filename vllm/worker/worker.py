@@ -9,9 +9,8 @@ import torch.distributed
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
-from vllm.core.scheduler_policy import (AsyncKVTransferEvent,
-                                        AsyncKVTransferRequest,
-                                        AsyncKVTransferState)
+from vllm.core.custom_schedulers.async_kv_transfer import (
+    AsyncKVTransferEvent, AsyncKVTransferRequest, AsyncKVTransferState)
 from vllm.device_allocator.cumem import CuMemAllocator
 from vllm.distributed import (ensure_model_parallel_initialized,
                               init_distributed_environment,

@@ -13,11 +13,9 @@ from vllm.core.block_reservation import BlockSwapReservation
 from vllm.core.interfaces import AllocStatus
 from vllm.core.scheduler import (Scheduler, SchedulerSwappedInOutputs,
                                  SchedulingBudget)
-from vllm.core.scheduler_policy import (AsyncKVExecutionMarker,
-                                        AsyncKVSchedulePolicy,
-                                        AsyncKVTransferEvent,
-                                        AsyncKVTransferOperation,
-                                        AsyncKVTransferRequest)
+from vllm.core.custom_schedulers.async_kv_transfer import (
+    AsyncKVExecutionMarker, AsyncKVSchedulePolicy, AsyncKVTransferEvent,
+    AsyncKVTransferOperation, AsyncKVTransferRequest)
 from vllm.logger import init_logger
 from vllm.sequence import SequenceGroup, SequenceStatus
 

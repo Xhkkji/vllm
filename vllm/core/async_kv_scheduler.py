@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import time
+import os
 from typing import Callable, Iterable, List, Optional, Set, Tuple
 
 import vllm.envs as envs
@@ -12,7 +13,7 @@ from vllm.config import CacheConfig, LoRAConfig, SchedulerConfig
 from vllm.core.block_reservation import BlockSwapReservation
 from vllm.core.interfaces import AllocStatus
 from vllm.core.scheduler import (Scheduler, SchedulerSwappedInOutputs,
-                                 SchedulingBudget)
+                                 SchedulingBudget, PreemptionMode)
 from vllm.core.custom_schedulers.async_kv_transfer import (
     AsyncKVExecutionMarker, AsyncKVSchedulePolicy, AsyncKVTransferEvent,
     AsyncKVTransferOperation, AsyncKVTransferRequest)
@@ -20,6 +21,13 @@ from vllm.logger import init_logger
 from vllm.sequence import SequenceGroup, SequenceStatus
 
 logger = init_logger(__name__)
+
+ASYNC_KV_STRATEGY_NATIVE = "native"
+ASYNC_KV_STRATEGY_CHUNKED_PRIORITY_PREEMPT = "chunked_priority_preempt"
+ASYNC_KV_STRATEGIES = {
+    ASYNC_KV_STRATEGY_NATIVE,
+    ASYNC_KV_STRATEGY_CHUNKED_PRIORITY_PREEMPT,
+}
 
 
 class AsyncKVScheduler(Scheduler):
@@ -51,8 +59,18 @@ class AsyncKVScheduler(Scheduler):
         # table 一致；小于 1 时直接失败，避免运行中出现隐式单槽回退。
         self.async_kv_policy = AsyncKVSchedulePolicy(
             max_in_flight=envs.VLLM_BAM_MDS_MAX_IN_FLIGHT)
+        self.async_kv_scheduler_strategy = os.getenv(
+            "VLLM_BAM_ASYNC_SCHEDULER_STRATEGY",
+            ASYNC_KV_STRATEGY_NATIVE)
+        if self.async_kv_scheduler_strategy not in ASYNC_KV_STRATEGIES:
+            raise ValueError(
+                "unsupported VLLM_BAM_ASYNC_SCHEDULER_STRATEGY="
+                f"{self.async_kv_scheduler_strategy}; expected one of "
+                f"{sorted(ASYNC_KV_STRATEGIES)}")
         self.loading: dict[str, SequenceGroup] = {}
         self.saving: dict[str, SequenceGroup] = {}
+        self._chunked_priority_waiting_id: Optional[str] = None
+        self._chunked_priority_preempted_victims: Set[str] = set()
         # READY 请求先进入 running，真正被 Engine dispatch 前保留一个观测
         # 标记。这样可以区分“状态已经可运行”和“已经进入模型执行 batch”。
         self._async_kv_execution_markers: dict[
@@ -64,7 +82,73 @@ class AsyncKVScheduler(Scheduler):
     @property
     def scheduler_strategy(self) -> str:
         """返回稳定的策略名称，供日志和实验结果标记使用。"""
-        return "async_kv"
+        return f"async_kv:{self.async_kv_scheduler_strategy}"
+
+    def _schedule_chunked_prefill(self):
+        """在原生 chunked path 前注入可选的等待感知抢占策略。
+
+        父类仍负责 continuous batching、running/decode 优先、chunked prefill
+        token budget 和最终 SchedulerOutputs。本钩子只在 priority policy 下，
+        当 waiting 高优先级请求因 KV block 不足无法进入 running 时，提前把
+        一个低优先级 running victim 送入现有 async swap-out 路径。
+        """
+        if (self.async_kv_scheduler_strategy
+                == ASYNC_KV_STRATEGY_CHUNKED_PRIORITY_PREEMPT):
+            self._preempt_low_priority_running_for_waiting()
+        return super()._schedule_chunked_prefill()
+
+    def _preempt_low_priority_running_for_waiting(self) -> int:
+        if self.scheduler_config.policy != "priority":
+            return 0
+        if not self.waiting or not self.running:
+            return 0
+
+        # Keep waiting in the same priority order used by vLLM's native
+        # priority policy: lower priority value wins, then earlier arrival.
+        self.waiting = type(self.waiting)(
+            sorted(self.waiting, key=self._get_priority))
+        waiting_head = self.waiting[0]
+        if waiting_head.request_id != self._chunked_priority_waiting_id:
+            self._chunked_priority_waiting_id = waiting_head.request_id
+            self._chunked_priority_preempted_victims.clear()
+
+        candidates = [
+            seq_group for seq_group in self.running
+            if seq_group.request_id
+            not in self._chunked_priority_preempted_victims
+        ]
+        if not candidates:
+            return 0
+        victim = max(candidates, key=self._get_priority)
+        if self._get_priority(victim) <= self._get_priority(waiting_head):
+            return 0
+
+        # If the high-priority waiting request can already be admitted, let
+        # the native chunked scheduler handle it without extra churn.
+        if self.block_manager.can_allocate(waiting_head) == AllocStatus.OK:
+            return 0
+
+        self.running.remove(victim)
+        blocks_to_swap_out: List[Tuple[int, int]] = []
+        preempted_mode = self._preempt(victim, blocks_to_swap_out)
+        self._chunked_priority_preempted_victims.add(victim.request_id)
+        if preempted_mode == PreemptionMode.SWAP:
+            self.swapped.append(victim)
+        else:
+            self.waiting.appendleft(victim)
+        if envs.VLLM_V0_SWAP_TRACE:
+            logger.info(
+                "[V0_SWAP_TRACE][AsyncKV][Scheduler] "
+                "phase=chunked_priority_preempt victim_seq_group_id=%s "
+                "waiting_seq_group_id=%s victim_priority=%s "
+                "waiting_priority=%s mode=%s",
+                victim.request_id,
+                waiting_head.request_id,
+                self._get_priority(victim),
+                self._get_priority(waiting_head),
+                preempted_mode.name,
+            )
+        return 1
 
     def _enqueue_async_kv_transfer(
         self,

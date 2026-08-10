@@ -12,9 +12,12 @@ from vllm.core.block.cpu_gpu_block_allocator import CpuGpuBlockAllocator
 from vllm.core.block.interfaces import Block
 from vllm.core.block.prefix_caching_block import (ComputedBlocksTracker,
                                                   LastAccessBlocksTracker)
+from vllm.core.custom_schedulers.bam_mds_prefix import (
+    compute_full_prefix_block_hashes)
 from vllm.core.block.utils import check_no_caching_or_swa_for_blockmgr_encdec
-from vllm.core.block_reservation import (BlockResidency, BlockSwapReservation,
-                                         LogicalBlockKey)
+from vllm.core.block_reservation import (BlockPrefixRestoreReservation,
+                                         BlockResidency,
+                                         BlockSwapReservation, LogicalBlockKey)
 from vllm.core.interfaces import AllocStatus, BlockSpaceManager
 from vllm.logger import init_logger
 from vllm.sequence import Sequence, SequenceGroup, SequenceStatus
@@ -44,6 +47,16 @@ class _BlockSwapReservationRecord:
 
     public: BlockSwapReservation
     tables: Tuple[_ReservedBlockTable, ...]
+
+
+@dataclass(frozen=True)
+class _BlockPrefixRestoreReservationRecord:
+    """prefix read 完成前由 block manager 独占的源 block 引用。"""
+
+    public: BlockPrefixRestoreReservation
+    seq: Sequence
+    source_blocks: Tuple[Block, ...]
+    pending_target_blocks: Tuple[Block, ...]
 
 
 class SelfAttnBlockSpaceManager(BlockSpaceManager):
@@ -140,6 +153,8 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         self._reservation_counter = itertools.count()
         self._block_swap_reservations: Dict[
             str, _BlockSwapReservationRecord] = {}
+        self._prefix_restore_reservations: Dict[
+            str, _BlockPrefixRestoreReservationRecord] = {}
         # 正式 block table 指向 GPU 时，这里按逻辑位置持有有效 storage
         # 副本。物理 block id 会被 allocator 复用，不能作为跨调度身份；
         # `(seq_id, logical_index)` 才是 residency 和 pin 的稳定键。
@@ -317,6 +332,27 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         self.block_tables[seq_id].free()
         del self.block_tables[seq_id]
 
+    def free_mds_prefix_store(self, seq: Sequence) -> None:
+        """释放 prefix populate 后位于 storage 的正式 block table。
+
+        原生 ``free`` 的 last-access tracker 只支持 GPU id；prefix store
+        commit 后 table 已经切到 CPU/storage，所以这里跳过那一步。其余
+        sequence tracker、replica 和 block refcount 的释放顺序保持一致，
+        完整 immutable storage block 会以 refcount=0 留在 CPU LRU 中。
+        """
+        seq_id = seq.seq_id
+        if seq_id not in self.block_tables:
+            return
+        self._last_access_blocks_tracker.remove_seq(seq_id)
+        self._computed_blocks_tracker.remove_seq(seq_id)
+        for replica in self._pop_storage_replicas(seq_id):
+            self.block_allocator.free(replica)
+        for key in tuple(self._pinned_gpu_blocks):
+            if key.seq_id == seq_id:
+                del self._pinned_gpu_blocks[key]
+        self.block_tables[seq_id].free()
+        del self.block_tables[seq_id]
+
     def free_cross(self, seq_group: SequenceGroup) -> None:
         request_id = seq_group.request_id
         if request_id not in self.cross_block_tables:
@@ -457,6 +493,208 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         return self._reserve_swap(seq_group, SequenceStatus.SWAPPED,
                                   Device.CPU, Device.GPU)
 
+    def get_mds_cached_prefix_blocks(self, seq: Sequence,
+                                     device: Device) -> int:
+        """返回指定层级中从 token 0 连续命中的完整 block 数。
+
+        这里直接查询 allocator，不写入 ``ComputedBlocksTracker``。restore
+        READY 之前缓存长度仍不应对原生 Scheduler 可见。
+        """
+        storage_blocks, gpu_blocks = self.get_mds_cached_prefix_block_counts(
+            seq)
+        return storage_blocks if device == Device.CPU else gpu_blocks
+
+    def get_mds_cached_prefix_block_counts(
+            self, seq: Sequence) -> Tuple[int, int]:
+        """一次 hash 计算同时返回 ``(storage_blocks, gpu_blocks)``。"""
+        if not self.enable_caching:
+            return 0, 0
+        block_hashes = compute_full_prefix_block_hashes(
+            seq.get_token_ids(), self.block_size, seq.extra_hash())
+        storage_blocks = len(
+            self.block_allocator.find_cached_blocks_prefix(
+                block_hashes, device=Device.CPU))
+        gpu_blocks = len(
+            self.block_allocator.find_cached_blocks_prefix(
+                block_hashes, device=Device.GPU))
+        return storage_blocks, gpu_blocks
+
+    def can_reserve_mds_prefix_restore(
+        self,
+        num_prefix_blocks: int,
+        num_gpu_cached_blocks: int,
+    ) -> AllocStatus:
+        """判断当前是否能为 SSD 扩展 prefix 预留 GPU target。
+
+        HBM 已命中的前缀只增加 block 引用，不消耗新物理块；真正需要预留
+        的数量是 ``SSD prefix - HBM prefix``。完整 suffix 尚不分配，后续
+        仍由原生 running prefill 的 ``can_append_slots`` 控制。
+        """
+        if not 0 <= num_gpu_cached_blocks < num_prefix_blocks:
+            return AllocStatus.NEVER
+        if (self.num_total_gpu_blocks - num_prefix_blocks
+                < self.watermark_blocks):
+            return AllocStatus.NEVER
+        required = num_prefix_blocks - num_gpu_cached_blocks
+        free_blocks = self.get_num_free_gpu_blocks()
+        if free_blocks - required >= self.watermark_blocks:
+            return AllocStatus.OK
+        return AllocStatus.LATER
+
+    def reserve_mds_prefix_restore(
+        self,
+        seq_group: SequenceGroup,
+        num_prefix_blocks: int,
+        num_gpu_cached_blocks: int,
+    ) -> BlockPrefixRestoreReservation:
+        """为新请求建立部分 GPU table，并预留 SSD prefix 的直接恢复事务。
+
+        table 只包含连续命中的完整 prefix：已有 HBM hit 直接复用，SSD
+        扩展部分使用 allocator 的 pending target。未命中的 suffix 不在这里
+        分配，READY 后由原生 running prefill 的 append_slots 补齐。
+        """
+        if not self.enable_caching:
+            raise RuntimeError("BaM MDS prefix restore requires prefix caching")
+        waiting_seqs = seq_group.get_seqs(status=SequenceStatus.WAITING)
+        if len(waiting_seqs) != 1:
+            raise ValueError("BaM MDS prefix v0 requires one waiting sequence")
+        seq = waiting_seqs[0]
+        if seq.seq_id in self.block_tables:
+            raise RuntimeError("prefix restore target is already allocated")
+        if not 0 <= num_gpu_cached_blocks < num_prefix_blocks:
+            raise ValueError("SSD prefix must extend the GPU cached prefix")
+
+        source_blocks: Tuple[Block, ...] = ()
+        target_blocks: List[Block] = []
+        pending_targets: List[Block] = []
+        try:
+            prefix_token_ids = seq.get_token_ids()[:num_prefix_blocks *
+                                                   self.block_size]
+            token_blocks = [
+                prefix_token_ids[index:index + self.block_size]
+                for index in range(0, len(prefix_token_ids), self.block_size)
+            ]
+
+            # 先复用已经 computed 的 HBM prefix。lookup 已经确认这部分连续
+            # 命中，因此 allocate_immutable_blocks 不会创建新物理 block。
+            if num_gpu_cached_blocks:
+                target_blocks.extend(
+                    self.block_allocator.allocate_immutable_blocks(
+                        prev_block=None,
+                        block_token_ids=token_blocks[:num_gpu_cached_blocks],
+                        device=Device.GPU,
+                        extra_hash=seq.extra_hash(),
+                    ))
+            previous_target = target_blocks[-1] if target_blocks else None
+
+            # SSD 扩展部分分配独立、未注册 hash 的 pending target。即使多个
+            # loading 请求共享 token prefix，也不会在 DMA 期间共享物理地址。
+            pending_targets = self.block_allocator.allocate_pending_restore_blocks(
+                prev_block=previous_target,
+                block_token_ids=token_blocks[num_gpu_cached_blocks:],
+                device=Device.GPU,
+                extra_hash=seq.extra_hash(),
+            )
+            target_blocks.extend(pending_targets)
+            block_table = BlockTable(
+                block_size=self.block_size,
+                block_allocator=self.block_allocator,
+                _blocks=target_blocks,
+                max_block_sliding_window=self.max_block_sliding_window,
+            )
+            self.block_tables[seq.seq_id] = block_table
+            self._last_access_blocks_tracker.add_seq(seq.seq_id)
+
+            # 初始化原生 tracker，使 loading 期间 abort/free 仍满足生命周期。
+            # 在 continuous batching + priority preempt 下，同一 token prefix
+            # 可能已被 allocator 认定为 HBM cached，但这个新的 waiting seq
+            # 尚未进入过原生 admission，ComputedBlocksTracker 还没有对应的
+            # cached-token frontier。这里以 allocator 查询得到的连续 HBM hit
+            # 为准初始化 tracker；SSD 扩展部分仍保持 IO_PENDING，只有 READY
+            # 后才会在 commit_mds_prefix_restore 中提升到完整 prefix 长度。
+            observed_gpu_tokens = self._computed_blocks_tracker.get_num_cached_tokens(
+                seq)
+            expected_gpu_tokens = num_gpu_cached_blocks * self.block_size
+            if observed_gpu_tokens < expected_gpu_tokens:
+                logger.info(
+                    "[BAM_MDS_PREFIX] phase=tracker_frontier_adjust "
+                    "seq_group_id=%s observed_gpu_tokens=%d "
+                    "expected_gpu_tokens=%d",
+                    seq_group.request_id,
+                    observed_gpu_tokens,
+                    expected_gpu_tokens,
+                )
+                self._computed_blocks_tracker.set_num_cached_tokens(
+                    seq, expected_gpu_tokens)
+
+            source_blocks = tuple(
+                self.block_allocator.allocate_immutable_blocks(
+                    prev_block=None,
+                    block_token_ids=token_blocks,
+                    device=Device.CPU,
+                    extra_hash=seq.extra_hash(),
+                ))
+            mapping = []
+            logical_blocks = []
+            for logical_index in range(num_gpu_cached_blocks,
+                                       num_prefix_blocks):
+                source = source_blocks[logical_index]
+                target = target_blocks[logical_index]
+                assert source.block_id is not None
+                assert target.block_id is not None
+                mapping.append((
+                    self.block_allocator.get_physical_block_id(
+                        Device.CPU, source.block_id),
+                    self.block_allocator.get_physical_block_id(
+                        Device.GPU, target.block_id),
+                ))
+                logical_blocks.append(
+                    LogicalBlockKey(seq.seq_id, logical_index))
+        except Exception:
+            for source in source_blocks:
+                self.block_allocator.free(source)
+            if seq.seq_id in self.block_tables:
+                self.free(seq)
+            else:
+                for target in target_blocks:
+                    self.block_allocator.free(target)
+            raise
+
+        reservation_id = f"block-prefix-restore-{next(self._reservation_counter)}"
+        public = BlockPrefixRestoreReservation(
+            reservation_id=reservation_id,
+            seq_group_id=seq_group.request_id,
+            block_mapping=tuple(mapping),
+            logical_blocks=tuple(logical_blocks),
+            num_prefix_blocks=num_prefix_blocks,
+        )
+        self._prefix_restore_reservations[reservation_id] = (
+            _BlockPrefixRestoreReservationRecord(
+                public=public,
+                seq=seq,
+                source_blocks=source_blocks,
+                pending_target_blocks=tuple(pending_targets),
+            ))
+        return public
+
+    def commit_mds_prefix_restore(self, reservation_id: str) -> None:
+        """在 MDS READY 后发布 restored prefix 的 computed 语义。"""
+        record = self._prefix_restore_reservations.pop(reservation_id)
+        self.block_allocator.publish_pending_restore_blocks(
+            list(record.pending_target_blocks), Device.GPU)
+        self._computed_blocks_tracker.set_num_cached_tokens(
+            record.seq,
+            record.public.num_prefix_blocks * self.block_size,
+        )
+        for source in record.source_blocks:
+            self.block_allocator.free(source)
+
+    def abort_mds_prefix_restore(self, reservation_id: str) -> None:
+        """取消 prefix read，并释放临时持有的 SSD source 引用。"""
+        record = self._prefix_restore_reservations.pop(reservation_id)
+        for source in record.source_blocks:
+            self.block_allocator.free(source)
+
     def can_swap_out(self, seq_group: SequenceGroup) -> bool:
         """Returns whether we can swap out the given sequence_group 
         with num_lookahead_slots.
@@ -525,6 +763,37 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         return self._reserve_swap(seq_group, SequenceStatus.RUNNING,
                                   Device.GPU, Device.CPU)
 
+    def reserve_mds_prefix_store(
+            self, seq_group: SequenceGroup) -> BlockSwapReservation:
+        """为正常完成请求建立 GPU -> SSD prefix populate 事务。
+
+        finished sequence 已经不再是 RUNNING，不能复用 ``reserve_swap_out``
+        的状态过滤；除此之外，物理 copy、clean replica 复用和 commit 顺序
+        与普通 MDS write 完全相同。
+        """
+        finished = tuple(seq for seq in seq_group.get_seqs()
+                         if seq.status in (SequenceStatus.FINISHED_STOPPED,
+                                           SequenceStatus.FINISHED_LENGTH_CAPPED))
+        if not finished:
+            raise ValueError("prefix store requires a normally finished sequence")
+        return self._reserve_swap(seq_group, None, Device.GPU, Device.CPU)
+
+    def can_reserve_mds_prefix_store(self,
+                                     seq_group: SequenceGroup) -> bool:
+        """检查 finished table 是否有足够的 storage 目标 block。"""
+        required = 0
+        for seq in seq_group.get_seqs():
+            source_blocks = tuple(self.block_tables[seq.seq_id].blocks)
+            if any(
+                    self._pinned_gpu_blocks.get(
+                        LogicalBlockKey(seq.seq_id, logical_index), 0)
+                    for logical_index in range(len(source_blocks))):
+                return False
+            required += (len(source_blocks)
+                         - self._clean_storage_prefix_length(
+                             seq.seq_id, source_blocks))
+        return required <= self.get_num_free_cpu_blocks()
+
     def can_reserve_swap_out(self, seq_group: SequenceGroup) -> bool:
         """判断 storage 空间能否容纳当前 dirty suffix。
 
@@ -587,6 +856,14 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
                 # write 后 target storage blocks 转交给正式 block table。
                 # 复用的 clean block 原来由 directory 持有，删除目录项只
                 # 转移所有权；被 dirty block 替换的旧 replica 才真正释放。
+                storage_block_ids = [
+                    block.block_id for block in table_record.target_blocks
+                    if block.block_id is not None
+                ]
+                # MDS DONE 才意味着 SSD 内容真实可读。只提交本事务的 id，
+                # 不能顺带把另一笔仍在飞行的 prefix write 标成 computed。
+                self.block_allocator.mark_blocks_as_computed_on_device(
+                    storage_block_ids, Device.CPU)
                 previous_replicas = self._pop_storage_replicas(
                     table_record.seq_id)
                 for source_block in table_record.source_blocks:
@@ -607,7 +884,7 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
     def _reserve_swap(
         self,
         seq_group: SequenceGroup,
-        sequence_status: SequenceStatus,
+        sequence_status: Optional[SequenceStatus],
         source_device: Device,
         target_device: Device,
     ) -> BlockSwapReservation:
@@ -622,7 +899,10 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         physical_logical_keys: List[LogicalBlockKey] = []
         reused_blocks = 0
         try:
-            for seq in seq_group.get_seqs(status=sequence_status):
+            sequences = (seq_group.get_seqs(status=sequence_status)
+                         if sequence_status is not None else
+                         seq_group.get_seqs())
+            for seq in sequences:
                 source_blocks = tuple(self.block_tables[seq.seq_id].blocks)
                 if source_device == Device.GPU:
                     (target_blocks, new_targets,

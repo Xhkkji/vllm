@@ -95,6 +95,12 @@ class PrefixCachingBlockAllocator(BlockAllocator):
         # are scheduled.
         self._touched_blocks: Set[BlockId] = set()
 
+        # BaM MDS restore target 已经占用真实 GPU block id，但 SSD DMA 尚未
+        # 完成。它们在 READY 前不能进入 ``_cached_blocks``，否则另一个相同
+        # prefix 的请求会复用仍在写入的物理地址；也不能被原生批量 computed
+        # 提交发布。pending block 只由下面三个专用接口创建、发布和回收。
+        self._pending_restore_block_ids: Set[BlockId] = set()
+
         # Used to track status of each physical block id
         self._block_tracker: Dict[BlockId, BlockTracker] = {}
         for block_id in block_ids:
@@ -208,6 +214,63 @@ class PrefixCachingBlockAllocator(BlockAllocator):
                                                        extra_hash=extra_hash)
             blocks.append(prev_block)
         return blocks
+
+    def allocate_pending_restore_blocks(
+        self,
+        prev_block: Optional[Block],
+        block_token_ids: List[List[int]],
+        extra_hash: Optional[int] = None,
+    ) -> List[Block]:
+        """为外部 SSD restore 分配尚不可见的完整 block。
+
+        与 ``allocate_immutable_blocks`` 的关键区别是：这里先保留 hashless
+        allocator 分配的物理 id，再构造带完整 token/hash 的 Block 对象，
+        但不调用 ``promote_to_immutable_block``。因此它既不会成为 prefix
+        lookup 命中，也不会与另一笔相同 prefix restore 共享 DMA target。
+        """
+        blocks: List[Block] = []
+        try:
+            for token_ids in block_token_ids:
+                if len(token_ids) != self._block_size:
+                    raise ValueError(
+                        "pending restore only supports complete blocks")
+                block_id = self._allocate_block_id()
+                block = self._block_pool.init_block(
+                    prev_block=prev_block,
+                    token_ids=token_ids,
+                    block_size=self._block_size,
+                    physical_block_id=block_id,
+                    extra_hash=extra_hash,
+                )
+                assert block.content_hash is not None
+                self._pending_restore_block_ids.add(block_id)
+                blocks.append(block)
+                prev_block = block
+        except Exception:
+            for block in blocks:
+                self.free(block)
+            raise
+        return blocks
+
+    def publish_pending_restore_blocks(self,
+                                       blocks: List[Block]) -> List[int]:
+        """在 MDS READY 后原子地把 pending block 发布到 prefix cache。
+
+        promotion 期间若已有普通 forward 生成相同 hash，原生 allocator 会
+        回收当前临时 target，并让 Block 对象切换到已完成的 canonical id；
+        无论哪种情况，返回值都是 block table 最终应使用的物理 id。
+        """
+        published_ids: List[int] = []
+        for block in blocks:
+            block_id = block.block_id
+            if block_id is None or block_id not in self._pending_restore_block_ids:
+                raise RuntimeError("block is not pending MDS restore")
+            self._pending_restore_block_ids.remove(block_id)
+            block.block_id = self.promote_to_immutable_block(block)
+            assert block.block_id is not None
+            published_ids.append(block.block_id)
+        self.mark_blocks_as_computed(published_ids)
+        return published_ids
 
     def allocate_mutable_block(self,
                                prev_block: Optional[Block],
@@ -325,23 +388,18 @@ class PrefixCachingBlockAllocator(BlockAllocator):
         if self.evictor.num_blocks == 0:
             return None
 
-        # Here we get an evicted block, which is only added
-        # into evictor if its ref counter is 0
-        # and since its content would be changed, we need
-        # to remove it from _cached_blocks's tracking list
+        # Evictor entry 与 hash/refcount 必须是同一个 allocator 事务中的一致
+        # 状态。不能静默跳过异常 entry，否则该物理 block 会既不在 evictor，
+        # 也不在 hashless free list 中，形成永久容量泄漏。
         block_id, content_hash_to_evict = self.evictor.evict()
-
-        # Sanity checks
         assert content_hash_to_evict in self._cached_blocks
-        _block_id = self._cached_blocks[content_hash_to_evict]
-        assert self._refcounter.get(_block_id) == 0
-        assert _block_id == block_id
-
+        cached_block_id = self._cached_blocks[content_hash_to_evict]
+        assert self._refcounter.get(cached_block_id) == 0
+        assert cached_block_id == block_id
         self._cached_blocks.pop(content_hash_to_evict)
 
         self._refcounter.incr(block_id)
         self._track_block_id(block_id, computed=False)
-
         return block_id
 
     def _free_block_id(self, block: Block) -> None:
@@ -369,6 +427,16 @@ class PrefixCachingBlockAllocator(BlockAllocator):
     def free(self, block: Block, keep_block_object: bool = False) -> None:
         """Release the block (look at free_block_id(..) docs)
         """
+        block_id = block.block_id
+        if block_id in self._pending_restore_block_ids:
+            # pending block 有 content hash，但尚未注册到 _cached_blocks，不能
+            # 走 immutable/cached free。按原始 hashless id 回收，并清除发布
+            # 屏障，供 reservation abort 和部分分配失败共用。
+            self._pending_restore_block_ids.remove(block_id)
+            self._decr_refcount_hashless_block(block)
+            if not keep_block_object:
+                self._block_pool.free_block(block)
+            return
         # Release the physical block index
         self._free_block_id(block)
 
@@ -578,10 +646,16 @@ class PrefixCachingBlockAllocator(BlockAllocator):
                     "Mark block as accessed which is not belonged to GPU")
 
     def mark_blocks_as_computed(self, block_ids: List[int]) -> None:
-        # Mark all touched blocks as computed.
-        for block_id in self._touched_blocks:
+        # 原生调用传空列表，语义仍是提交本轮全部 touched block。BaM prefix
+        # restore 传入明确 id，只提交 MDS 已经写完的目标，避免把同一时刻
+        # 尚未计算的 prompt suffix 误标成可命中。
+        blocks_to_mark = (self._touched_blocks if not block_ids else
+                          self._touched_blocks.intersection(block_ids))
+        blocks_to_mark = blocks_to_mark.difference(
+            self._pending_restore_block_ids)
+        for block_id in blocks_to_mark:
             self._block_tracker[block_id].computed = True
-        self._touched_blocks.clear()
+        self._touched_blocks.difference_update(blocks_to_mark)
 
     def _track_block_id(self, block_id: Optional[BlockId],
                         computed: bool) -> None:
@@ -1077,6 +1151,22 @@ class ComputedBlocksTracker:
         num_cached_tokens = num_cached_blocks * self._block_size
         self._seq_id_to_num_tokens_computed[seq.seq_id] = num_cached_tokens
         return num_cached_tokens
+
+    def set_num_cached_tokens(self, seq: Sequence,
+                              num_cached_tokens: int) -> None:
+        """记录外部后端已恢复、且可以跳过计算的连续 prefix 长度。
+
+        BaM MDS 在 admission 前把 SSD KV 直接放入 GPU block。这个状态不由
+        原生 GPU cache lookup 产生，但后续 chunked prefill 仍应复用 vLLM 的
+        cached-token 预算和 metadata 语义，所以只在 I/O READY 后通过这个
+        小接口更新 tracker，不直接改 ``SequenceData``。
+        """
+        if not self._enable_caching:
+            raise RuntimeError("external cached tokens require prefix caching")
+        assert num_cached_tokens % self._block_size == 0
+        assert 0 <= num_cached_tokens <= len(seq.get_token_ids())
+        self._update_seq_hashes(seq)
+        self._seq_id_to_num_tokens_computed[seq.seq_id] = num_cached_tokens
 
     def remove_seq(self, seq_id: int) -> None:
         """Stop tracking the sequence."""

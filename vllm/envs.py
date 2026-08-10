@@ -64,6 +64,9 @@ if TYPE_CHECKING:
     VLLM_BAM_MDS_TORCH_BRIDGE_DIR: Optional[str] = None
     VLLM_BAM_MDS_TIMEOUT_SECONDS: float = 120.0
     VLLM_BAM_MDS_MAX_IN_FLIGHT: int = 4
+    VLLM_BAM_MDS_SERVICE_LIFETIME: str = "resident"
+    VLLM_BAM_MDS_IDLE_STOP_DELAY_MS: int = 0
+    VLLM_BAM_MDS_PREFIX_ENABLE: bool = False
     VLLM_BAM_DIRECT_PLACEMENT: bool = False
     VLLM_BAM_DIRECT_PLACEMENT_IMPL: str = "lmcache"
     VLLM_BAM_DIRECT_PLACEMENT_RUNTIME_ONE_COPY: bool = False
@@ -524,6 +527,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: float(os.getenv("VLLM_BAM_MDS_TIMEOUT_SECONDS", "120")),
     "VLLM_BAM_MDS_MAX_IN_FLIGHT":
     lambda: int(os.getenv("VLLM_BAM_MDS_MAX_IN_FLIGHT", "4")),
+    "VLLM_BAM_MDS_SERVICE_LIFETIME":
+    lambda: os.getenv("VLLM_BAM_MDS_SERVICE_LIFETIME", "resident"),
+    "VLLM_BAM_MDS_IDLE_STOP_DELAY_MS":
+    lambda: int(os.getenv("VLLM_BAM_MDS_IDLE_STOP_DELAY_MS", "0")),
+    # 只启用 BaM MDS 自己的 SSD prefix populate/restore 控制面。关闭时
+    # AsyncKVScheduler 的原有 swap-only 行为完全不变。
+    "VLLM_BAM_MDS_PREFIX_ENABLE":
+    lambda: bool(int(os.getenv("VLLM_BAM_MDS_PREFIX_ENABLE", "0"))),
 
     # 是否启用 Direct Placement v0。
     # 开启后 LMCache retrieve 会优先尝试：

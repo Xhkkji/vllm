@@ -194,6 +194,31 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
         return self._allocators[device].allocate_immutable_block(
             prev_block, token_ids, extra_hash=extra_hash)
 
+    def allocate_pending_restore_blocks(
+        self,
+        prev_block: Optional[Block],
+        block_token_ids: List[List[int]],
+        device: Device,
+        extra_hash: Optional[int] = None,
+    ) -> List[Block]:
+        """在指定设备分配 BaM MDS 尚未 READY 的不可见 block。"""
+        allocator = self._allocators[device]
+        if not isinstance(allocator, PrefixCachingBlockAllocator):
+            raise RuntimeError("pending restore requires prefix caching")
+        return allocator.allocate_pending_restore_blocks(
+            prev_block,
+            block_token_ids,
+            extra_hash=extra_hash,
+        )
+
+    def publish_pending_restore_blocks(self, blocks: List[Block],
+                                       device: Device) -> List[int]:
+        """发布一次已经完成的 BaM MDS restore reservation。"""
+        allocator = self._allocators[device]
+        if not isinstance(allocator, PrefixCachingBlockAllocator):
+            raise RuntimeError("pending restore requires prefix caching")
+        return allocator.publish_pending_restore_blocks(blocks)
+
     def free(self, block: Block) -> None:
         """Frees the memory occupied by the given block.
 
@@ -324,6 +349,16 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
         # Prefix caching only supported on GPU.
         device = Device.GPU
         return self._allocators[device].mark_blocks_as_computed(block_ids)
+
+    def mark_blocks_as_computed_on_device(self, block_ids: List[int],
+                                          device: Device) -> None:
+        """把指定设备上本轮写入完成的 block 标记为可复用。
+
+        原生 V0 只会在 GPU forward 后标记 GPU block。BaM MDS 的 SSD 写入
+        完成后，还需要显式推进 CPU/storage allocator 的 computed 状态，
+        否则相同 token hash 虽然存在，也不能被 prefix lookup 安全命中。
+        """
+        self._allocators[device].mark_blocks_as_computed(block_ids)
 
     def get_common_computed_block_ids(
             self, computed_seq_block_ids: List[List[int]]) -> List[int]:

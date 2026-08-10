@@ -6,17 +6,20 @@ import pytest
 
 from vllm.config import CacheConfig, SchedulerConfig
 from vllm.core.async_kv_scheduler import AsyncKVScheduler
+from vllm.core.block.interfaces import BlockAllocator
 from vllm.core.scheduler import Scheduler, SchedulingBudget
 from vllm.core.scheduler_policy import (AsyncKVTransferEvent,
                                         AsyncKVTransferOperation,
                                         AsyncKVTransferState)
 from vllm.sequence import SequenceStatus
+from vllm.utils import Device
 
-from .utils import (append_new_token_seq_group, create_dummy_prompt,
+from .utils import (append_new_token_seq, append_new_token_seq_group,
+                    create_dummy_prompt,
                     schedule_and_update_computed_tokens)
 
 
-def _create_scheduler() -> AsyncKVScheduler:
+def _create_scheduler(enable_prefix_caching: bool = False) -> AsyncKVScheduler:
     """创建一个同时具备 GPU block 和 storage block 的小型调度器。"""
     block_size = 4
     scheduler_config = SchedulerConfig(
@@ -29,7 +32,264 @@ def _create_scheduler() -> AsyncKVScheduler:
     cache_config = CacheConfig(block_size, 1.0, 1, "auto")
     cache_config.num_cpu_blocks = 16
     cache_config.num_gpu_blocks = 16
+    cache_config.enable_prefix_caching = enable_prefix_caching
     return AsyncKVScheduler(scheduler_config, cache_config, None)
+
+
+def test_bam_mds_prefix_store_restore_uses_native_computed_semantics(
+        monkeypatch):
+    """BaM MDS prefix 应完成 populate -> SSD read -> 跳过 prefill 闭环。"""
+    monkeypatch.setenv("VLLM_BAM_MDS_PREFIX_ENABLE", "1")
+    scheduler = _create_scheduler(enable_prefix_caching=True)
+
+    # populate 请求先按普通 prefill 计算。这里显式推进 computed token，模拟
+    # 一次真实 model execution 已经完成，随后请求正常结束。
+    populate_tokens = list(range(8))
+    populate_seq, populate_group = create_dummy_prompt(
+        "70",
+        prompt_tokens=populate_tokens,
+        block_size=4,
+    )
+    scheduler.add_seq_group(populate_group)
+    schedule_and_update_computed_tokens(scheduler)
+    populate_seq.status = SequenceStatus.FINISHED_STOPPED
+    # 真实 V0 single-step output processor 会先 free_seq，再统一清理 group。
+    scheduler.free_seq(populate_seq)
+    assert populate_seq.seq_id in scheduler.block_manager.block_tables
+    scheduler.free_finished_seq_groups()
+
+    store = scheduler.drain_async_kv_transfers_to_submit()
+    assert len(store) == 1
+    assert store[0].operation == AsyncKVTransferOperation.WRITE
+    assert store[0].request_id in scheduler.prefix_saving
+    scheduler.apply_async_kv_event(
+        AsyncKVTransferEvent(store[0].request_id,
+                             AsyncKVTransferState.READY))
+    scheduler.complete_ready_async_kv_transfers()
+    assert populate_seq.seq_id not in scheduler.block_manager.block_tables
+
+    # 正常情况下 HBM 压力会淘汰 GPU prefix。单测直接清空 GPU 层，只保留
+    # CPU/storage 索引，从而确定后续命中确实经过 MDS，而不是原生 HBM hit。
+    assert scheduler.block_manager.reset_prefix_cache(Device.GPU)
+    reuse_tokens = populate_tokens + [100, 101, 102, 103]
+    reuse_seq, reuse_group = create_dummy_prompt(
+        "71",
+        prompt_tokens=reuse_tokens,
+        block_size=4,
+    )
+    scheduler.add_seq_group(reuse_group)
+
+    assert scheduler._maybe_start_bam_mds_prefix_restore()
+    restore = scheduler.drain_async_kv_transfers_to_submit()
+    assert len(restore) == 1
+    assert restore[0].operation == AsyncKVTransferOperation.READ
+    assert len(restore[0].block_mapping) == 2
+    assert reuse_seq.status == SequenceStatus.WAITING
+    # READY 前只存在 2 个 prefix block；未命中的 suffix 尚未分配。
+    assert len(scheduler.block_manager.get_block_table(reuse_seq)) == 2
+    assert not scheduler.running
+
+    scheduler.apply_async_kv_event(
+        AsyncKVTransferEvent(restore[0].request_id,
+                             AsyncKVTransferState.READY))
+    scheduler.complete_ready_async_kv_transfers()
+    assert reuse_seq.status == SequenceStatus.RUNNING
+    assert list(scheduler.running) == [reuse_group]
+
+    metadata, scheduled = schedule_and_update_computed_tokens(scheduler)
+    assert scheduled.scheduled_seq_groups[0].seq_group == reuse_group
+    assert len(scheduler.block_manager.get_block_table(reuse_seq)) == 3
+    assert metadata[0].computed_block_nums == scheduler.block_manager.get_block_table(
+        reuse_seq)[:2]
+
+
+def test_bam_mds_prefix_restore_overlaps_running_compute(monkeypatch):
+    """pending prefix 不应阻止已有 running 请求，也不能提前成为 hit。"""
+    monkeypatch.setenv("VLLM_BAM_MDS_PREFIX_ENABLE", "1")
+    scheduler = _create_scheduler(enable_prefix_caching=True)
+
+    # 构造一个已写入 CPU/storage prefix cache 的历史请求。
+    source_tokens = list(range(8))
+    source_seq, source_group = create_dummy_prompt(
+        "72", prompt_tokens=source_tokens, block_size=4)
+    scheduler.add_seq_group(source_group)
+    schedule_and_update_computed_tokens(scheduler)
+    source_seq.status = SequenceStatus.FINISHED_STOPPED
+    scheduler.free_seq(source_seq)
+    scheduler.free_finished_seq_groups()
+    store = scheduler.drain_async_kv_transfers_to_submit()[0]
+    scheduler.apply_async_kv_event(
+        AsyncKVTransferEvent(store.request_id, AsyncKVTransferState.READY))
+    scheduler.complete_ready_async_kv_transfers()
+    assert scheduler.block_manager.reset_prefix_cache(Device.GPU)
+
+    # A 已经在 running；C/D 同时等待两个不同 suffix 的相同历史 prefix。
+    active_seq, active_group = create_dummy_prompt(
+        "73", prompt_tokens=list(range(40, 48)), block_size=4)
+    scheduler.add_seq_group(active_group)
+    schedule_and_update_computed_tokens(scheduler)
+    append_new_token_seq(active_seq, 999)
+    reuse_groups = []
+    for request_id, suffix in (("74", [100, 101, 102, 103]),
+                               ("75", [200, 201, 202, 203])):
+        _, group = create_dummy_prompt(
+            request_id,
+            prompt_tokens=source_tokens + suffix,
+            block_size=4,
+        )
+        scheduler.add_seq_group(group)
+        reuse_groups.append(group)
+
+    assert scheduler._maybe_start_bam_mds_prefix_restore() == 2
+    restores = scheduler.drain_async_kv_transfers_to_submit()
+    assert len(restores) == 2
+    assert all(request.operation == AsyncKVTransferOperation.READ
+               for request in restores)
+    # Pending target 没有注册到 GPU prefix cache，哪怕主动执行全局 mark 也
+    # 不能让另一请求把尚未完成 DMA 的物理 block 当成命中。
+    for group in reuse_groups:
+        seq = group.first_seq
+        assert len(scheduler.block_manager.get_block_table(seq)) == 2
+        assert scheduler.block_manager.get_mds_cached_prefix_blocks(
+            seq, Device.GPU) == 0
+    scheduler.block_manager.block_allocator.mark_blocks_as_computed([])
+    for group in reuse_groups:
+        assert scheduler.block_manager.get_mds_cached_prefix_blocks(
+            group.first_seq, Device.GPU) == 0
+
+    # 即便 prefix read pending，A 仍能计算，且剩余 sequence slot 可以继续
+    # admission 一个不命中 SSD 的普通请求；不能因为存在 I/O 冻结 waiting。
+    _, ordinary_group = create_dummy_prompt(
+        "79", prompt_tokens=list(range(300, 308)), block_size=4)
+    scheduler.add_seq_group(ordinary_group)
+    _, scheduled = schedule_and_update_computed_tokens(scheduler)
+    scheduled_groups = [item.seq_group
+                        for item in scheduled.scheduled_seq_groups]
+    assert active_group in scheduled_groups
+    assert ordinary_group in scheduled_groups
+
+    # 乱序 READY：每个 reservation 独立发布，两个请求都进入 running。
+    for request in reversed(restores):
+        scheduler.apply_async_kv_event(
+            AsyncKVTransferEvent(request.request_id,
+                                 AsyncKVTransferState.READY))
+    scheduler.complete_ready_async_kv_transfers()
+    assert all(group in scheduler.running for group in reuse_groups)
+    for group in reuse_groups:
+        assert len(scheduler.block_manager.get_block_table(
+            group.first_seq)) == 2
+
+
+@pytest.mark.parametrize(
+    ("abort_first", "terminal_state"),
+    [
+        (False, AsyncKVTransferState.ERROR),
+        (True, AsyncKVTransferState.READY),
+        (True, AsyncKVTransferState.ERROR),
+    ],
+)
+def test_bam_mds_prefix_restore_abort_releases_pending_transaction(
+        monkeypatch, abort_first, terminal_state):
+    """ERROR/abort 都不能发布 hash，也不能泄漏 pending target。"""
+    monkeypatch.setenv("VLLM_BAM_MDS_PREFIX_ENABLE", "1")
+    scheduler = _create_scheduler(enable_prefix_caching=True)
+
+    # 先生成只存在于 SSD 层的两个完整 prefix block。这里沿用真实生命周期：
+    # 原生 prefill 负责计算，MDS prefix store 建立 storage 索引，再淘汰 HBM。
+    prefix_tokens = list(range(8))
+    source_seq, source_group = create_dummy_prompt(
+        "76", prompt_tokens=prefix_tokens, block_size=4)
+    scheduler.add_seq_group(source_group)
+    schedule_and_update_computed_tokens(scheduler)
+    source_seq.status = SequenceStatus.FINISHED_STOPPED
+    scheduler.free_seq(source_seq)
+    scheduler.free_finished_seq_groups()
+    store = scheduler.drain_async_kv_transfers_to_submit()[0]
+    scheduler.apply_async_kv_event(
+        AsyncKVTransferEvent(store.request_id,
+                             AsyncKVTransferState.READY))
+    scheduler.complete_ready_async_kv_transfers()
+    assert scheduler.block_manager.reset_prefix_cache(Device.GPU)
+
+    # restore reserve 只分配两个 pending prefix target，不为 suffix 分配 block。
+    reuse_seq, reuse_group = create_dummy_prompt(
+        "77",
+        prompt_tokens=prefix_tokens + [100, 101, 102, 103],
+        block_size=4,
+    )
+    free_gpu_before_restore = scheduler.block_manager.get_num_free_gpu_blocks()
+    scheduler.add_seq_group(reuse_group)
+    assert scheduler._maybe_start_bam_mds_prefix_restore() == 1
+    restore = scheduler.drain_async_kv_transfers_to_submit()[0]
+    assert len(scheduler.block_manager.get_block_table(reuse_seq)) == 2
+    assert scheduler.block_manager.get_num_free_gpu_blocks() == (
+        free_gpu_before_restore - 2)
+
+    # active DMA 无法安全地立即释放 target。用户 abort 只记录取消意图，等
+    # READY/ERROR 终态到达后，再由同一个事务清理路径释放物理 block。
+    if abort_first:
+        scheduler.abort_seq_group(reuse_group.request_id)
+        assert reuse_seq.status == SequenceStatus.FINISHED_ABORTED
+        assert restore.request_id in scheduler.prefix_loading
+
+    scheduler.apply_async_kv_event(
+        AsyncKVTransferEvent(restore.request_id, terminal_state,
+                             error="injected MDS failure"))
+    scheduler.complete_ready_async_kv_transfers()
+
+    # 回收完成后，allocator 空闲数、正式 table 和事务记录必须全部复原；更
+    # 关键的是，相同 token 的 GPU lookup 仍为 0，失败 DMA 绝不能发布 hash。
+    assert reuse_seq.seq_id not in scheduler.block_manager.block_tables
+    assert scheduler.block_manager.get_num_free_gpu_blocks() == (
+        free_gpu_before_restore)
+    assert scheduler.block_manager.get_mds_cached_prefix_blocks(
+        reuse_seq, Device.GPU) == 0
+    assert not scheduler.block_manager._prefix_restore_reservations
+    assert not scheduler.prefix_loading
+    assert not scheduler._cancelled_async_kv_requests
+    assert not scheduler.has_active_async_kv_transfer()
+
+
+def test_bam_mds_prefix_restore_does_not_bypass_blocked_priority_head(
+        monkeypatch):
+    """高优先级 restore 暂不可分配时，后续请求不能抢先预留 HBM。"""
+    monkeypatch.setenv("VLLM_BAM_MDS_PREFIX_ENABLE", "1")
+    scheduler = _create_scheduler(enable_prefix_caching=True)
+    scheduler.scheduler_config.policy = "priority"
+
+    _, lower_group = create_dummy_prompt(
+        "80", prompt_tokens=list(range(8)), block_size=4)
+    _, higher_group = create_dummy_prompt(
+        "81", prompt_tokens=list(range(8)), block_size=4)
+    lower_group.priority = 10
+    higher_group.priority = 0
+    scheduler.add_seq_group(lower_group)
+    scheduler.add_seq_group(higher_group)
+
+    attempted_request_ids = []
+
+    def fail_reservation(seq_group, num_prefix_blocks,
+                         num_gpu_cached_blocks):
+        attempted_request_ids.append(seq_group.request_id)
+        raise BlockAllocator.NoFreeBlocksError()
+
+    monkeypatch.setattr(scheduler.block_manager,
+                        "get_mds_cached_prefix_block_counts",
+                        lambda seq: (2, 0))
+    monkeypatch.setattr(scheduler.block_manager,
+                        "reserve_mds_prefix_restore", fail_reservation)
+
+    scheduler._sort_waiting_for_prefix_restore()
+    assert scheduler._maybe_start_bam_mds_prefix_restore() == 0
+    assert attempted_request_ids == [higher_group.request_id]
+    assert list(scheduler.waiting) == [higher_group, lower_group]
+    assert not scheduler.prefix_loading
+
+    # 该请求已经确认有 SSD prefix，只是本轮 target 不足。父类仍可推进已有
+    # running，但不能把 waiting 请求直接 admission 成完整 recompute。
+    outputs = scheduler._schedule_chunked_prefill_with_reserved_slots()
+    assert not outputs.scheduled_seq_groups
+    assert list(scheduler.waiting) == [higher_group, lower_group]
 
 
 def _sync_swap_out(scheduler: AsyncKVScheduler, seq_group) -> None:

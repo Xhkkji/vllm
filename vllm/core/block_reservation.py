@@ -51,3 +51,19 @@ class BlockSwapReservation:
     # I/O mapping 与逻辑 block 一一对应；后续策略可以在不解析 allocator
     # 私有对象的前提下，把 completion 关联回 residency directory。
     logical_blocks: Tuple[LogicalBlockKey, ...] = ()
+
+
+@dataclass(frozen=True)
+class BlockPrefixRestoreReservation:
+    """一次 BaM MDS prefix SSD -> GPU 恢复事务。
+
+    与 swap-in 不同，目标请求原本没有 storage block table。Block manager
+    会先为新请求建立 GPU table，再把命中的连续 prefix 映射到这些目标
+    block；READY 前 Scheduler 不会让该请求进入计算队列。
+    """
+
+    reservation_id: str
+    seq_group_id: str
+    block_mapping: BlockMapping
+    logical_blocks: Tuple[LogicalBlockKey, ...]
+    num_prefix_blocks: int

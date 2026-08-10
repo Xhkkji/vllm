@@ -686,8 +686,18 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             record.seq,
             record.public.num_prefix_blocks * self.block_size,
         )
-        for source in record.source_blocks:
-            self.block_allocator.free(source)
+
+        # prefix restore 的 CPU source 是刚完成 DMA 的 SSD clean replica。
+        # 它不能在这里直接释放：后续 decode/prefill 未改写这些前缀时，
+        # GPU -> SSD swap/store 应复用同一份副本，只写新增的 dirty suffix。
+        # 这与普通 swap-in 的所有权转移语义一致；目录在 seq free 或下一次
+        # 成功写回时统一回收/替换，避免每个 prefix hit 都重写完整 prompt。
+        old_replicas = self._pop_storage_replicas(record.seq.seq_id)
+        for replica in old_replicas:
+            self.block_allocator.free(replica)
+        for logical_index, source_block in enumerate(record.source_blocks):
+            key = LogicalBlockKey(record.seq.seq_id, logical_index)
+            self._storage_replicas[key] = source_block
 
     def abort_mds_prefix_restore(self, reservation_id: str) -> None:
         """取消 prefix read，并释放临时持有的 SSD source 引用。"""

@@ -102,6 +102,18 @@ def test_bam_mds_prefix_store_restore_uses_native_computed_semantics(
     assert metadata[0].computed_block_nums == scheduler.block_manager.get_block_table(
         reuse_seq)[:2]
 
+    # restore 的 SSD source 必须转交为该 sequence 的 clean replica。否则
+    # 请求结束后的 prefix store 会把两个已恢复 prefix block 也重新写盘。
+    assert scheduler.block_manager.get_num_clean_storage_replicas(
+        reuse_seq) == 2
+    reuse_seq.status = SequenceStatus.FINISHED_STOPPED
+    scheduler.free_seq(reuse_seq)
+    scheduler.free_finished_seq_groups()
+    next_store = scheduler.drain_async_kv_transfers_to_submit()
+    assert len(next_store) == 1
+    assert next_store[0].operation == AsyncKVTransferOperation.WRITE
+    assert [key.logical_index for key in next_store[0].logical_blocks] == [2]
+
 
 def test_bam_mds_prefix_restore_overlaps_running_compute(monkeypatch):
     """pending prefix 不应阻止已有 running 请求，也不能提前成为 hit。"""

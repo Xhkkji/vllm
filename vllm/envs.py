@@ -67,6 +67,10 @@ if TYPE_CHECKING:
     VLLM_BAM_MDS_SERVICE_LIFETIME: str = "resident"
     VLLM_BAM_MDS_IDLE_STOP_DELAY_MS: int = 0
     VLLM_BAM_MDS_PREFIX_ENABLE: bool = False
+    VLLM_BAM_MDS_HIERARCHICAL_IO_ENABLE: bool = False
+    VLLM_BAM_MDS_HIERARCHICAL_NUM_LAYERS: int = 0
+    VLLM_BAM_MDS_HIERARCHICAL_WINDOW_LAYERS: int = 0
+    VLLM_BAM_MDS_HIERARCHICAL_LAYER_BARRIER: bool = False
     VLLM_BAM_DIRECT_PLACEMENT: bool = False
     VLLM_BAM_DIRECT_PLACEMENT_IMPL: str = "lmcache"
     VLLM_BAM_DIRECT_PLACEMENT_RUNTIME_ONE_COPY: bool = False
@@ -535,6 +539,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # AsyncKVScheduler 的原有 swap-only 行为完全不变。
     "VLLM_BAM_MDS_PREFIX_ENABLE":
     lambda: bool(int(os.getenv("VLLM_BAM_MDS_PREFIX_ENABLE", "0"))),
+    # Step 1/2 的层级 I/O 实验开关。NUM_LAYERS 是当前 PP rank 的本地层数；
+    # 关闭时不会拆分请求，也不会增加原有 prefix baseline 的 transfer 数量。
+    "VLLM_BAM_MDS_HIERARCHICAL_IO_ENABLE":
+    lambda: bool(
+        int(os.getenv("VLLM_BAM_MDS_HIERARCHICAL_IO_ENABLE", "0"))),
+    "VLLM_BAM_MDS_HIERARCHICAL_NUM_LAYERS":
+    lambda: int(os.getenv("VLLM_BAM_MDS_HIERARCHICAL_NUM_LAYERS", "0")),
+    "VLLM_BAM_MDS_HIERARCHICAL_WINDOW_LAYERS":
+    lambda: int(os.getenv("VLLM_BAM_MDS_HIERARCHICAL_WINDOW_LAYERS", "0")),
+    # Step 4：首窗 ready 后进入 forward，并在每个 layer window 前由 worker
+    # 直接确认 DMA 完成。关闭时保留 Step 1/2 的 full-restore dispatch gate。
+    "VLLM_BAM_MDS_HIERARCHICAL_LAYER_BARRIER":
+    lambda: bool(
+        int(os.getenv("VLLM_BAM_MDS_HIERARCHICAL_LAYER_BARRIER", "0"))),
 
     # 是否启用 Direct Placement v0。
     # 开启后 LMCache retrieve 会优先尝试：

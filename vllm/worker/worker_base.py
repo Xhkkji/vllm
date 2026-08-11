@@ -4,6 +4,7 @@ import dataclasses
 import os
 import time
 from abc import abstractmethod
+from contextlib import nullcontext
 from typing import Any, Dict, List, Optional, Set, Tuple, Type, Union
 
 import cloudpickle
@@ -426,14 +427,25 @@ class LocalOrDistributedWorkerBase(WorkerBase):
                 orig_model_execute_time = intermediate_tensors.tensors.get(
                     "model_execute_time", torch.tensor(0)).item()
 
-        output = self.model_runner.execute_model(
-            model_input=model_input,
-            kv_caches=self.kv_cache[worker_input.virtual_engine]
-            if self.kv_cache is not None else None,
-            intermediate_tensors=intermediate_tensors,
-            num_steps=num_steps,
-            **kwargs,
-        )
+        activate_layer_barrier = (
+            getattr(self, "activate_hierarchical_layer_barrier", None)
+            if envs.VLLM_BAM_MDS_HIERARCHICAL_LAYER_BARRIER else None)
+        request_ids = tuple(
+            (model_input.request_ids_to_seq_ids or {}).keys())
+        barrier_context = (
+            activate_layer_barrier(worker_input.virtual_engine, request_ids)
+            if activate_layer_barrier is not None else nullcontext())
+        # 普通 Worker 没有这项可选能力，仍是空上下文；MDS Worker 只在实验
+        # 开关打开时由模型侧逐层调用 barrier，不改变原生执行主循环的语义。
+        with barrier_context:
+            output = self.model_runner.execute_model(
+                model_input=model_input,
+                kv_caches=self.kv_cache[worker_input.virtual_engine]
+                if self.kv_cache is not None else None,
+                intermediate_tensors=intermediate_tensors,
+                num_steps=num_steps,
+                **kwargs,
+            )
         if envs.VLLM_V0_SWAP_TRACE:
             logger.info(
                 "[V0_SWAP_TRACE][WorkerBase] phase=after_model_runner "

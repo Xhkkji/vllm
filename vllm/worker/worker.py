@@ -2,6 +2,7 @@
 """A GPU worker class."""
 import gc
 import os
+import time
 from typing import Dict, List, Optional, Sequence, Set, Tuple, Type, Union
 
 import torch
@@ -11,6 +12,8 @@ import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.core.custom_schedulers.async_kv_transfer import (
     AsyncKVTransferEvent, AsyncKVTransferRequest, AsyncKVTransferState)
+from vllm.core.custom_schedulers.hierarchical_io import (
+    activate_layer_barrier)
 from vllm.device_allocator.cumem import CuMemAllocator
 from vllm.distributed import (ensure_model_parallel_initialized,
                               init_distributed_environment,
@@ -66,6 +69,13 @@ class Worker(LocalOrDistributedWorkerBase):
         # engine iteration 同时存活；completion 不依赖提交顺序。
         self._async_kv_transfer_mappings: Dict[
             Tuple[int, str], torch.Tensor] = {}
+        # Step 4 的 worker-local barrier 状态。Scheduler 仍是 transfer 的
+        # 唯一所有者；Worker 只在 model forward 中代替下一轮 Engine poll 查询
+        # 已提交的 handle，并把 completion event 缓存给正常 RPC 路径回传。
+        self._hierarchical_layer_requests: Dict[
+            Tuple[int, str], AsyncKVTransferRequest] = {}
+        self._hierarchical_layer_completed: Dict[
+            Tuple[int, str], AsyncKVTransferEvent] = {}
         if self.model_config.trust_remote_code:
             # note: lazy import to avoid importing torch before initializing
             from vllm.utils import init_cached_hf_modules
@@ -504,17 +514,31 @@ class Worker(LocalOrDistributedWorkerBase):
                 dtype=torch.int64,
             ).view(-1, 2)
             event = cache_engine.submit_async_kv_transfer(
-                request.request_id, request.operation, mapping)
+                request.request_id,
+                request.operation,
+                mapping,
+                layer_range=request.layer_range)
             events.append(event)
             if event.state == AsyncKVTransferState.PENDING:
                 self._async_kv_transfer_mappings[key] = mapping
+                if request.layer_range is not None:
+                    self._hierarchical_layer_requests[key] = request
         return events
 
     def poll_async_kv_transfers(
             self, virtual_engine: int) -> List[AsyncKVTransferEvent]:
         """非阻塞轮询当前 virtual engine 的全部 outstanding transfer。"""
         cache_engine = self.cache_engine[virtual_engine]
+        # 先返回 layer barrier 已消费的 READY/ERROR。Engine 会照常把它们
+        # 交给 Scheduler，完成 reservation 的 commit/abort，Worker 不修改
+        # block allocator 的所有权。
         events: List[AsyncKVTransferEvent] = []
+        completed_keys = [
+            key for key in self._hierarchical_layer_completed
+            if key[0] == virtual_engine
+        ]
+        for key in completed_keys:
+            events.append(self._hierarchical_layer_completed.pop(key))
         keys = [
             key for key in self._async_kv_transfer_mappings
             if key[0] == virtual_engine
@@ -526,7 +550,90 @@ class Worker(LocalOrDistributedWorkerBase):
             events.append(event)
             if event.state != AsyncKVTransferState.PENDING:
                 del self._async_kv_transfer_mappings[key]
+                self._hierarchical_layer_requests.pop(key, None)
         return events
+
+    def activate_hierarchical_layer_barrier(
+            self, virtual_engine: int,
+            request_ids: Tuple[str, ...]):
+        """返回覆盖一次 model forward 的 worker-local barrier context。"""
+        return activate_layer_barrier(
+            self._wait_for_hierarchical_layer,
+            virtual_engine=virtual_engine,
+            request_ids=request_ids,
+        )
+
+    def _wait_for_hierarchical_layer(
+        self,
+        virtual_engine: int,
+        request_ids: Tuple[str, ...],
+        layer_index: int,
+    ) -> None:
+        """在 attention 读取该层 prefix KV 前确认 window DMA READY。
+
+        MDS daemon 与 GPU forward 并行。若后续 window 尚在传输，这里以短暂
+        sleep 避免忙轮询抢占 CPU；READY event 留到 forward 返回后由下一次
+        Engine poll 正常传给 Scheduler，防止同一 MDS handle 被重复 finish。
+        """
+        matching = tuple(
+            (key, request) for key, request in
+            self._hierarchical_layer_requests.items()
+            if (key[0] == virtual_engine and request.seq_group_id in request_ids
+                and request.layer_range is not None
+                and request.layer_range[0] <= layer_index <
+                request.layer_range[1]))
+        if not matching:
+            return
+
+        cache_engine = self.cache_engine[virtual_engine]
+        for key, request in matching:
+            if envs.VLLM_V0_SWAP_TRACE:
+                logger.info(
+                    "[BAM_MDS_HIERARCHICAL][LayerBarrier] phase=wait "
+                    "request_id=%s seq_group_id=%s layer=%d layer_range=%s",
+                    request.request_id,
+                    request.seq_group_id,
+                    layer_index,
+                    request.layer_range,
+                )
+            while True:
+                completed = self._hierarchical_layer_completed.get(key)
+                if completed is not None:
+                    if completed.state == AsyncKVTransferState.ERROR:
+                        raise RuntimeError(
+                            "hierarchical MDS restore failed before layer "
+                            f"{layer_index}: {completed.error}")
+                    break
+
+                mapping = self._async_kv_transfer_mappings.get(key)
+                if mapping is None:
+                    # Engine poll 已经完成并删除该请求，当前 layer 可安全运行。
+                    break
+                event = cache_engine.poll_async_kv_transfer(
+                    request.request_id, mapping)
+                if event.state == AsyncKVTransferState.PENDING:
+                    time.sleep(0.0001)
+                    continue
+
+                del self._async_kv_transfer_mappings[key]
+                self._hierarchical_layer_requests.pop(key, None)
+                self._hierarchical_layer_completed[key] = event
+                if envs.VLLM_V0_SWAP_TRACE:
+                    logger.info(
+                        "[BAM_MDS_HIERARCHICAL][LayerBarrier] "
+                        "phase=ready request_id=%s seq_group_id=%s "
+                        "layer=%d layer_range=%s state=%s",
+                        request.request_id,
+                        request.seq_group_id,
+                        layer_index,
+                        request.layer_range,
+                        event.state.name,
+                    )
+                if event.state == AsyncKVTransferState.ERROR:
+                    raise RuntimeError(
+                        "hierarchical MDS restore failed before layer "
+                        f"{layer_index}: {event.error}")
+                break
 
     def _get_cached_seq_group_metadata(
             self,

@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import sys
 import time
-from typing import Sequence
+from typing import Any, Optional, Sequence, Tuple
 
 import torch
 
@@ -28,6 +28,7 @@ class _PendingTransfer:
     handle: object
     mapping: tuple[tuple[int, int], ...]
     operation: str
+    layer_range: Optional[Tuple[int, int]]
     submitted_at_ns: int
 
 
@@ -171,7 +172,9 @@ class BaMMDSConnector:
 
     def submit_transfer_async(self, scheduler_request_id: str,
                               src_to_dst: torch.Tensor, *,
-                              operation: str) -> bool:
+                              operation: str,
+                              layer_range: Optional[Tuple[int, int]] = None
+                              ) -> bool:
         """提交一笔 MDS logical read/write，不等待完成。
 
         返回 True 仅表示 mapping 为空、无需 I/O；正常提交返回 False。MDS
@@ -181,20 +184,24 @@ class BaMMDSConnector:
             raise ValueError("scheduler_request_id must not be empty")
         if operation not in ("read", "write"):
             raise ValueError(f"unsupported async MDS operation: {operation}")
+        layer_range = self._validate_layer_range(layer_range)
         if src_to_dst.numel() == 0:
             return True
         if scheduler_request_id in self._pending_transfers:
             pending = self._pending_transfers[scheduler_request_id]
             mapping, _ = self._mapping_payload(src_to_dst,
-                                                operation=operation)
+                                                operation=operation,
+                                                layer_range=layer_range)
             if (mapping != pending.mapping
-                    or operation != pending.operation):
+                    or operation != pending.operation
+                    or layer_range != pending.layer_range):
                 raise RuntimeError(
                     "MDS transfer changed while request was in flight")
             return False
 
         mapping, payload = self._mapping_payload(src_to_dst,
-                                                 operation=operation)
+                                                 operation=operation,
+                                                 layer_range=layer_range)
         submit = (self.client.submit_read_async
                   if operation == "read" else self.client.submit_write_async)
         handle = submit(payload)
@@ -203,25 +210,28 @@ class BaMMDSConnector:
             handle=handle,
             mapping=mapping,
             operation=operation,
+            layer_range=layer_range,
             submitted_at_ns=submitted_at_ns)
         if envs.VLLM_V0_SWAP_TRACE:
             logger.info(
                 "[V0_SWAP_TRACE][AsyncKV][Connector] phase=submit "
                 "operation=%s scheduler_request_id=%s mds_request_id=%d "
-                "submit_monotonic_ns=%d blocks=%d",
+                "submit_monotonic_ns=%d blocks=%d layer_range=%s",
                 operation,
                 scheduler_request_id,
                 handle.request_id,
                 submitted_at_ns,
                 len(mapping),
+                layer_range,
             )
         logger.debug(
             "[BAM_MDS] submitted async %s scheduler_request_id=%s "
-            "mds_request_id=%d blocks=%d",
+            "mds_request_id=%d blocks=%d layer_range=%s",
             operation,
             scheduler_request_id,
             handle.request_id,
             len(mapping),
+            layer_range,
         )
         return False
 
@@ -264,11 +274,12 @@ class BaMMDSConnector:
             )
         logger.info(
             "[BAM_MDS] async %s done scheduler_request_id=%s "
-            "mds_request_id=%d blocks=%d io_elapsed_ms=%.3f",
+            "mds_request_id=%d blocks=%d layer_range=%s io_elapsed_ms=%.3f",
             operation,
             scheduler_request_id,
             request_id,
             len(mapping),
+            pending.layer_range,
             io_elapsed_ns / 1.0e6,
         )
         return True
@@ -287,7 +298,8 @@ class BaMMDSConnector:
         src_to_dst: torch.Tensor,
         *,
         operation: str,
-    ) -> tuple[tuple[tuple[int, int], ...], dict[str, list[int]]]:
+        layer_range: Optional[Tuple[int, int]] = None,
+    ) -> tuple[tuple[tuple[int, int], ...], dict[str, Any]]:
         mappings = tuple(
             (int(source), int(destination))
             for source, destination in src_to_dst.to(
@@ -300,7 +312,25 @@ class BaMMDSConnector:
             storage_ids, gpu_ids = source_ids, destination_ids
         else:
             raise ValueError(f"unsupported MDS operation: {operation}")
-        return mappings, {
+        payload: dict[str, Any] = {
             "gpu_block_ids": gpu_ids,
             "storage_block_ids": storage_ids,
         }
+        if layer_range is not None:
+            payload["layer_start"] = layer_range[0]
+            payload["layer_end"] = layer_range[1]
+        return mappings, payload
+
+    def _validate_layer_range(
+        self,
+        layer_range: Optional[Tuple[int, int]],
+    ) -> Optional[Tuple[int, int]]:
+        """尽早拒绝越界 window，避免 daemon 已开始部分 DMA 后才报错。"""
+        if layer_range is None:
+            return None
+        start_layer, end_layer = (int(layer_range[0]), int(layer_range[1]))
+        if not 0 <= start_layer < end_layer <= self.layout.num_layers:
+            raise ValueError(
+                "MDS layer range is outside local KV cache: "
+                f"[{start_layer}, {end_layer}) vs {self.layout.num_layers}")
+        return start_layer, end_layer

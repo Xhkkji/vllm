@@ -2,7 +2,7 @@
 """CacheEngine class for managing the KV cache."""
 import time
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -300,6 +300,7 @@ class CacheEngine:
         request_id: str,
         operation: AsyncKVTransferOperation,
         src_to_dst: torch.Tensor,
+        layer_range: Optional[Tuple[int, int]] = None,
     ) -> AsyncKVTransferEvent:
         """把 Scheduler 的异步 read/write 提交给 resident MDS。
 
@@ -320,15 +321,19 @@ class CacheEngine:
             logger.info(
                 "[V0_SWAP_TRACE][AsyncKV][CacheEngine] phase=submit "
                 "operation=%s request_id=%s submit_monotonic_ns=%d "
-                "mappings=%d",
+                "mappings=%d layer_range=%s",
                 operation.value,
                 request_id,
                 trace.submitted_at_ns,
                 src_to_dst.shape[0],
+                layer_range,
             )
         try:
             ready = self.bam_mds_connector.submit_transfer_async(
-                request_id, src_to_dst, operation=operation.value)
+                request_id,
+                src_to_dst,
+                operation=operation.value,
+                layer_range=layer_range)
         except Exception as exc:
             del self._bam_mds_async_kv_traces[request_id]
             return AsyncKVTransferEvent(request_id,

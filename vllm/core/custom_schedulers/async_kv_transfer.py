@@ -56,6 +56,9 @@ class AsyncKVTransferRequest:
     block_mapping: BlockMapping
     logical_blocks: Tuple[LogicalBlockKey, ...]
     priority: AsyncKVTransferPriority
+    # ``None`` 保持原有“搬完整 block 的全部层”语义。层级 restore 才携带
+    # 左闭右开的本地 layer range；Worker/MDS 不解释 scheduler plan。
+    layer_range: Optional[Tuple[int, int]] = None
 
 
 @dataclass(frozen=True)
@@ -133,6 +136,7 @@ class AsyncKVTransferQueue:
         block_mapping: Sequence[Tuple[int, int]],
         logical_blocks: Sequence[LogicalBlockKey] = (),
         priority: Optional[AsyncKVTransferPriority] = None,
+        layer_range: Optional[Tuple[int, int]] = None,
     ) -> AsyncKVTransferRequest:
         """登记 reservation，但暂不占用 Worker/MDS request slot。"""
         if priority is None:
@@ -148,6 +152,7 @@ class AsyncKVTransferQueue:
             block_mapping=tuple(tuple(pair) for pair in block_mapping),
             logical_blocks=tuple(logical_blocks),
             priority=priority,
+            layer_range=layer_range,
         )
         self._transfers[request_id] = PendingAsyncKVTransfer(request=request)
         return request
@@ -231,4 +236,3 @@ class AsyncKVTransferQueue:
 
 # 旧类名保留为别名，避免当前 AsyncKVScheduler 和历史测试一次性大改。
 AsyncKVSchedulePolicy = AsyncKVTransferQueue
-

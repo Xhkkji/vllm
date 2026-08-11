@@ -677,8 +677,8 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             ))
         return public
 
-    def commit_mds_prefix_restore(self, reservation_id: str) -> None:
-        """在 MDS READY 后发布 restored prefix 的 computed 语义。"""
+    def commit_mds_prefix_restore(self, reservation_id: str) -> int:
+        """发布 restored prefix，并返回可推进的连续 prefix token 数。"""
         record = self._prefix_restore_reservations.pop(reservation_id)
         self.block_allocator.publish_pending_restore_blocks(
             list(record.pending_target_blocks), Device.GPU)
@@ -698,6 +698,27 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         for logical_index, source_block in enumerate(record.source_blocks):
             key = LogicalBlockKey(record.seq.seq_id, logical_index)
             self._storage_replicas[key] = source_block
+        return record.public.num_prefix_blocks * self.block_size
+
+    def admit_mds_prefix_restore_for_layer_barrier(
+            self, reservation_id: str) -> int:
+        """允许层屏障请求跳过 prefix 重新计算，但暂不发布 hash。
+
+        目标 GPU block 在 reservation 创建时已经进入该 sequence 的 block
+        table，且仍被 ``pending_restore`` 集合持有，不会被 prefix lookup 或
+        其他请求复用。首个 layer window READY 后，模型可以在每层 barrier
+        的保护下使用这些地址；因此这里只推进本请求的 cached-token
+        frontier，让原生 chunked prefill 从 suffix 开始。
+
+        特意不调用 ``publish_pending_restore_blocks``：后续 layer 的 DMA
+        可能仍在写相同 logical prefix 的其他层，此时提前注册 hash 会把
+        未完成 KV 暴露为新的全局 prefix cache 命中。
+        """
+        record = self._prefix_restore_reservations[reservation_id]
+        restored_tokens = record.public.num_prefix_blocks * self.block_size
+        self._computed_blocks_tracker.set_num_cached_tokens(
+            record.seq, restored_tokens)
+        return restored_tokens
 
     def abort_mds_prefix_restore(self, reservation_id: str) -> None:
         """取消 prefix read，并释放临时持有的 SSD source 引用。"""

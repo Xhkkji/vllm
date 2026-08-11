@@ -95,6 +95,7 @@ def test_bam_mds_prefix_store_restore_uses_native_computed_semantics(
     scheduler.complete_ready_async_kv_transfers()
     assert reuse_seq.status == SequenceStatus.RUNNING
     assert list(scheduler.running) == [reuse_group]
+    assert reuse_seq.get_num_computed_tokens() == len(populate_tokens)
 
     metadata, scheduled = schedule_and_update_computed_tokens(scheduler)
     assert scheduled.scheduled_seq_groups[0].seq_group == reuse_group
@@ -190,6 +191,210 @@ def test_bam_mds_prefix_restore_overlaps_running_compute(monkeypatch):
     for group in reuse_groups:
         assert len(scheduler.block_manager.get_block_table(
             group.first_seq)) == 2
+
+
+def test_bam_mds_hierarchical_prefix_first_window_admission(monkeypatch):
+    """首窗 READY 只准入控制面；全窗 READY 后才能发布并执行。"""
+    monkeypatch.setenv("VLLM_BAM_MDS_PREFIX_ENABLE", "1")
+    monkeypatch.setenv("VLLM_BAM_MDS_HIERARCHICAL_IO_ENABLE", "1")
+    monkeypatch.setenv("VLLM_BAM_MDS_HIERARCHICAL_NUM_LAYERS", "4")
+    monkeypatch.setenv("VLLM_BAM_MDS_HIERARCHICAL_WINDOW_LAYERS", "2")
+    scheduler = _create_scheduler(enable_prefix_caching=True)
+
+    prefix_tokens = list(range(8))
+    source_seq, source_group = create_dummy_prompt(
+        "90", prompt_tokens=prefix_tokens, block_size=4)
+    scheduler.add_seq_group(source_group)
+    schedule_and_update_computed_tokens(scheduler)
+    source_seq.status = SequenceStatus.FINISHED_STOPPED
+    scheduler.free_seq(source_seq)
+    scheduler.free_finished_seq_groups()
+    store = scheduler.drain_async_kv_transfers_to_submit()[0]
+    assert store.layer_range is None
+    scheduler.apply_async_kv_event(
+        AsyncKVTransferEvent(store.request_id,
+                             AsyncKVTransferState.READY))
+    scheduler.complete_ready_async_kv_transfers()
+    assert scheduler.block_manager.reset_prefix_cache(Device.GPU)
+
+    reuse_seq, reuse_group = create_dummy_prompt(
+        "91",
+        prompt_tokens=prefix_tokens + [100, 101, 102, 103],
+        block_size=4,
+    )
+    scheduler.add_seq_group(reuse_group)
+    assert scheduler._maybe_start_bam_mds_prefix_restore() == 1
+    windows = scheduler.drain_async_kv_transfers_to_submit()
+    assert [request.layer_range for request in windows] == [(0, 2), (2, 4)]
+    assert len({request.reservation_id for request in windows}) == 1
+
+    # 第一组层已经在 GPU，但完整 block hash 仍不可发布，也不能进入 running。
+    scheduler.apply_async_kv_event(
+        AsyncKVTransferEvent(windows[0].request_id,
+                             AsyncKVTransferState.READY))
+    scheduler.complete_ready_async_kv_transfers()
+    assert scheduler.get_hierarchical_admitted_seq_group_ids() == (
+        reuse_group.request_id, )
+    assert reuse_seq.status == SequenceStatus.WAITING
+    assert reuse_group not in scheduler.running
+    assert scheduler.block_manager.get_mds_cached_prefix_blocks(
+        reuse_seq, Device.GPU) == 0
+
+    scheduler.apply_async_kv_event(
+        AsyncKVTransferEvent(windows[1].request_id,
+                             AsyncKVTransferState.READY))
+    scheduler.complete_ready_async_kv_transfers()
+    assert not scheduler.get_hierarchical_admitted_seq_group_ids()
+    assert reuse_seq.status == SequenceStatus.RUNNING
+    assert reuse_group in scheduler.running
+    assert scheduler.block_manager.get_mds_cached_prefix_blocks(
+        reuse_seq, Device.GPU) == 2
+
+
+def test_bam_mds_layer_barrier_dispatches_after_first_window(monkeypatch):
+    """Step 4 只提前 dispatch，后续 window 完成前仍不可发布 prefix hash。"""
+    monkeypatch.setenv("VLLM_BAM_MDS_PREFIX_ENABLE", "1")
+    monkeypatch.setenv("VLLM_BAM_MDS_HIERARCHICAL_IO_ENABLE", "1")
+    monkeypatch.setenv("VLLM_BAM_MDS_HIERARCHICAL_NUM_LAYERS", "4")
+    monkeypatch.setenv("VLLM_BAM_MDS_HIERARCHICAL_WINDOW_LAYERS", "2")
+    monkeypatch.setenv("VLLM_BAM_MDS_HIERARCHICAL_LAYER_BARRIER", "1")
+    scheduler = _create_scheduler(enable_prefix_caching=True)
+
+    prefix_tokens = list(range(8))
+    source_seq, source_group = create_dummy_prompt(
+        "96", prompt_tokens=prefix_tokens, block_size=4)
+    scheduler.add_seq_group(source_group)
+    schedule_and_update_computed_tokens(scheduler)
+    source_seq.status = SequenceStatus.FINISHED_STOPPED
+    scheduler.free_seq(source_seq)
+    scheduler.free_finished_seq_groups()
+    store = scheduler.drain_async_kv_transfers_to_submit()[0]
+    scheduler.apply_async_kv_event(
+        AsyncKVTransferEvent(store.request_id, AsyncKVTransferState.READY))
+    scheduler.complete_ready_async_kv_transfers()
+    assert scheduler.block_manager.reset_prefix_cache(Device.GPU)
+
+    reuse_seq, reuse_group = create_dummy_prompt(
+        "97",
+        prompt_tokens=prefix_tokens + [100, 101, 102, 103],
+        block_size=4,
+    )
+    scheduler.add_seq_group(reuse_group)
+    assert scheduler._maybe_start_bam_mds_prefix_restore() == 1
+    windows = scheduler.drain_async_kv_transfers_to_submit()
+
+    scheduler.apply_async_kv_event(
+        AsyncKVTransferEvent(windows[0].request_id,
+                             AsyncKVTransferState.READY))
+    scheduler.complete_ready_async_kv_transfers()
+    # scheduler 可从 suffix prefill 开始；真实的 layer-by-layer 安全性由
+    # Worker barrier 在 forward 内保证，因而这些 pending block 尚未可命中。
+    assert reuse_seq.status == SequenceStatus.RUNNING
+    assert reuse_group in scheduler.running
+    assert reuse_seq.get_num_computed_tokens() == len(prefix_tokens)
+    assert scheduler.block_manager.get_mds_cached_prefix_blocks(
+        reuse_seq, Device.GPU) == 0
+
+    scheduler.apply_async_kv_event(
+        AsyncKVTransferEvent(windows[1].request_id,
+                             AsyncKVTransferState.READY))
+    scheduler.complete_ready_async_kv_transfers()
+    assert scheduler.block_manager.get_mds_cached_prefix_blocks(
+        reuse_seq, Device.GPU) == 2
+    assert scheduler.running.count(reuse_group) == 1
+
+
+def test_bam_mds_hierarchical_full_hit_recomputes_only_last_token(monkeypatch):
+    """完整 block hit 仍须保留最后一个 prompt token 给模型执行。"""
+    monkeypatch.setenv("VLLM_BAM_MDS_PREFIX_ENABLE", "1")
+    monkeypatch.setenv("VLLM_BAM_MDS_HIERARCHICAL_IO_ENABLE", "1")
+    monkeypatch.setenv("VLLM_BAM_MDS_HIERARCHICAL_NUM_LAYERS", "4")
+    monkeypatch.setenv("VLLM_BAM_MDS_HIERARCHICAL_WINDOW_LAYERS", "2")
+    scheduler = _create_scheduler(enable_prefix_caching=True)
+
+    prompt_tokens = list(range(8))
+    source_seq, source_group = create_dummy_prompt(
+        "94", prompt_tokens=prompt_tokens, block_size=4)
+    scheduler.add_seq_group(source_group)
+    schedule_and_update_computed_tokens(scheduler)
+    source_seq.status = SequenceStatus.FINISHED_STOPPED
+    scheduler.free_seq(source_seq)
+    scheduler.free_finished_seq_groups()
+    store = scheduler.drain_async_kv_transfers_to_submit()[0]
+    scheduler.apply_async_kv_event(
+        AsyncKVTransferEvent(store.request_id,
+                             AsyncKVTransferState.READY))
+    scheduler.complete_ready_async_kv_transfers()
+    assert scheduler.block_manager.reset_prefix_cache(Device.GPU)
+
+    reuse_seq, reuse_group = create_dummy_prompt(
+        "95", prompt_tokens=prompt_tokens, block_size=4)
+    scheduler.add_seq_group(reuse_group)
+    assert scheduler._maybe_start_bam_mds_prefix_restore() == 1
+    windows = scheduler.drain_async_kv_transfers_to_submit()
+    for request in windows:
+        scheduler.apply_async_kv_event(
+            AsyncKVTransferEvent(request.request_id,
+                                 AsyncKVTransferState.READY))
+    scheduler.complete_ready_async_kv_transfers()
+
+    assert reuse_seq.status == SequenceStatus.RUNNING
+    assert reuse_seq.get_num_computed_tokens() == len(prompt_tokens) - 1
+    _, scheduled = schedule_and_update_computed_tokens(scheduler)
+    assert scheduled.scheduled_seq_groups[0].token_chunk_size == 1
+
+
+def test_bam_mds_hierarchical_abort_waits_for_all_windows(monkeypatch):
+    """首窗准入后 abort 也必须等待其余 DMA，不能提前释放 target。"""
+    monkeypatch.setenv("VLLM_BAM_MDS_PREFIX_ENABLE", "1")
+    monkeypatch.setenv("VLLM_BAM_MDS_HIERARCHICAL_IO_ENABLE", "1")
+    monkeypatch.setenv("VLLM_BAM_MDS_HIERARCHICAL_NUM_LAYERS", "4")
+    monkeypatch.setenv("VLLM_BAM_MDS_HIERARCHICAL_WINDOW_LAYERS", "2")
+    scheduler = _create_scheduler(enable_prefix_caching=True)
+
+    prefix_tokens = list(range(8))
+    source_seq, source_group = create_dummy_prompt(
+        "92", prompt_tokens=prefix_tokens, block_size=4)
+    scheduler.add_seq_group(source_group)
+    schedule_and_update_computed_tokens(scheduler)
+    source_seq.status = SequenceStatus.FINISHED_STOPPED
+    scheduler.free_seq(source_seq)
+    scheduler.free_finished_seq_groups()
+    store = scheduler.drain_async_kv_transfers_to_submit()[0]
+    scheduler.apply_async_kv_event(
+        AsyncKVTransferEvent(store.request_id,
+                             AsyncKVTransferState.READY))
+    scheduler.complete_ready_async_kv_transfers()
+    assert scheduler.block_manager.reset_prefix_cache(Device.GPU)
+
+    reuse_seq, reuse_group = create_dummy_prompt(
+        "93",
+        prompt_tokens=prefix_tokens + [100, 101, 102, 103],
+        block_size=4,
+    )
+    free_gpu_before_restore = scheduler.block_manager.get_num_free_gpu_blocks()
+    scheduler.add_seq_group(reuse_group)
+    assert scheduler._maybe_start_bam_mds_prefix_restore() == 1
+    windows = scheduler.drain_async_kv_transfers_to_submit()
+
+    scheduler.apply_async_kv_event(
+        AsyncKVTransferEvent(windows[0].request_id,
+                             AsyncKVTransferState.READY))
+    scheduler.complete_ready_async_kv_transfers()
+    scheduler.abort_seq_group(reuse_group.request_id)
+    assert reuse_seq.status == SequenceStatus.FINISHED_ABORTED
+    assert scheduler.block_manager.get_num_free_gpu_blocks() == (
+        free_gpu_before_restore - 2)
+
+    scheduler.apply_async_kv_event(
+        AsyncKVTransferEvent(windows[1].request_id,
+                             AsyncKVTransferState.READY))
+    scheduler.complete_ready_async_kv_transfers()
+    assert scheduler.block_manager.get_num_free_gpu_blocks() == (
+        free_gpu_before_restore)
+    assert not scheduler.hierarchical_prefix_loading
+    assert not scheduler.hierarchical_prefix_admitted
+    assert not scheduler.block_manager._prefix_restore_reservations
 
 
 @pytest.mark.parametrize(

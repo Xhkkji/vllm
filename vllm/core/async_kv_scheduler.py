@@ -20,6 +20,9 @@ from vllm.core.scheduler import (Scheduler, SchedulerSwappedInOutputs,
 from vllm.core.custom_schedulers.async_kv_transfer import (
     AsyncKVExecutionMarker, AsyncKVSchedulePolicy, AsyncKVTransferEvent,
     AsyncKVTransferOperation, AsyncKVTransferRequest)
+from vllm.core.custom_schedulers.hierarchical_io import (
+    HierarchicalIOConfig, HierarchicalLayerBarrierConfig,
+    HierarchicalRestoreController)
 from vllm.logger import init_logger
 from vllm.sequence import Sequence, SequenceGroup, SequenceStatus
 
@@ -78,16 +81,58 @@ class AsyncKVScheduler(Scheduler):
         # 两者只复用底层 MDS transfer queue，READY 后的队列迁移语义不同，
         # 因此不能通过伪造 SWAPPED 状态混在 loading/saving 中。
         self.bam_mds_prefix_enabled = envs.VLLM_BAM_MDS_PREFIX_ENABLE
-        if self.bam_mds_prefix_enabled and not cache_config.enable_prefix_caching:
+        if (self.bam_mds_prefix_enabled
+                and not cache_config.enable_prefix_caching):
             raise ValueError(
                 "VLLM_BAM_MDS_PREFIX_ENABLE requires --enable-prefix-caching")
         self.prefix_loading: dict[str, SequenceGroup] = {}
         self.prefix_saving: dict[str, SequenceGroup] = {}
+        self.hierarchical_io_config = HierarchicalIOConfig.from_env()
+        self.hierarchical_layer_barrier_config = (
+            HierarchicalLayerBarrierConfig.from_env())
+        if (self.hierarchical_io_config.enabled
+                and not self.bam_mds_prefix_enabled):
+            raise ValueError(
+                "hierarchical MDS I/O requires VLLM_BAM_MDS_PREFIX_ENABLE")
+        if (self.hierarchical_layer_barrier_config.enabled
+                and not self.hierarchical_io_config.enabled):
+            raise ValueError(
+                "hierarchical layer barrier requires hierarchical MDS I/O")
+        if self.hierarchical_layer_barrier_config.enabled:
+            # forward 期间 Worker 只能轮询已提交的 MDS handle，无法安全地
+            # 越过 Engine/Scheduler 自己激活 queued request。因此 Step 4 的
+            # 最小正确版本要求一个父 restore 的所有 window 同时 in-flight。
+            # 否则模型到达第 5 个 window 时可能等待尚未 submit 的第 5 笔 I/O。
+            required_windows = (
+                (self.hierarchical_io_config.num_layers +
+                 self.hierarchical_io_config.window_layers - 1) //
+                self.hierarchical_io_config.window_layers)
+            if self.async_kv_policy.max_in_flight < required_windows:
+                raise ValueError(
+                    "hierarchical layer barrier requires "
+                    "VLLM_BAM_MDS_MAX_IN_FLIGHT >= number of layer windows "
+                    f"({required_windows})")
+        self.hierarchical_prefix_restores = HierarchicalRestoreController()
+        # key 是父 reservation/plan id，而不是 window request id。一个请求
+        # 无论拆成多少层窗口，都只占一个 scheduler sequence slot。
+        self.hierarchical_prefix_loading: dict[str, SequenceGroup] = {}
+        # 首窗 READY 后进入“已准入但禁止 dispatch”的显式状态。Step 2 只
+        # 建立控制面边界；Step 4 接入 model layer barrier 前不能放进 running。
+        self.hierarchical_prefix_admitted: Set[str] = set()
         self._prefix_restore_admission_blocked = False
         logger.info(
             "[BAM_MDS_PREFIX] phase=init enabled=%s block_size=%d",
             self.bam_mds_prefix_enabled,
             cache_config.block_size,
+        )
+        logger.info(
+            "[BAM_MDS_HIERARCHICAL] phase=init enabled=%s "
+            "num_layers=%d window_layers=%d dispatch_gate=%s",
+            self.hierarchical_io_config.enabled,
+            self.hierarchical_io_config.num_layers,
+            self.hierarchical_io_config.window_layers,
+            ("layer_barrier"
+             if self.hierarchical_layer_barrier_config.enabled else "closed"),
         )
         self._chunked_priority_waiting_id: Optional[str] = None
         self._chunked_priority_preempted_victims: Set[str] = set()
@@ -157,7 +202,8 @@ class AsyncKVScheduler(Scheduler):
         return sum(
             group.get_max_num_running_seqs()
             for group in (*self.loading.values(),
-                          *self.prefix_loading.values()))
+                          *self.prefix_loading.values(),
+                          *self.hierarchical_prefix_loading.values()))
 
     def _schedule_chunked_prefill_with_reserved_slots(self):
         """在不复制父类调度器的前提下，为异步 read 保留 sequence slot。
@@ -218,7 +264,8 @@ class AsyncKVScheduler(Scheduler):
             sum(group.get_max_num_running_seqs() for group in self.running) +
             self._num_async_read_sequence_slots())
         max_prefix_loads = (self.async_kv_policy.max_in_flight -
-                            len(self.loading) - len(self.prefix_loading))
+                            len(self.loading) - len(self.prefix_loading) -
+                            len(self.hierarchical_prefix_loading))
         if max_seq_slots <= 0 or max_prefix_loads <= 0:
             return 0
 
@@ -265,24 +312,69 @@ class AsyncKVScheduler(Scheduler):
                 self._prefix_restore_admission_blocked = True
                 break
             self.waiting.remove(seq_group)
-            request = self._enqueue_async_kv_transfer(
-                seq_group,
-                reservation,
-                AsyncKVTransferOperation.READ,
-                prefix=True,
-            )
-            logger.info(
-                "[BAM_MDS_PREFIX] phase=restore_queued request_id=%s "
-                "seq_group_id=%s storage_prefix_blocks=%d "
-                "gpu_prefix_blocks=%d read_blocks=%d",
-                request.request_id,
-                seq_group.request_id,
-                storage_prefix_blocks,
-                gpu_prefix_blocks,
-                len(reservation.block_mapping),
-            )
+            if self.hierarchical_io_config.enabled:
+                self._enqueue_hierarchical_prefix_restore(seq_group,
+                                                          reservation)
+            else:
+                request = self._enqueue_async_kv_transfer(
+                    seq_group,
+                    reservation,
+                    AsyncKVTransferOperation.READ,
+                    prefix=True,
+                )
+                logger.info(
+                    "[BAM_MDS_PREFIX] phase=restore_queued request_id=%s "
+                    "seq_group_id=%s storage_prefix_blocks=%d "
+                    "gpu_prefix_blocks=%d read_blocks=%d",
+                    request.request_id,
+                    seq_group.request_id,
+                    storage_prefix_blocks,
+                    gpu_prefix_blocks,
+                    len(reservation.block_mapping),
+                )
             started += 1
         return started
+
+    def _enqueue_hierarchical_prefix_restore(
+        self,
+        seq_group: SequenceGroup,
+        reservation: BlockPrefixRestoreReservation,
+    ) -> None:
+        """为同一个 prefix reservation 建立多个 layer-window 子请求。"""
+        plan = self.hierarchical_io_config.build_plan(
+            reservation.reservation_id)
+        requests = tuple(
+            self.async_kv_policy.enqueue(
+                seq_group.request_id,
+                reservation.reservation_id,
+                AsyncKVTransferOperation.READ,
+                reservation.block_mapping,
+                reservation.logical_blocks,
+                layer_range=window.layer_range,
+            ) for window in plan.windows)
+        self.hierarchical_prefix_restores.register(
+            plan, tuple(request.request_id for request in requests))
+        self.hierarchical_prefix_loading[plan.plan_id] = seq_group
+
+        logger.info(
+            "[BAM_MDS_HIERARCHICAL] phase=plan_queued plan_id=%s "
+            "seq_group_id=%s windows=%d blocks=%d",
+            plan.plan_id,
+            seq_group.request_id,
+            len(plan.windows),
+            len(reservation.block_mapping),
+        )
+        for request, window in zip(requests, plan.windows):
+            logger.info(
+                "[BAM_MDS_HIERARCHICAL] phase=window_queued plan_id=%s "
+                "request_id=%s window=%d/%d layer_range=[%d,%d)",
+                plan.plan_id,
+                request.request_id,
+                window.index,
+                len(plan.windows),
+                window.start_layer,
+                window.end_layer,
+            )
 
     def _preempt_long_context_victims_for_waiting(self) -> int:
         """主动制造长上下文 HBM/SSD 迁移压力的实验策略。
@@ -474,6 +566,7 @@ class AsyncKVScheduler(Scheduler):
         """把 reservation 中的请求计入 Engine 未完成判断。"""
         return (bool(self.loading) or bool(self.saving)
                 or bool(self.prefix_loading) or bool(self.prefix_saving)
+                or bool(self.hierarchical_prefix_loading)
                 or super().has_unfinished_seqs())
 
     def get_num_unfinished_seq_groups(self) -> int:
@@ -481,6 +574,7 @@ class AsyncKVScheduler(Scheduler):
         # saving 请求通常已经在原生 swapped 队列中，只为不在原生三队列
         # 中的 loading 请求额外计数，避免统计翻倍。
         return (len(self.loading) + len(self.prefix_loading)
+                + len(self.hierarchical_prefix_loading)
                 + len(self.prefix_saving)
                 + super().get_num_unfinished_seq_groups())
 
@@ -497,6 +591,11 @@ class AsyncKVScheduler(Scheduler):
         ready = self.async_kv_policy.pop_ready()
         ready_groups: List[SequenceGroup] = []
         for request in ready:
+            if self.hierarchical_prefix_restores.contains_request(
+                    request.request_id):
+                self._complete_hierarchical_prefix_window(
+                    request, succeeded=True, ready_groups=ready_groups)
+                continue
             is_prefix_restore = request.request_id in self.prefix_loading
             is_prefix_store = request.request_id in self.prefix_saving
             lifecycle = (self.loading
@@ -525,8 +624,10 @@ class AsyncKVScheduler(Scheduler):
                 continue
 
             if is_prefix_restore:
-                self.block_manager.commit_mds_prefix_restore(
+                restored_prefix_tokens = self.block_manager.commit_mds_prefix_restore(
                     request.reservation_id)
+                self._advance_restored_prefix_frontier(
+                    seq_group, restored_prefix_tokens)
             else:
                 self.block_manager.commit_block_swap(request.reservation_id)
             committed_ns = time.monotonic_ns()
@@ -584,13 +685,15 @@ class AsyncKVScheduler(Scheduler):
                         marker.promoted_monotonic_ns,
                     )
 
-        for seq_group in reversed(ready_groups):
-            self.running.appendleft(seq_group)
-
         # MDS poll 失败时，异步请求已经不能再被 attention 使用。将它们
         # 标记为 ignored，并释放已经预留的 GPU block，避免 block 泄漏。
         for load in self.async_kv_policy.pop_errors():
             request = load.request
+            if self.hierarchical_prefix_restores.contains_request(
+                    request.request_id):
+                self._complete_hierarchical_prefix_window(
+                    request, succeeded=False, ready_groups=ready_groups)
+                continue
             # abort 只登记“完成后丢弃”，不会中止正在进行的 DMA。后端既可能
             # 回 READY，也可能回 ERROR；两种终态都必须消费取消标记，否则
             # 控制面会留下一个永远无法再次完成的 request id。
@@ -624,6 +727,161 @@ class AsyncKVScheduler(Scheduler):
                     if not seq.is_finished():
                         seq.status = SequenceStatus.FINISHED_IGNORED
                 super()._free_finished_seq_group(seq_group)
+
+        # error 分支可能让父事务在本轮最后一个 window 才达到终态，因此
+        # ready_groups 的统一入队必须放在 ready/error 两部分都处理完之后。
+        for seq_group in reversed(ready_groups):
+            if seq_group not in self.running:
+                self.running.appendleft(seq_group)
+
+    def _complete_hierarchical_prefix_window(
+        self,
+        request: AsyncKVTransferRequest,
+        *,
+        succeeded: bool,
+        ready_groups: List[SequenceGroup],
+    ) -> None:
+        """推进一个 window，并在父事务终态执行唯一一次 commit/abort。"""
+        if succeeded:
+            progress = self.hierarchical_prefix_restores.mark_ready(
+                request.request_id)
+        else:
+            progress = self.hierarchical_prefix_restores.mark_error(
+                request.request_id)
+        seq_group = self.hierarchical_prefix_loading.get(progress.plan_id)
+        if seq_group is None:
+            raise RuntimeError(
+                f"missing hierarchical prefix plan: {progress.plan_id}")
+
+        logger.info(
+            "[BAM_MDS_HIERARCHICAL] phase=window_%s plan_id=%s "
+            "request_id=%s seq_group_id=%s window=%d layer_range=[%d,%d)",
+            "ready" if succeeded else "error",
+            progress.plan_id,
+            request.request_id,
+            seq_group.request_id,
+            progress.window.index,
+            progress.window.start_layer,
+            progress.window.end_layer,
+        )
+        if progress.first_window_became_ready:
+            # 这是 Step 2 的 first-window-ready admission。该集合表示调度器
+            # 已接受请求并可在未来交给 layer pipeline；当前不修改 RUNNING
+            # 状态，确保 Step 4 之前完整 model forward 看不到半恢复 KV。
+            self.hierarchical_prefix_admitted.add(progress.plan_id)
+            logger.info(
+                "[BAM_MDS_HIERARCHICAL] phase=first_window_admitted "
+                "plan_id=%s seq_group_id=%s potential_restore_ttft_ms=%.3f "
+                "dispatch_gate=%s",
+                progress.plan_id,
+                seq_group.request_id,
+                (progress.first_window_ready_monotonic_ns -
+                 progress.plan_created_monotonic_ns) / 1.0e6,
+                ("layer_barrier" if self.hierarchical_layer_barrier_config.
+                 enabled else "closed"),
+            )
+            if self.hierarchical_layer_barrier_config.enabled:
+                # Step 4 的唯一 scheduler 语义变化：首窗完成即可让 native
+                # chunked prefill 调度 suffix。pending target 尚未 publish，
+                # 只能由 worker 的逐层 barrier 读取，绝不成为全局 hash 命中。
+                restored_prefix_tokens = (
+                    self.block_manager.
+                    admit_mds_prefix_restore_for_layer_barrier(
+                        progress.plan_id))
+                self._advance_restored_prefix_frontier(
+                    seq_group, restored_prefix_tokens)
+                for seq in seq_group.get_seqs(
+                        status=SequenceStatus.WAITING):
+                    seq.status = SequenceStatus.RUNNING
+                ready_groups.append(seq_group)
+                logger.info(
+                    "[BAM_MDS_HIERARCHICAL] phase=layer_barrier_dispatch "
+                    "plan_id=%s seq_group_id=%s restored_prefix_tokens=%d",
+                    progress.plan_id,
+                    seq_group.request_id,
+                    restored_prefix_tokens,
+                )
+
+        if not progress.all_terminal:
+            return
+
+        self.hierarchical_prefix_admitted.discard(progress.plan_id)
+        if progress.all_ready and not progress.cancelled:
+            restored_prefix_tokens = (
+                self.block_manager.commit_mds_prefix_restore(progress.plan_id))
+            # barrier 模式已在首窗 READY 时推进 frontier 并转为 RUNNING；
+            # 全部 window 结束时仅发布 hash/SSD replica，不能重复入队。
+            already_dispatched = self.hierarchical_layer_barrier_config.enabled
+            if not already_dispatched:
+                self._advance_restored_prefix_frontier(seq_group,
+                                                       restored_prefix_tokens)
+            committed_ns = time.monotonic_ns()
+            if not already_dispatched:
+                for seq in seq_group.get_seqs(status=SequenceStatus.WAITING):
+                    seq.status = SequenceStatus.RUNNING
+                ready_groups.append(seq_group)
+            logger.info(
+                "[BAM_MDS_HIERARCHICAL] phase=full_restore_ready "
+                "plan_id=%s seq_group_id=%s full_restore_ms=%.3f "
+                "first_to_full_gap_ms=%.3f",
+                progress.plan_id,
+                seq_group.request_id,
+                (committed_ns - progress.plan_created_monotonic_ns) / 1.0e6,
+                (committed_ns - progress.first_window_ready_monotonic_ns)
+                / 1.0e6,
+            )
+        else:
+            # 任一 window 失败，或者首窗准入后用户 abort，都不能发布这个
+            # prefix。此处已经确认全部子 DMA 终态，释放 target 才是安全的。
+            self.block_manager.abort_mds_prefix_restore(progress.plan_id)
+            for seq in seq_group.get_seqs():
+                if not seq.is_finished():
+                    seq.status = (SequenceStatus.FINISHED_ABORTED
+                                  if progress.cancelled else
+                                  SequenceStatus.FINISHED_IGNORED)
+            super()._free_finished_seq_group(seq_group)
+            logger.info(
+                "[BAM_MDS_HIERARCHICAL] phase=restore_aborted "
+                "plan_id=%s seq_group_id=%s failed=%s cancelled=%s",
+                progress.plan_id,
+                seq_group.request_id,
+                progress.failed,
+                progress.cancelled,
+            )
+
+        self.hierarchical_prefix_restores.release(progress.plan_id)
+        del self.hierarchical_prefix_loading[progress.plan_id]
+
+    @staticmethod
+    def _advance_restored_prefix_frontier(
+        seq_group: SequenceGroup,
+        restored_prefix_tokens: int,
+    ) -> None:
+        """补齐直接从 loading 提升到 running 时的 cached-token 记账。
+
+        原生 prefix admission 会把 ``cached + uncached`` 一起放进第一次
+        ScheduledSequenceGroup；output processor 随后一次性推进 sequence 的
+        computed frontier。MDS restore READY 后直接进入 running，绕过了这次
+        waiting admission。如果只发布 block hash 而不推进 sequence frontier，
+        running scheduler 会把同一小段 suffix 重复执行，直到累计 token 数
+        追上 prefix。
+
+        全 prompt 命中是唯一例外：vLLM 必须重新执行最后一个 token 来生成
+        prompt logits，所以最多推进到 ``prompt_len - 1``。这里只修改 sequence
+        的逻辑计算边界；pending block 的发布仍由 block manager 事务负责。
+        """
+        for seq in seq_group.get_seqs(status=SequenceStatus.WAITING):
+            target = min(restored_prefix_tokens, max(0, seq.get_len() - 1))
+            current = seq.get_num_computed_tokens()
+            if target > current:
+                seq.data.update_num_computed_tokens(target - current)
+
+    def get_hierarchical_admitted_seq_group_ids(self) -> Tuple[str, ...]:
+        """返回首窗已 READY、但 dispatch safety gate 尚未放行的请求。"""
+        return tuple(
+            seq_group.request_id
+            for plan_id, seq_group in self.hierarchical_prefix_loading.items()
+            if plan_id in self.hierarchical_prefix_admitted)
 
     def _free_completed_mds_prefix_store(
             self, seq_group: SequenceGroup) -> None:
@@ -774,6 +1032,22 @@ class AsyncKVScheduler(Scheduler):
                 self._remove_from_swapped(seq_group)
 
         super().abort_seq_group(request_ids, seq_id_to_seq_group)
+        # 层级 restore 的 group 已从 waiting 摘出，但在 full restore 前也未放
+        # 入 running，因此父类看不到它。这里只标记父事务取消；所有 window
+        # 仍正常走到 READY/ERROR，最后一个终态才会触发安全 abort reservation。
+        for plan_id, seq_group in tuple(
+                self.hierarchical_prefix_loading.items()):
+            real_request_id = seq_group.request_id
+            if seq_group.request_id in seq_id_to_seq_group:
+                real_request_id = seq_id_to_seq_group[
+                    seq_group.request_id].group_id
+            if real_request_id not in request_ids:
+                continue
+            self.hierarchical_prefix_restores.cancel_plan(plan_id)
+            for seq in seq_group.get_seqs():
+                if not seq.is_finished():
+                    seq.status = SequenceStatus.FINISHED_ABORTED
+
         # READY 但尚未进入执行 batch 的请求可能在这里被取消。删除纯观测
         # marker，避免一次永远不会发生的 first_execute 长期占用记录。
         for seq_group_id in tuple(self._async_kv_execution_markers):

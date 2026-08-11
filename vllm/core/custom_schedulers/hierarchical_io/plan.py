@@ -77,6 +77,7 @@ class RollingPrefetchConfig:
     lead_windows: int = 1
     max_lead_windows: int = 1
     target_slack_ms: float = 0.0
+    activation_backend: str = "host"
 
     @classmethod
     def from_env(
@@ -96,6 +97,8 @@ class RollingPrefetchConfig:
             str(lead_windows)))
         target_slack_ms = float(values.get(
             "VLLM_BAM_MDS_HIERARCHICAL_TARGET_SLACK_MS", "0"))
+        activation_backend = values.get(
+            "VLLM_BAM_MDS_HIERARCHICAL_ACTIVATION_BACKEND", "host").lower()
         if lead_windows < 0:
             raise ValueError(
                 "VLLM_BAM_MDS_HIERARCHICAL_LEAD_WINDOWS must be non-negative")
@@ -106,10 +109,16 @@ class RollingPrefetchConfig:
         if target_slack_ms < 0:
             raise ValueError(
                 "VLLM_BAM_MDS_HIERARCHICAL_TARGET_SLACK_MS must be non-negative")
+        if activation_backend not in ("host", "gpu_visible",
+                                      "resident_event", "gpu_native"):
+            raise ValueError(
+                "VLLM_BAM_MDS_HIERARCHICAL_ACTIVATION_BACKEND must be "
+                "host, gpu_visible, resident_event or gpu_native")
         return cls(enabled=True,
                    lead_windows=lead_windows,
                    max_lead_windows=max_lead_windows,
-                   target_slack_ms=target_slack_ms)
+                   target_slack_ms=target_slack_ms,
+                   activation_backend=activation_backend)
 
     @property
     def initial_windows(self) -> int:

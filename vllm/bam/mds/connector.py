@@ -84,6 +84,9 @@ class BaMMDSConnector:
         self._prefetch_templates: dict[
             str, tuple[str, tuple[tuple[int, int], ...], str,
                        Optional[Tuple[int, int]]]] = {}
+        # gpu_native 每个 plan 只暴露一个 int64 frontier。Tensor 指向
+        # cudaHostRegisterMapped 的共享 mmap 字段，不拥有底层内存。
+        self._prefetch_frontiers: dict[str, torch.Tensor] = {}
         try:
             self.gpu_cache = self._allocate_and_wrap()
         except Exception:
@@ -245,13 +248,22 @@ class BaMMDSConnector:
         self,
         plan_id: str,
         units: Sequence[tuple[str, torch.Tensor, str,
-                              Optional[Tuple[int, int]]]],
+                              Optional[Tuple[int, int]], bool]],
     ) -> None:
         """一次登记完整 plan 的 descriptor templates，不提交 I/O。"""
         staged: dict[str, tuple[dict[str, Any], str]] = {}
-        for request_id, mapping_tensor, operation, layer_range in units:
+        activation_prefix = 0
+        saw_staged = False
+        for request_id, mapping_tensor, operation, layer_range, activate in units:
             if operation not in ("read", "write"):
                 raise ValueError(f"unsupported MDS operation: {operation}")
+            if activate:
+                if saw_staged:
+                    raise ValueError(
+                        "initial prefetch activation must be a contiguous prefix")
+                activation_prefix += 1
+            else:
+                saw_staged = True
             layer_range = self._validate_layer_range(layer_range)
             mapping, payload = self._mapping_payload(
                 mapping_tensor, operation=operation, layer_range=layer_range)
@@ -261,7 +273,22 @@ class BaMMDSConnector:
             self._prefetch_templates[request_id] = (
                 plan_id, mapping, operation, layer_range)
         try:
-            self.client.register_prefetch_plan(plan_id, staged)
+            native_activation = (
+                envs.VLLM_BAM_MDS_HIERARCHICAL_ACTIVATION_BACKEND.lower()
+                == "gpu_native")
+            binding = self.client.register_prefetch_plan(
+                plan_id,
+                staged,
+                native_activation=native_activation,
+                initial_frontier=activation_prefix - 1,
+            )
+            if binding is not None:
+                frontier = self.bridge.tensor_from_cuda_ptr(
+                    binding.authorized_frontier_device_ptr,
+                    [1], [1], "int64", self.layout.device_index)
+                if frontier.dtype != torch.int64 or not frontier.is_cuda:
+                    raise RuntimeError("invalid MDS GPU frontier tensor")
+                self._prefetch_frontiers[plan_id] = frontier
         except Exception:
             for request_id in staged:
                 self._prefetch_templates.pop(request_id, None)
@@ -313,6 +340,19 @@ class BaMMDSConnector:
             prefetch_plan_id=plan_id,
         )
         return False
+
+    def advance_prefetch_plan_gpu(self, plan_id: str,
+                                  unit_index: int) -> None:
+        """在当前 model stream 上排队一次 GPU doorbell store。
+
+        ``fill_`` 是异步 CUDA kernel；函数返回不代表 store 已执行。只有此前
+        layer kernel 完成后，共享 mmap 中的 frontier 才会前进，daemon 因而
+        不可能早于真实 GPU consumer progress 激活后续 window。
+        """
+        frontier = self._prefetch_frontiers.get(plan_id)
+        if frontier is None:
+            raise RuntimeError("MDS plan has no GPU-native frontier")
+        frontier.fill_(int(unit_index))
 
     def discard_staged_prefetch_units(
         self,
@@ -398,6 +438,7 @@ class BaMMDSConnector:
                for template in self._prefetch_templates.values()):
             return
         self.client.release_prefetch_plan(plan_id)
+        self._prefetch_frontiers.pop(plan_id, None)
         if envs.VLLM_V0_SWAP_TRACE:
             logger.info(
                 "[BAM_MDS_PREFETCH][Connector] phase=plan_released "

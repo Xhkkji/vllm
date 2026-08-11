@@ -13,6 +13,7 @@ at::ScalarType parse_dtype(const std::string &dtype)
   if (dtype == "float16") return at::kHalf;
   if (dtype == "bfloat16") return at::kBFloat16;
   if (dtype == "float32") return at::kFloat;
+  if (dtype == "int64") return at::kLong;
   TORCH_CHECK(false, "unsupported external CUDA tensor dtype: ", dtype);
 }
 

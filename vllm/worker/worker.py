@@ -519,12 +519,12 @@ class Worker(LocalOrDistributedWorkerBase):
         # connector，但只有 activate_on_submit=True 的首批 unit 会占 slot。
         plans: dict[str, list[tuple[str, torch.Tensor,
                                     AsyncKVTransferOperation,
-                                    Optional[Tuple[int, int]]]]] = {}
+                                    Optional[Tuple[int, int]], bool]]] = {}
         for request, mapping in prepared:
             if request.prefetch_plan_id is not None:
                 plans.setdefault(request.prefetch_plan_id, []).append(
                     (request.request_id, mapping, request.operation,
-                     request.layer_range))
+                     request.layer_range, request.activate_on_submit))
         for plan_id, units in plans.items():
             cache_engine.stage_async_kv_prefetch_plan(plan_id, units)
 
@@ -619,6 +619,7 @@ class Worker(LocalOrDistributedWorkerBase):
             lambda unit, mapping: cache_engine.poll_async_kv_transfer(
                 unit.request_id, mapping),
             max_active=envs.VLLM_BAM_MDS_MAX_IN_FLIGHT,
+            advance=cache_engine.advance_async_kv_prefetch_plan,
         )
         self._log_prefetch_runtime_traces()
 

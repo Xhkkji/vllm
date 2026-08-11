@@ -75,6 +75,7 @@ if TYPE_CHECKING:
     VLLM_BAM_MDS_HIERARCHICAL_LEAD_WINDOWS: int = 1
     VLLM_BAM_MDS_HIERARCHICAL_MAX_LEAD_WINDOWS: int = 1
     VLLM_BAM_MDS_HIERARCHICAL_TARGET_SLACK_MS: float = 0.0
+    VLLM_BAM_MDS_HIERARCHICAL_ACTIVATION_BACKEND: str = "host"
     VLLM_BAM_DIRECT_PLACEMENT: bool = False
     VLLM_BAM_DIRECT_PLACEMENT_IMPL: str = "lmcache"
     VLLM_BAM_DIRECT_PLACEMENT_RUNTIME_ONE_COPY: bool = False
@@ -569,6 +570,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_BAM_MDS_HIERARCHICAL_TARGET_SLACK_MS":
     lambda: float(
         os.getenv("VLLM_BAM_MDS_HIERARCHICAL_TARGET_SLACK_MS", "0")),
+    # host 保留现有 Python layer hook 立即激活语义；gpu_visible 由同一个
+    # layer hook 查询 CUDA event；resident_event 则由常驻控制线程等待 GPU
+    # event 后激活已预授权 unit；gpu_native 则由 model stream 直接写 MDS
+    # GPU-visible frontier，daemon 消费预先注册的 descriptor plan。
+    "VLLM_BAM_MDS_HIERARCHICAL_ACTIVATION_BACKEND":
+    lambda: os.getenv(
+        "VLLM_BAM_MDS_HIERARCHICAL_ACTIVATION_BACKEND", "host"),
 
     # 是否启用 Direct Placement v0。
     # 开启后 LMCache retrieve 会优先尝试：

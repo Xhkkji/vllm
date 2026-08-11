@@ -358,7 +358,7 @@ class CacheEngine:
         self,
         plan_id: str,
         units: Sequence[tuple[str, torch.Tensor, AsyncKVTransferOperation,
-                              Optional[Tuple[int, int]]]],
+                              Optional[Tuple[int, int]], bool]],
     ) -> None:
         """把完整 plan 下沉为 MDS 模板；此时不创建 trace 或 MDS handle。"""
         if self.bam_mds_connector is None:
@@ -366,9 +366,18 @@ class CacheEngine:
                 "prefetch plan requires the resident MDS connector")
         self.bam_mds_connector.stage_prefetch_plan(
             plan_id,
-            tuple((request_id, mapping, operation.value, layer_range)
-                  for request_id, mapping, operation, layer_range in units),
+            tuple((request_id, mapping, operation.value, layer_range, activate)
+                  for request_id, mapping, operation, layer_range, activate
+                  in units),
         )
+
+    def advance_async_kv_prefetch_plan(self, plan_id: str,
+                                       unit_index: int) -> None:
+        """把 model layer progress 写入 MDS GPU-visible frontier。"""
+        if self.bam_mds_connector is None:
+            raise RuntimeError(
+                "prefetch plan requires the resident MDS connector")
+        self.bam_mds_connector.advance_prefetch_plan_gpu(plan_id, unit_index)
 
     def discard_staged_async_kv_prefetch_units(
             self, request_ids: Sequence[str]) -> None:

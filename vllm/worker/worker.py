@@ -11,9 +11,10 @@ import torch.distributed
 import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.core.custom_schedulers.async_kv_transfer import (
-    AsyncKVTransferEvent, AsyncKVTransferRequest, AsyncKVTransferState)
+    AsyncKVTransferEvent, AsyncKVTransferOperation, AsyncKVTransferRequest,
+    AsyncKVTransferState)
 from vllm.core.custom_schedulers.hierarchical_io import (
-    activate_layer_barrier)
+    RollingPrefetchConfig, RollingPrefetchRuntime, activate_layer_barrier)
 from vllm.device_allocator.cumem import CuMemAllocator
 from vllm.distributed import (ensure_model_parallel_initialized,
                               init_distributed_environment,
@@ -69,13 +70,11 @@ class Worker(LocalOrDistributedWorkerBase):
         # engine iteration 同时存活；completion 不依赖提交顺序。
         self._async_kv_transfer_mappings: Dict[
             Tuple[int, str], torch.Tensor] = {}
-        # Step 4 的 worker-local barrier 状态。Scheduler 仍是 transfer 的
-        # 唯一所有者；Worker 只在 model forward 中代替下一轮 Engine poll 查询
-        # 已提交的 handle，并把 completion event 缓存给正常 RPC 路径回传。
-        self._hierarchical_layer_requests: Dict[
-            Tuple[int, str], AsyncKVTransferRequest] = {}
-        self._hierarchical_layer_completed: Dict[
-            Tuple[int, str], AsyncKVTransferEvent] = {}
+        # layer-window 和未来 sparse unit 共用一个 plan runtime。Scheduler
+        # 仍是 block/reservation 的唯一所有者；这里仅保存预授权 mapping，
+        # 根据 model progress 激活 MDS handle，并缓存 completion event。
+        self._prefetch_runtime = RollingPrefetchRuntime(
+            RollingPrefetchConfig.from_env())
         if self.model_config.trust_remote_code:
             # note: lazy import to avoid importing torch before initializing
             from vllm.utils import init_cached_hf_modules
@@ -503,6 +502,7 @@ class Worker(LocalOrDistributedWorkerBase):
         """
         cache_engine = self.cache_engine[virtual_engine]
         events: List[AsyncKVTransferEvent] = []
+        prepared: list[tuple[AsyncKVTransferRequest, torch.Tensor]] = []
         for request in requests:
             key = (virtual_engine, request.request_id)
             if key in self._async_kv_transfer_mappings:
@@ -513,6 +513,38 @@ class Worker(LocalOrDistributedWorkerBase):
                 device="cpu",
                 dtype=torch.int64,
             ).view(-1, 2)
+            prepared.append((request, mapping))
+
+        # stage 是 plan 级动作：所有 descriptor template 一次下沉到 MDS
+        # connector，但只有 activate_on_submit=True 的首批 unit 会占 slot。
+        plans: dict[str, list[tuple[str, torch.Tensor,
+                                    AsyncKVTransferOperation,
+                                    Optional[Tuple[int, int]]]]] = {}
+        for request, mapping in prepared:
+            if request.prefetch_plan_id is not None:
+                plans.setdefault(request.prefetch_plan_id, []).append(
+                    (request.request_id, mapping, request.operation,
+                     request.layer_range))
+        for plan_id, units in plans.items():
+            cache_engine.stage_async_kv_prefetch_plan(plan_id, units)
+
+        for request, mapping in prepared:
+            key = (virtual_engine, request.request_id)
+            if request.prefetch_plan_id is not None:
+                events.extend(self._prefetch_runtime.submit_or_stage(
+                    virtual_engine,
+                    request,
+                    mapping,
+                    lambda unit, unit_mapping: cache_engine.
+                    submit_async_kv_transfer(
+                        unit.request_id,
+                        unit.operation,
+                        unit_mapping,
+                        layer_range=unit.layer_range,
+                        prefetch_plan_id=unit.prefetch_plan_id),
+                ))
+                continue
+
             event = cache_engine.submit_async_kv_transfer(
                 request.request_id,
                 request.operation,
@@ -521,24 +553,17 @@ class Worker(LocalOrDistributedWorkerBase):
             events.append(event)
             if event.state == AsyncKVTransferState.PENDING:
                 self._async_kv_transfer_mappings[key] = mapping
-                if request.layer_range is not None:
-                    self._hierarchical_layer_requests[key] = request
         return events
 
     def poll_async_kv_transfers(
             self, virtual_engine: int) -> List[AsyncKVTransferEvent]:
         """非阻塞轮询当前 virtual engine 的全部 outstanding transfer。"""
         cache_engine = self.cache_engine[virtual_engine]
-        # 先返回 layer barrier 已消费的 READY/ERROR。Engine 会照常把它们
-        # 交给 Scheduler，完成 reservation 的 commit/abort，Worker 不修改
-        # block allocator 的所有权。
-        events: List[AsyncKVTransferEvent] = []
-        completed_keys = [
-            key for key in self._hierarchical_layer_completed
-            if key[0] == virtual_engine
-        ]
-        for key in completed_keys:
-            events.append(self._hierarchical_layer_completed.pop(key))
+        events = list(self._prefetch_runtime.poll_units(
+            virtual_engine,
+            lambda unit, mapping: cache_engine.poll_async_kv_transfer(
+                unit.request_id, mapping),
+        ))
         keys = [
             key for key in self._async_kv_transfer_mappings
             if key[0] == virtual_engine
@@ -550,8 +575,18 @@ class Worker(LocalOrDistributedWorkerBase):
             events.append(event)
             if event.state != AsyncKVTransferState.PENDING:
                 del self._async_kv_transfer_mappings[key]
-                self._hierarchical_layer_requests.pop(key, None)
+        self._log_prefetch_runtime_traces()
         return events
+
+    def discard_staged_async_kv_transfers(
+        self,
+        virtual_engine: int,
+        request_ids: Sequence[str],
+    ) -> None:
+        """清理取消 plan 中从未激活的 Worker descriptor templates。"""
+        self._prefetch_runtime.discard_units(virtual_engine, request_ids)
+        self.cache_engine[virtual_engine].discard_staged_async_kv_prefetch_units(
+            request_ids)
 
     def activate_hierarchical_layer_barrier(
             self, virtual_engine: int,
@@ -569,71 +604,43 @@ class Worker(LocalOrDistributedWorkerBase):
         request_ids: Tuple[str, ...],
         layer_index: int,
     ) -> None:
-        """在 attention 读取该层 prefix KV 前确认 window DMA READY。
-
-        MDS daemon 与 GPU forward 并行。若后续 window 尚在传输，这里以短暂
-        sleep 避免忙轮询抢占 CPU；READY event 留到 forward 返回后由下一次
-        Engine poll 正常传给 Scheduler，防止同一 MDS handle 被重复 finish。
-        """
-        matching = tuple(
-            (key, request) for key, request in
-            self._hierarchical_layer_requests.items()
-            if (key[0] == virtual_engine and request.seq_group_id in request_ids
-                and request.layer_range is not None
-                and request.layer_range[0] <= layer_index <
-                request.layer_range[1]))
-        if not matching:
-            return
-
+        """按 layer progress 激活未来 unit，并等待当前 unit 物理 READY。"""
         cache_engine = self.cache_engine[virtual_engine]
-        for key, request in matching:
-            if envs.VLLM_V0_SWAP_TRACE:
-                logger.info(
-                    "[BAM_MDS_HIERARCHICAL][LayerBarrier] phase=wait "
-                    "request_id=%s seq_group_id=%s layer=%d layer_range=%s",
-                    request.request_id,
-                    request.seq_group_id,
-                    layer_index,
-                    request.layer_range,
-                )
-            while True:
-                completed = self._hierarchical_layer_completed.get(key)
-                if completed is not None:
-                    if completed.state == AsyncKVTransferState.ERROR:
-                        raise RuntimeError(
-                            "hierarchical MDS restore failed before layer "
-                            f"{layer_index}: {completed.error}")
-                    break
+        self._prefetch_runtime.wait_ready(
+            virtual_engine,
+            request_ids,
+            layer_index,
+            lambda unit, mapping: cache_engine.submit_async_kv_transfer(
+                unit.request_id,
+                unit.operation,
+                mapping,
+                layer_range=unit.layer_range,
+                prefetch_plan_id=unit.prefetch_plan_id),
+            lambda unit, mapping: cache_engine.poll_async_kv_transfer(
+                unit.request_id, mapping),
+            max_active=envs.VLLM_BAM_MDS_MAX_IN_FLIGHT,
+        )
+        self._log_prefetch_runtime_traces()
 
-                mapping = self._async_kv_transfer_mappings.get(key)
-                if mapping is None:
-                    # Engine poll 已经完成并删除该请求，当前 layer 可安全运行。
-                    break
-                event = cache_engine.poll_async_kv_transfer(
-                    request.request_id, mapping)
-                if event.state == AsyncKVTransferState.PENDING:
-                    time.sleep(0.0001)
-                    continue
-
-                del self._async_kv_transfer_mappings[key]
-                self._hierarchical_layer_requests.pop(key, None)
-                self._hierarchical_layer_completed[key] = event
-                if envs.VLLM_V0_SWAP_TRACE:
-                    logger.info(
-                        "[BAM_MDS_HIERARCHICAL][LayerBarrier] "
-                        "phase=ready request_id=%s seq_group_id=%s "
-                        "layer=%d layer_range=%s state=%s",
-                        request.request_id,
-                        request.seq_group_id,
-                        layer_index,
-                        request.layer_range,
-                        event.state.name,
-                    )
-                if event.state == AsyncKVTransferState.ERROR:
-                    raise RuntimeError(
-                        "hierarchical MDS restore failed before layer "
-                        f"{layer_index}: {event.error}")
-                break
+    def _log_prefetch_runtime_traces(self) -> None:
+        """输出 worker 物理 READY 与 barrier wait，避免混入 scheduler 延迟。"""
+        traces = self._prefetch_runtime.pop_traces()
+        if not envs.VLLM_V0_SWAP_TRACE:
+            return
+        for trace in traces:
+            logger.info(
+                "[BAM_MDS_PREFETCH][Worker] phase=%s plan_id=%s "
+                "request_id=%s unit=%d monotonic_ns=%d layer=%s "
+                "wait_ms=%.3f lead_units=%d",
+                trace.phase,
+                trace.plan_id,
+                trace.request_id,
+                trace.unit_index,
+                trace.monotonic_ns,
+                trace.layer_index,
+                trace.wait_ns / 1.0e6,
+                trace.lead_units,
+            )
 
     def _get_cached_seq_group_metadata(
             self,

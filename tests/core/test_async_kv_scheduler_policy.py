@@ -82,3 +82,20 @@ def test_async_kv_policy_accepts_out_of_order_completions():
                              AsyncKVTransferState.READY))
     assert policy.pop_ready() == (second,)
     assert policy.pending_request_ids == (first.request_id,)
+
+
+def test_worker_event_can_activate_only_a_staged_prefetch_unit():
+    policy = AsyncKVSchedulePolicy(max_in_flight=1)
+    request = policy.enqueue(
+        "seq",
+        "plan",
+        AsyncKVTransferOperation.READ,
+        ((1, 2), ),
+        prefetch_plan_id="plan",
+        prefetch_unit_index=0,
+    )
+    assert policy.stage_plan("plan")[0].activate_on_submit is False
+    policy.apply_event(
+        AsyncKVTransferEvent(request.request_id,
+                             AsyncKVTransferState.PENDING))
+    assert policy.pending_request_ids == (request.request_id, )

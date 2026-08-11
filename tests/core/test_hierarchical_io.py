@@ -2,10 +2,14 @@
 
 """层级 I/O plan 和父事务屏障的纯控制面测试。"""
 
+from vllm.core.custom_schedulers.async_kv_transfer import (
+    AsyncKVTransferEvent, AsyncKVTransferOperation, AsyncKVTransferPriority,
+    AsyncKVTransferRequest, AsyncKVTransferState)
 from vllm.core.custom_schedulers.hierarchical_io import (
     HierarchicalIOConfig, HierarchicalLayerBarrierConfig,
-    HierarchicalRestoreController, activate_layer_barrier,
-    build_layer_restore_plan, wait_for_local_layer)
+    HierarchicalRestoreController, RollingPrefetchConfig,
+    RollingPrefetchRuntime, activate_layer_barrier, build_layer_restore_plan,
+    wait_for_local_layer)
 
 
 def test_layer_restore_plan_is_contiguous_and_default_disabled():
@@ -19,6 +23,81 @@ def test_layer_restore_plan_is_contiguous_and_default_disabled():
         (0, 4), (4, 8), (8, 10)
     ]
     assert [window.index for window in plan.windows] == [0, 1, 2]
+
+
+def test_rolling_config_is_explicit_and_validated():
+    config = RollingPrefetchConfig.from_env({
+        "VLLM_BAM_MDS_HIERARCHICAL_ROLLING_ENABLE": "1",
+        "VLLM_BAM_MDS_HIERARCHICAL_LEAD_WINDOWS": "2",
+        "VLLM_BAM_MDS_HIERARCHICAL_MAX_LEAD_WINDOWS": "3",
+        "VLLM_BAM_MDS_HIERARCHICAL_TARGET_SLACK_MS": "0.5",
+    })
+    assert config.enabled
+    assert config.initial_windows == 2
+    assert config.max_lead_windows == 3
+
+
+def _prefetch_request(index: int, *, activate: bool) -> AsyncKVTransferRequest:
+    return AsyncKVTransferRequest(
+        request_id=f"unit-{index}",
+        seq_group_id="seq-0",
+        reservation_id="plan-0",
+        operation=AsyncKVTransferOperation.READ,
+        block_mapping=((10, 20), ),
+        logical_blocks=(),
+        priority=AsyncKVTransferPriority.CRITICAL_READ,
+        layer_range=(index * 2, (index + 1) * 2),
+        prefetch_plan_id="plan-0",
+        prefetch_unit_index=index,
+        activate_on_submit=activate,
+    )
+
+
+def test_rolling_runtime_activates_future_unit_from_model_progress():
+    runtime = RollingPrefetchRuntime(
+        RollingPrefetchConfig(enabled=True,
+                              lead_windows=1,
+                              max_lead_windows=1))
+    activated = []
+    ready = set()
+
+    def submit(request, mapping):
+        activated.append((request.request_id, mapping))
+        return AsyncKVTransferEvent(request.request_id,
+                                    AsyncKVTransferState.PENDING)
+
+    def poll(request, _mapping):
+        state = (AsyncKVTransferState.READY
+                 if request.request_id in ready else
+                 AsyncKVTransferState.PENDING)
+        return AsyncKVTransferEvent(request.request_id, state)
+
+    assert runtime.submit_or_stage(0, _prefetch_request(0, activate=True),
+                                   "mapping-0", submit)[0].state == (
+                                       AsyncKVTransferState.PENDING)
+    assert not runtime.submit_or_stage(0,
+                                       _prefetch_request(1, activate=False),
+                                       "mapping-1", submit)
+    assert activated == [("unit-0", "mapping-0")]
+
+    ready.update(("unit-0", "unit-1"))
+    runtime.wait_ready(0, ("seq-0", ), 0, submit, poll, max_active=2)
+    assert activated == [("unit-0", "mapping-0"),
+                         ("unit-1", "mapping-1")]
+    events = runtime.poll_units(0, poll)
+    assert [(event.request_id, event.state) for event in events] == [
+        ("unit-1", AsyncKVTransferState.PENDING),
+        ("unit-0", AsyncKVTransferState.READY),
+        ("unit-1", AsyncKVTransferState.READY),
+    ]
+    traces = runtime.pop_traces()
+    assert {(trace.phase, trace.unit_index) for trace in traces} >= {
+        ("activated", 0),
+        ("activated", 1),
+        ("physical_ready", 0),
+        ("physical_ready", 1),
+        ("barrier_ready", 0),
+    }
 
 
 def test_first_window_admission_is_separate_from_full_restore():

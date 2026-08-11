@@ -19,7 +19,7 @@ from vllm.core.scheduler import (Scheduler, SchedulerSwappedInOutputs,
                                  SchedulingBudget, PreemptionMode)
 from vllm.core.custom_schedulers.async_kv_transfer import (
     AsyncKVExecutionMarker, AsyncKVSchedulePolicy, AsyncKVTransferEvent,
-    AsyncKVTransferOperation, AsyncKVTransferRequest)
+    AsyncKVTransferOperation, AsyncKVTransferRequest, AsyncKVTransferState)
 from vllm.core.custom_schedulers.hierarchical_io import (
     HierarchicalIOConfig, HierarchicalLayerBarrierConfig,
     HierarchicalRestoreController)
@@ -98,7 +98,8 @@ class AsyncKVScheduler(Scheduler):
                 and not self.hierarchical_io_config.enabled):
             raise ValueError(
                 "hierarchical layer barrier requires hierarchical MDS I/O")
-        if self.hierarchical_layer_barrier_config.enabled:
+        if (self.hierarchical_layer_barrier_config.enabled
+                and not self.hierarchical_io_config.rolling.enabled):
             # forward 期间 Worker 只能轮询已提交的 MDS handle，无法安全地
             # 越过 Engine/Scheduler 自己激活 queued request。因此 Step 4 的
             # 最小正确版本要求一个父 restore 的所有 window 同时 in-flight。
@@ -112,6 +113,10 @@ class AsyncKVScheduler(Scheduler):
                     "hierarchical layer barrier requires "
                     "VLLM_BAM_MDS_MAX_IN_FLIGHT >= number of layer windows "
                     f"({required_windows})")
+        if (self.hierarchical_io_config.rolling.enabled
+                and not self.hierarchical_layer_barrier_config.enabled):
+            raise ValueError(
+                "rolling hierarchical I/O requires the layer barrier")
         self.hierarchical_prefix_restores = HierarchicalRestoreController()
         # key 是父 reservation/plan id，而不是 window request id。一个请求
         # 无论拆成多少层窗口，都只占一个 scheduler sequence slot。
@@ -119,6 +124,11 @@ class AsyncKVScheduler(Scheduler):
         # 首窗 READY 后进入“已准入但禁止 dispatch”的显式状态。Step 2 只
         # 建立控制面边界；Step 4 接入 model layer barrier 前不能放进 running。
         self.hierarchical_prefix_admitted: Set[str] = set()
+        # rolling 模式第一次向 Worker 发送完整 plan 后，后续 queued unit
+        # 不再由 Engine 的普通 drain 自动激活，而由 model layer progress
+        # 触发。集合只属于 scheduler 控制面，不拥有 block/data。
+        self._hierarchical_rolling_staged_plans: Set[str] = set()
+        self._staged_async_kv_discards: list[str] = []
         self._prefix_restore_admission_blocked = False
         logger.info(
             "[BAM_MDS_PREFIX] phase=init enabled=%s block_size=%d",
@@ -351,6 +361,8 @@ class AsyncKVScheduler(Scheduler):
                 reservation.block_mapping,
                 reservation.logical_blocks,
                 layer_range=window.layer_range,
+                prefetch_plan_id=plan.plan_id,
+                prefetch_unit_index=window.index,
             ) for window in plan.windows)
         self.hierarchical_prefix_restores.register(
             plan, tuple(request.request_id for request in requests))
@@ -560,6 +572,8 @@ class AsyncKVScheduler(Scheduler):
 
     def has_active_async_kv_transfer(self) -> bool:
         """只要至少一笔 transfer 已提交，Engine 就需要轮询 Worker。"""
+        if self.hierarchical_io_config.rolling.enabled:
+            return self.async_kv_policy.has_outstanding
         return self.async_kv_policy.in_flight_count > 0
 
     def has_unfinished_seqs(self) -> bool:
@@ -851,6 +865,7 @@ class AsyncKVScheduler(Scheduler):
 
         self.hierarchical_prefix_restores.release(progress.plan_id)
         del self.hierarchical_prefix_loading[progress.plan_id]
+        self._hierarchical_rolling_staged_plans.discard(progress.plan_id)
 
     @staticmethod
     def _advance_restored_prefix_frontier(
@@ -1047,6 +1062,19 @@ class AsyncKVScheduler(Scheduler):
             for seq in seq_group.get_seqs():
                 if not seq.is_finished():
                     seq.status = SequenceStatus.FINISHED_ABORTED
+            # 未激活 unit 没有 DMA，可以立即在 Scheduler 标记 ERROR，并让
+            # Worker 丢弃 staged descriptor。已激活 unit 仍自然完成，父事务
+            # 等全部 unit 终态后才释放目标 block。
+            queued = self.async_kv_policy.requests_for_plan(
+                plan_id, state=AsyncKVTransferState.QUEUED)
+            for request in queued:
+                self.async_kv_policy.fail_queued(
+                    request.request_id, "prefetch plan was cancelled")
+                if plan_id in self._hierarchical_rolling_staged_plans:
+                    self._staged_async_kv_discards.append(request.request_id)
+
+        if self._staged_async_kv_discards:
+            self.complete_ready_async_kv_transfers()
 
         # READY 但尚未进入执行 batch 的请求可能在这里被取消。删除纯观测
         # marker，避免一次永远不会发生的 first_execute 长期占用记录。
@@ -1075,8 +1103,41 @@ class AsyncKVScheduler(Scheduler):
 
     def drain_async_kv_transfers_to_submit(
             self) -> Tuple[AsyncKVTransferRequest, ...]:
-        """按后端容量批量激活 queued transfer。"""
-        return self.async_kv_policy.activate_next()
+        """生成本轮 submit/stage 批次。
+
+        rolling plan 的首个 unit 占用真实 MDS slot；其余 unit 只把完整
+        mapping 预授权给 Worker，``activate_on_submit=False``，由 barrier
+        按模型进度稍后激活。普通 swap 和 rolling 关闭时仍走原队列逻辑。
+        """
+        if not self.hierarchical_io_config.rolling.enabled:
+            return self.async_kv_policy.activate_next()
+
+        requests: list[AsyncKVTransferRequest] = []
+        rolling_plan_ids = set(self.hierarchical_prefix_loading)
+        for plan_id in tuple(rolling_plan_ids):
+            if plan_id in self._hierarchical_rolling_staged_plans:
+                continue
+            initial = self.async_kv_policy.activate_plan(
+                plan_id, self.hierarchical_io_config.rolling.initial_windows)
+            # 没拿到完整首批 slot 时暂不 stage。否则 Worker 只有未来模板，
+            # 首窗却仍是 QUEUED，首窗 READY admission 永远无法发生。
+            if len(initial) < self.hierarchical_io_config.rolling.initial_windows:
+                continue
+            requests.extend(initial)
+            requests.extend(self.async_kv_policy.stage_plan(plan_id))
+            self._hierarchical_rolling_staged_plans.add(plan_id)
+
+        # 其他普通 swap 仍可使用空余 request slot，但不碰 rolling plan 的
+        # queued unit；后续 unit 的激活权只在 Worker barrier。
+        requests.extend(self.async_kv_policy.activate_next(
+            excluded_plan_ids=tuple(rolling_plan_ids)))
+        return tuple(requests)
+
+    def drain_staged_async_kv_discards(self) -> Tuple[str, ...]:
+        """返回需要 Worker 删除、且确认从未激活的 descriptor templates。"""
+        request_ids = tuple(self._staged_async_kv_discards)
+        self._staged_async_kv_discards.clear()
+        return request_ids
 
     def _swap_out(
         self,

@@ -21,6 +21,7 @@ class _FakeMDSClient:
         self.ready: set[int] = set()
         self.live: set[int] = set()
         self.submitted_payloads = []
+        self.prefetch_plans = {}
 
     def submit_read_async(self, payload):
         self.submitted_payloads.append(payload)
@@ -46,6 +47,32 @@ class _FakeMDSClient:
 
     def discard(self, handle) -> None:
         self.live.remove(handle.request_id)
+
+    def register_prefetch_plan(self, plan_id, units) -> None:
+        self.prefetch_plans[plan_id] = dict(units)
+
+    def activate_prefetch_units(self, plan_id, unit_ids):
+        handles = []
+        for unit_id in unit_ids:
+            payload, _operation = self.prefetch_plans[plan_id][unit_id]
+            self.submitted_payloads.append(payload)
+            handles.append(self._submit())
+        return tuple(handles)
+
+    def finish_prefetch_unit(self, plan_id, unit_id) -> int:
+        del self.prefetch_plans[plan_id][unit_id]
+        handle = next(handle for handle in self.live
+                      if handle in self.ready)
+        self.live.remove(handle)
+        return 123
+
+    def discard_prefetch_units(self, plan_id, unit_ids) -> None:
+        for unit_id in unit_ids:
+            del self.prefetch_plans[plan_id][unit_id]
+
+    def release_prefetch_plan(self, plan_id) -> None:
+        assert not self.prefetch_plans[plan_id]
+        del self.prefetch_plans[plan_id]
 
 
 def test_connector_tracks_multiple_out_of_order_transfers():
@@ -86,3 +113,29 @@ def test_connector_forwards_and_validates_layer_range():
     with pytest.raises(ValueError, match="outside local KV cache"):
         connector.submit_transfer_async(
             "window-bad", mapping, operation="read", layer_range=(6, 9))
+
+
+def test_connector_stages_and_releases_prefetch_plan():
+    connector = BaMMDSConnector.__new__(BaMMDSConnector)
+    connector.client = _FakeMDSClient()
+    connector._pending_transfers = {}
+    connector._prefetch_templates = {}
+    connector.layout = type("Layout", (), {"num_layers": 8})()
+
+    first = torch.tensor([[7, 3]], dtype=torch.int64)
+    second = torch.tensor([[8, 4]], dtype=torch.int64)
+    connector.stage_prefetch_plan(
+        "plan-0", (("unit-0", first, "read", (0, 4)),
+                   ("unit-1", second, "read", (4, 8))))
+    assert not connector.client.submitted_payloads
+
+    assert not connector.activate_prefetch_transfer_async(
+        "plan-0", "unit-0", first, operation="read", layer_range=(0, 4))
+    pending = connector._pending_transfers["unit-0"]
+    connector.client.ready.add(pending.handle.request_id)
+    assert connector.poll_transfer_async("unit-0")
+    assert "unit-1" in connector._prefetch_templates
+
+    connector.discard_staged_prefetch_units(("unit-1", ))
+    assert not connector._prefetch_templates
+    assert not connector.client.prefetch_plans

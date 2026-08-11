@@ -1347,6 +1347,14 @@ class LLMEngine:
                                              virtual_engine: int) -> None:
         """把下一笔 queued read/write 非阻塞提交给 Worker。"""
         scheduler = self.scheduler[virtual_engine]
+        drain_discards = getattr(scheduler, "drain_staged_async_kv_discards",
+                                 None)
+        if drain_discards is not None:
+            request_ids = drain_discards()
+            if request_ids:
+                self.model_executor.collective_rpc(
+                    "discard_staged_async_kv_transfers",
+                    args=(virtual_engine, request_ids))
         drain = getattr(scheduler, "drain_async_kv_transfers_to_submit", None)
         if drain is None:
             return

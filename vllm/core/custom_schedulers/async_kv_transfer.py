@@ -11,7 +11,7 @@ prefill/decode admission、victim 选择或 block residency 策略。把它从
 from __future__ import annotations
 
 import itertools
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum, auto
 from typing import Dict, Optional, Sequence, Tuple
 
@@ -59,6 +59,13 @@ class AsyncKVTransferRequest:
     # ``None`` 保持原有“搬完整 block 的全部层”语义。层级 restore 才携带
     # 左闭右开的本地 layer range；Worker/MDS 不解释 scheduler plan。
     layer_range: Optional[Tuple[int, int]] = None
+    # plan/unit identity 只描述预授权关系。普通 swap 为 None；layer-window
+    # restore 使用它在 Worker 中一次 stage 全计划、随后按模型进度激活 unit。
+    prefetch_plan_id: Optional[str] = None
+    prefetch_unit_index: Optional[int] = None
+    # False 表示这次 RPC 只把 descriptor template 放进 Worker，不占用 MDS
+    # request slot。真正激活时 Worker 会回传 PENDING，再由 Scheduler 更新状态。
+    activate_on_submit: bool = True
 
 
 @dataclass(frozen=True)
@@ -137,6 +144,8 @@ class AsyncKVTransferQueue:
         logical_blocks: Sequence[LogicalBlockKey] = (),
         priority: Optional[AsyncKVTransferPriority] = None,
         layer_range: Optional[Tuple[int, int]] = None,
+        prefetch_plan_id: Optional[str] = None,
+        prefetch_unit_index: Optional[int] = None,
     ) -> AsyncKVTransferRequest:
         """登记 reservation，但暂不占用 Worker/MDS request slot。"""
         if priority is None:
@@ -153,24 +162,37 @@ class AsyncKVTransferQueue:
             logical_blocks=tuple(logical_blocks),
             priority=priority,
             layer_range=layer_range,
+            prefetch_plan_id=prefetch_plan_id,
+            prefetch_unit_index=prefetch_unit_index,
         )
         self._transfers[request_id] = PendingAsyncKVTransfer(request=request)
         return request
 
-    def activate_next(self) -> Tuple[AsyncKVTransferRequest, ...]:
+    def activate_next(
+        self,
+        *,
+        excluded_plan_ids: Sequence[str] = (),
+        limit: Optional[int] = None,
+    ) -> Tuple[AsyncKVTransferRequest, ...]:
         """优先激活 critical read，再用剩余槽位处理 deferred write。
 
         已经 IN_FLIGHT 的 write 不会被伪取消；后到 read 只越过仍为 QUEUED
         的 write。这样不复制两套队列状态机，同时保持同优先级 FIFO。
         """
         capacity = self.available_capacity
+        if limit is not None:
+            if limit < 0:
+                raise ValueError("activation limit must be non-negative")
+            capacity = min(capacity, limit)
         if capacity <= 0:
             return ()
+        excluded = frozenset(excluded_plan_ids)
         activated = []
         for priority in AsyncKVTransferPriority:
             for transfer in self._transfers.values():
                 if (transfer.state != AsyncKVTransferState.QUEUED
-                        or transfer.request.priority != priority):
+                        or transfer.request.priority != priority
+                        or transfer.request.prefetch_plan_id in excluded):
                     continue
                 transfer.state = AsyncKVTransferState.PENDING
                 activated.append(transfer.request)
@@ -178,9 +200,56 @@ class AsyncKVTransferQueue:
                     return tuple(activated)
         return tuple(activated)
 
+    def activate_plan(self, plan_id: str, count: int) -> Tuple[
+            AsyncKVTransferRequest, ...]:
+        """激活一个 plan 的前 ``count`` 个 queued unit。"""
+        if count < 0:
+            raise ValueError("plan activation count must be non-negative")
+        if self.available_capacity < count:
+            return ()
+        capacity = count
+        activated = []
+        for transfer in self._transfers.values():
+            if (capacity == 0
+                    or transfer.state != AsyncKVTransferState.QUEUED
+                    or transfer.request.prefetch_plan_id != plan_id):
+                continue
+            transfer.state = AsyncKVTransferState.PENDING
+            activated.append(transfer.request)
+            capacity -= 1
+        return tuple(activated)
+
+    def stage_plan(self, plan_id: str) -> Tuple[AsyncKVTransferRequest, ...]:
+        """返回尚未激活的 unit，并标记 RPC 只做 Worker 侧 stage。"""
+        return tuple(
+            replace(transfer.request, activate_on_submit=False)
+            for transfer in self._transfers.values()
+            if transfer.request.prefetch_plan_id == plan_id
+            and transfer.state == AsyncKVTransferState.QUEUED)
+
+    def requests_for_plan(
+        self,
+        plan_id: str,
+        *,
+        state: Optional[AsyncKVTransferState] = None,
+    ) -> Tuple[AsyncKVTransferRequest, ...]:
+        """按 unit 入队顺序返回一个预授权 plan 的请求。"""
+        return tuple(
+            transfer.request for transfer in self._transfers.values()
+            if transfer.request.prefetch_plan_id == plan_id
+            and (state is None or transfer.state == state))
+
     def apply_event(self, event: AsyncKVTransferEvent) -> None:
         """应用 active request 的 PENDING/READY/ERROR 事件。"""
         transfer = self._get_transfer(event.request_id)
+        # rolling activation 发生在 model forward 内，Scheduler 下一次运行时
+        # 才收到 Worker 的 PENDING 通知。因此只有带 plan identity 的 QUEUED
+        # 请求允许由该事件切到 PENDING；普通 transfer 仍必须由 activate_next。
+        if (transfer.state == AsyncKVTransferState.QUEUED
+                and event.state == AsyncKVTransferState.PENDING
+                and transfer.request.prefetch_plan_id is not None):
+            transfer.state = AsyncKVTransferState.PENDING
+            return
         if transfer.state != AsyncKVTransferState.PENDING:
             raise RuntimeError(
                 f"async KV request is not active: {event.request_id}")
@@ -218,6 +287,15 @@ class AsyncKVTransferQueue:
                 f"cannot cancel active async KV request: {request_id}")
         del self._transfers[request_id]
         return transfer.request
+
+    def fail_queued(self, request_id: str, error: str) -> None:
+        """把从未提交的 unit 变成可由统一 error 路径消费的终态。"""
+        transfer = self._get_transfer(request_id)
+        if transfer.state != AsyncKVTransferState.QUEUED:
+            raise RuntimeError(
+                f"cannot fail active async KV request: {request_id}")
+        transfer.state = AsyncKVTransferState.ERROR
+        transfer.error = error
 
     def _ids_in_state(
         self,

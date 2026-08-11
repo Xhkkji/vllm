@@ -2,7 +2,7 @@
 """CacheEngine class for managing the KV cache."""
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -301,6 +301,7 @@ class CacheEngine:
         operation: AsyncKVTransferOperation,
         src_to_dst: torch.Tensor,
         layer_range: Optional[Tuple[int, int]] = None,
+        prefetch_plan_id: Optional[str] = None,
     ) -> AsyncKVTransferEvent:
         """把 Scheduler 的异步 read/write 提交给 resident MDS。
 
@@ -329,11 +330,19 @@ class CacheEngine:
                 layer_range,
             )
         try:
-            ready = self.bam_mds_connector.submit_transfer_async(
-                request_id,
-                src_to_dst,
-                operation=operation.value,
-                layer_range=layer_range)
+            if prefetch_plan_id is None:
+                ready = self.bam_mds_connector.submit_transfer_async(
+                    request_id,
+                    src_to_dst,
+                    operation=operation.value,
+                    layer_range=layer_range)
+            else:
+                ready = self.bam_mds_connector.activate_prefetch_transfer_async(
+                    prefetch_plan_id,
+                    request_id,
+                    src_to_dst,
+                    operation=operation.value,
+                    layer_range=layer_range)
         except Exception as exc:
             del self._bam_mds_async_kv_traces[request_id]
             return AsyncKVTransferEvent(request_id,
@@ -344,6 +353,29 @@ class CacheEngine:
             return AsyncKVTransferEvent(request_id,
                                         AsyncKVTransferState.READY)
         return AsyncKVTransferEvent(request_id, AsyncKVTransferState.PENDING)
+
+    def stage_async_kv_prefetch_plan(
+        self,
+        plan_id: str,
+        units: Sequence[tuple[str, torch.Tensor, AsyncKVTransferOperation,
+                              Optional[Tuple[int, int]]]],
+    ) -> None:
+        """把完整 plan 下沉为 MDS 模板；此时不创建 trace 或 MDS handle。"""
+        if self.bam_mds_connector is None:
+            raise RuntimeError(
+                "prefetch plan requires the resident MDS connector")
+        self.bam_mds_connector.stage_prefetch_plan(
+            plan_id,
+            tuple((request_id, mapping, operation.value, layer_range)
+                  for request_id, mapping, operation, layer_range in units),
+        )
+
+    def discard_staged_async_kv_prefetch_units(
+            self, request_ids: Sequence[str]) -> None:
+        if self.bam_mds_connector is None:
+            raise RuntimeError(
+                "prefetch plan requires the resident MDS connector")
+        self.bam_mds_connector.discard_staged_prefetch_units(request_ids)
 
     def poll_async_kv_transfer(
             self, request_id: str,

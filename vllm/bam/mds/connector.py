@@ -30,6 +30,7 @@ class _PendingTransfer:
     operation: str
     layer_range: Optional[Tuple[int, int]]
     submitted_at_ns: int
+    prefetch_plan_id: Optional[str] = None
 
 
 class BaMMDSConnector:
@@ -78,6 +79,11 @@ class BaMMDSConnector:
         # scheduler request_id 与底层 MDS handle 属于两个命名空间；每个
         # scheduler request 独立保存 mapping 和 handle，completion 可乱序。
         self._pending_transfers: dict[str, _PendingTransfer] = {}
+        # request_id -> (plan_id, mapping, operation, layer_range)。模板登记不
+        # 占 MDS slot，model progress 只能激活这里已经存在的 request。
+        self._prefetch_templates: dict[
+            str, tuple[str, tuple[tuple[int, int], ...], str,
+                       Optional[Tuple[int, int]]]] = {}
         try:
             self.gpu_cache = self._allocate_and_wrap()
         except Exception:
@@ -235,6 +241,95 @@ class BaMMDSConnector:
         )
         return False
 
+    def stage_prefetch_plan(
+        self,
+        plan_id: str,
+        units: Sequence[tuple[str, torch.Tensor, str,
+                              Optional[Tuple[int, int]]]],
+    ) -> None:
+        """一次登记完整 plan 的 descriptor templates，不提交 I/O。"""
+        staged: dict[str, tuple[dict[str, Any], str]] = {}
+        for request_id, mapping_tensor, operation, layer_range in units:
+            if operation not in ("read", "write"):
+                raise ValueError(f"unsupported MDS operation: {operation}")
+            layer_range = self._validate_layer_range(layer_range)
+            mapping, payload = self._mapping_payload(
+                mapping_tensor, operation=operation, layer_range=layer_range)
+            if request_id in self._prefetch_templates:
+                raise RuntimeError(f"duplicate staged prefetch unit: {request_id}")
+            staged[request_id] = (payload, operation)
+            self._prefetch_templates[request_id] = (
+                plan_id, mapping, operation, layer_range)
+        try:
+            self.client.register_prefetch_plan(plan_id, staged)
+        except Exception:
+            for request_id in staged:
+                self._prefetch_templates.pop(request_id, None)
+            raise
+        if envs.VLLM_V0_SWAP_TRACE:
+            logger.info(
+                "[BAM_MDS_PREFETCH][Connector] phase=plan_staged "
+                "plan_id=%s units=%d",
+                plan_id,
+                len(staged),
+            )
+
+    def activate_prefetch_transfer_async(
+        self,
+        plan_id: str,
+        scheduler_request_id: str,
+        src_to_dst: torch.Tensor,
+        *,
+        operation: str,
+        layer_range: Optional[Tuple[int, int]],
+    ) -> bool:
+        """激活一个已 stage unit；禁止 forward 临时更改 mapping。"""
+        template = self._prefetch_templates.get(scheduler_request_id)
+        if template is None or template[0] != plan_id:
+            raise RuntimeError("unknown staged prefetch unit")
+        layer_range = self._validate_layer_range(layer_range)
+        mapping, _ = self._mapping_payload(src_to_dst,
+                                            operation=operation,
+                                            layer_range=layer_range)
+        if (mapping, operation, layer_range) != template[1:]:
+            raise RuntimeError("prefetch unit changed after plan stage")
+        try:
+            handle = self.client.activate_prefetch_units(
+                plan_id, (scheduler_request_id, ))[0]
+        except Exception:
+            # submit 失败发生在 unit 尚未拥有 active handle 时，可以安全删除
+            # 模板；Scheduler 会把该 unit 作为 ERROR 推进父事务。
+            self.client.discard_prefetch_units(plan_id,
+                                               (scheduler_request_id, ))
+            del self._prefetch_templates[scheduler_request_id]
+            self._maybe_release_prefetch_plan(plan_id)
+            raise
+        self._pending_transfers[scheduler_request_id] = _PendingTransfer(
+            handle=handle,
+            mapping=mapping,
+            operation=operation,
+            layer_range=layer_range,
+            submitted_at_ns=time.monotonic_ns(),
+            prefetch_plan_id=plan_id,
+        )
+        return False
+
+    def discard_staged_prefetch_units(
+        self,
+        scheduler_request_ids: Sequence[str],
+    ) -> None:
+        by_plan: dict[str, list[str]] = {}
+        for request_id in scheduler_request_ids:
+            template = self._prefetch_templates.get(request_id)
+            if template is None:
+                raise RuntimeError(f"unknown staged prefetch unit: {request_id}")
+            by_plan.setdefault(template[0], []).append(request_id)
+        for plan_id, request_ids in by_plan.items():
+            self.client.discard_prefetch_units(plan_id, tuple(request_ids))
+            for request_id in request_ids:
+                del self._prefetch_templates[request_id]
+            self._maybe_release_prefetch_plan(plan_id)
+
     def poll_transfer_async(self, scheduler_request_id: str) -> bool:
         """非阻塞查询指定 scheduler request 的 MDS 完成状态。"""
         pending = self._pending_transfers.get(scheduler_request_id)
@@ -249,7 +344,14 @@ class BaMMDSConnector:
             # completion 已经失败，后续不能再用同一个 scheduler request
             # 轮询；释放 client/connector identity，由 Scheduler abort block
             # reservation。daemon 若进入全局 ERROR 会阻止后续 submit。
-            self.client.discard(pending.handle)
+            if pending.prefetch_plan_id is None:
+                self.client.discard(pending.handle)
+            else:
+                self.client.fail_prefetch_unit(pending.prefetch_plan_id,
+                                               scheduler_request_id)
+                del self._prefetch_templates[scheduler_request_id]
+                self._maybe_release_prefetch_plan(
+                    pending.prefetch_plan_id)
             del self._pending_transfers[scheduler_request_id]
             raise
 
@@ -257,8 +359,15 @@ class BaMMDSConnector:
         mapping = pending.mapping
         operation = pending.operation
         observed_done_ns = time.monotonic_ns()
-        io_elapsed_ns = self.client.finish(pending.handle)
+        if pending.prefetch_plan_id is None:
+            io_elapsed_ns = self.client.finish(pending.handle)
+        else:
+            io_elapsed_ns = self.client.finish_prefetch_unit(
+                pending.prefetch_plan_id, scheduler_request_id)
         del self._pending_transfers[scheduler_request_id]
+        if pending.prefetch_plan_id is not None:
+            del self._prefetch_templates[scheduler_request_id]
+            self._maybe_release_prefetch_plan(pending.prefetch_plan_id)
         if envs.VLLM_V0_SWAP_TRACE:
             logger.info(
                 "[V0_SWAP_TRACE][AsyncKV][Connector] phase=ready "
@@ -283,6 +392,18 @@ class BaMMDSConnector:
             io_elapsed_ns / 1.0e6,
         )
         return True
+
+    def _maybe_release_prefetch_plan(self, plan_id: str) -> None:
+        if any(template[0] == plan_id
+               for template in self._prefetch_templates.values()):
+            return
+        self.client.release_prefetch_plan(plan_id)
+        if envs.VLLM_V0_SWAP_TRACE:
+            logger.info(
+                "[BAM_MDS_PREFETCH][Connector] phase=plan_released "
+                "plan_id=%s",
+                plan_id,
+            )
 
     def _transfer_mapping(self, src_to_dst: torch.Tensor, *, operation: str) -> None:
         if src_to_dst.numel() == 0:

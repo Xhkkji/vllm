@@ -25,6 +25,8 @@ class HierarchicalRestoreProgress:
     cancelled: bool
     first_unit_ready_monotonic_ns: Optional[int]
     plan_created_monotonic_ns: int
+    profiling_only: bool
+    block_selector: str
 
 
 @dataclass
@@ -142,4 +144,6 @@ class HierarchicalRestoreController:
             first_unit_ready_monotonic_ns=(
                 state.first_unit_ready_monotonic_ns),
             plan_created_monotonic_ns=state.plan.created_monotonic_ns,
+            profiling_only=state.plan.profiling_only,
+            block_selector=state.plan.block_selector,
         )

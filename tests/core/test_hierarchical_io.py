@@ -10,9 +10,10 @@ from vllm.core.custom_schedulers.async_kv_transfer import (
     AsyncKVTransferRequest, AsyncKVTransferState)
 from vllm.core.custom_schedulers.hierarchical_io import (
     HierarchicalIOConfig, HierarchicalLayerBarrierConfig,
-    HierarchicalRestoreController, PrefetchUnit, RollingPrefetchConfig,
-    RollingPrefetchRuntime, activate_layer_barrier, build_layer_restore_plan,
-    select_prefetch_unit_blocks, wait_for_local_layer)
+    HierarchicalRestoreController, PrefetchBlockSelectorConfig, PrefetchUnit,
+    RollingPrefetchConfig, RollingPrefetchRuntime, activate_layer_barrier,
+    build_layer_restore_plan, select_prefetch_unit_blocks,
+    wait_for_local_layer)
 
 
 def test_layer_restore_plan_is_contiguous_and_default_disabled():
@@ -62,6 +63,34 @@ def test_prefetch_unit_rejects_ambiguous_or_invalid_block_selection():
     with pytest.raises(ValueError, match="outside"):
         select_prefetch_unit_blocks(unit, ((10, 20), ),
                                     (LogicalBlockKey(7, 0), ))
+
+
+def test_sparse_prefetch_selector_builds_profiling_only_plan():
+    """selector 只改变 block 投影，不改变 layer unit 生命周期。"""
+    config = PrefetchBlockSelectorConfig.from_env({
+        "VLLM_BAM_MDS_PREFETCH_BLOCK_SELECTOR": "tail_n",
+        "VLLM_BAM_MDS_PREFETCH_BLOCK_COUNT": "2",
+    })
+    plan = build_layer_restore_plan(plan_id="restore-sparse",
+                                    num_layers=6,
+                                    window_layers=2,
+                                    block_selector=config,
+                                    num_blocks=5,
+                                    created_monotonic_ns=100)
+    assert plan.profiling_only
+    assert plan.block_selector == "tail_n"
+    assert [unit.layer_range for unit in plan.units] == [
+        (0, 2), (2, 4), (4, 6)
+    ]
+    assert [unit.block_indices for unit in plan.units] == [(3, 4)] * 3
+
+
+def test_stride_prefetch_selector_is_deterministic():
+    config = PrefetchBlockSelectorConfig.from_env({
+        "VLLM_BAM_MDS_PREFETCH_BLOCK_SELECTOR": "stride",
+        "VLLM_BAM_MDS_PREFETCH_BLOCK_STRIDE": "2",
+    })
+    assert config.select(5) == (0, 2, 4)
 
 
 def test_rolling_config_is_explicit_and_validated():

@@ -75,6 +75,9 @@ if TYPE_CHECKING:
     VLLM_BAM_MDS_HIERARCHICAL_LEAD_WINDOWS: int = 1
     VLLM_BAM_MDS_HIERARCHICAL_MAX_LEAD_WINDOWS: int = 1
     VLLM_BAM_MDS_HIERARCHICAL_TARGET_SLACK_MS: float = 0.0
+    VLLM_BAM_MDS_PREFETCH_BLOCK_SELECTOR: str = "dense"
+    VLLM_BAM_MDS_PREFETCH_BLOCK_COUNT: int = 0
+    VLLM_BAM_MDS_PREFETCH_BLOCK_STRIDE: int = 1
     VLLM_BAM_DIRECT_PLACEMENT: bool = False
     VLLM_BAM_DIRECT_PLACEMENT_IMPL: str = "lmcache"
     VLLM_BAM_DIRECT_PLACEMENT_RUNTIME_ONE_COPY: bool = False
@@ -569,6 +572,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_BAM_MDS_HIERARCHICAL_TARGET_SLACK_MS":
     lambda: float(
         os.getenv("VLLM_BAM_MDS_HIERARCHICAL_TARGET_SLACK_MS", "0")),
+
+    "VLLM_BAM_MDS_PREFETCH_BLOCK_SELECTOR":
+    lambda: os.getenv("VLLM_BAM_MDS_PREFETCH_BLOCK_SELECTOR", "dense"),
+    "VLLM_BAM_MDS_PREFETCH_BLOCK_COUNT":
+    lambda: int(os.getenv("VLLM_BAM_MDS_PREFETCH_BLOCK_COUNT", "0")),
+    "VLLM_BAM_MDS_PREFETCH_BLOCK_STRIDE":
+    lambda: int(os.getenv("VLLM_BAM_MDS_PREFETCH_BLOCK_STRIDE", "1")),
 
     # 是否启用 Direct Placement v0。
     # 开启后 LMCache retrieve 会优先尝试：

@@ -256,6 +256,60 @@ def test_bam_mds_hierarchical_prefix_first_window_admission(monkeypatch):
         reuse_seq, Device.GPU) == 2
 
 
+def test_bam_mds_sparse_prefetch_selector_is_profiling_only(monkeypatch):
+    """部分 block restore 目前只做 I/O profiling，不能发布完整 prefix。"""
+    monkeypatch.setenv("VLLM_BAM_MDS_PREFIX_ENABLE", "1")
+    monkeypatch.setenv("VLLM_BAM_MDS_HIERARCHICAL_IO_ENABLE", "1")
+    monkeypatch.setenv("VLLM_BAM_MDS_HIERARCHICAL_NUM_LAYERS", "4")
+    monkeypatch.setenv("VLLM_BAM_MDS_HIERARCHICAL_WINDOW_LAYERS", "2")
+    monkeypatch.setenv("VLLM_BAM_MDS_PREFETCH_BLOCK_SELECTOR", "tail_n")
+    monkeypatch.setenv("VLLM_BAM_MDS_PREFETCH_BLOCK_COUNT", "1")
+    scheduler = _create_scheduler(enable_prefix_caching=True)
+
+    prefix_tokens = list(range(8))
+    source_seq, source_group = create_dummy_prompt(
+        "92", prompt_tokens=prefix_tokens, block_size=4)
+    scheduler.add_seq_group(source_group)
+    schedule_and_update_computed_tokens(scheduler)
+    source_seq.status = SequenceStatus.FINISHED_STOPPED
+    scheduler.free_seq(source_seq)
+    scheduler.free_finished_seq_groups()
+    store = scheduler.drain_async_kv_transfers_to_submit()[0]
+    scheduler.apply_async_kv_event(
+        AsyncKVTransferEvent(store.request_id,
+                             AsyncKVTransferState.READY))
+    scheduler.complete_ready_async_kv_transfers()
+    assert scheduler.block_manager.reset_prefix_cache(Device.GPU)
+
+    reuse_seq, reuse_group = create_dummy_prompt(
+        "93",
+        prompt_tokens=prefix_tokens + [100, 101, 102, 103],
+        block_size=4,
+    )
+    scheduler.add_seq_group(reuse_group)
+    assert scheduler._maybe_start_bam_mds_prefix_restore() == 1
+    windows = scheduler.drain_async_kv_transfers_to_submit()
+
+    # tail_n=1 只恢复父 reservation 的最后一个 block。这个请求能验证 MDS
+    # 小粒度 I/O 链路，但由于缺少 sparse attention consumer，不能被当作
+    # 完整 prefix hit 发布。
+    assert [request.layer_range for request in windows] == [(0, 2), (2, 4)]
+    assert [len(request.block_mapping) for request in windows] == [1, 1]
+    assert [[key.logical_index for key in request.logical_blocks]
+            for request in windows] == [[1], [1]]
+
+    for request in windows:
+        scheduler.apply_async_kv_event(
+            AsyncKVTransferEvent(request.request_id,
+                                 AsyncKVTransferState.READY))
+    scheduler.complete_ready_async_kv_transfers()
+
+    assert reuse_seq.status == SequenceStatus.FINISHED_IGNORED
+    assert reuse_group not in scheduler.running
+    assert scheduler.block_manager.get_mds_cached_prefix_blocks(
+        reuse_seq, Device.GPU) == 0
+
+
 def test_bam_mds_layer_barrier_dispatches_after_first_unit(monkeypatch):
     """Step 4 只提前 dispatch，后续 window 完成前仍不可发布 prefix hash。"""
     monkeypatch.setenv("VLLM_BAM_MDS_PREFIX_ENABLE", "1")

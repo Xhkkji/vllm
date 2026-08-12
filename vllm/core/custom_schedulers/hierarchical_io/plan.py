@@ -13,6 +13,79 @@ from vllm.core.block_reservation import BlockMapping, LogicalBlockKey
 
 
 @dataclass(frozen=True)
+class PrefetchBlockSelectorConfig:
+    """把父 reservation 的 block 集合裁剪成可 profiling 的小粒度 I/O。
+
+    默认 ``dense`` 保持现有 layer-prefetch 语义：每个 unit 都恢复父
+    reservation 的全部 blocks。非 dense selector 只是为 sparse attention
+    的访问模式提前打通 I/O 控制面，当前必须视为 profiling-only：它可以
+    测 BaM 小粒度 restore 的提交、完成和带宽，但不能把完整 prefix hash
+    发布给 vLLM 原生 prefix cache。
+    """
+
+    policy: str = "dense"
+    block_count: int = 0
+    stride: int = 1
+
+    @classmethod
+    def from_env(
+        cls,
+        environ: Optional[Mapping[str, str]] = None,
+    ) -> "PrefetchBlockSelectorConfig":
+        values = os.environ if environ is None else environ
+        policy = values.get(
+            "VLLM_BAM_MDS_PREFETCH_BLOCK_SELECTOR",
+            "dense",
+        ).strip().lower()
+        block_count = int(
+            values.get("VLLM_BAM_MDS_PREFETCH_BLOCK_COUNT", "0"))
+        stride = int(values.get("VLLM_BAM_MDS_PREFETCH_BLOCK_STRIDE", "1"))
+
+        if policy in ("", "none", "all"):
+            policy = "dense"
+        if policy not in ("dense", "tail_n", "recent_n", "stride"):
+            raise ValueError(
+                "VLLM_BAM_MDS_PREFETCH_BLOCK_SELECTOR must be one of "
+                "dense, tail_n, recent_n, stride")
+        if policy in ("tail_n", "recent_n") and block_count <= 0:
+            raise ValueError(
+                "VLLM_BAM_MDS_PREFETCH_BLOCK_COUNT must be positive for "
+                f"{policy}")
+        if policy == "stride" and stride <= 0:
+            raise ValueError(
+                "VLLM_BAM_MDS_PREFETCH_BLOCK_STRIDE must be positive")
+        return cls(policy=policy, block_count=block_count, stride=stride)
+
+    @property
+    def is_dense(self) -> bool:
+        return self.policy == "dense"
+
+    @property
+    def profiling_only(self) -> bool:
+        """非 dense selector 目前只用于 I/O profiling，不发布完整 prefix。"""
+        return not self.is_dense
+
+    def select(self, total_blocks: int) -> Optional[Tuple[int, ...]]:
+        """返回 reservation-relative block indices；dense 返回 ``None``。
+
+        这里故意只提供两个最小 selector：
+        - ``tail_n/recent_n``：模拟 sparse attention 常见的近邻 KV 访问。
+        - ``stride``：制造可重复的稀疏采样，用于观察随机/跨段 restore 开销。
+        后续真实 sparse mask 也应只替换这个选择函数，而不改 MDS 生命周期。
+        """
+        if total_blocks <= 0:
+            raise ValueError("prefetch selector requires at least one block")
+        if self.policy == "dense":
+            return None
+        if self.policy in ("tail_n", "recent_n"):
+            count = min(self.block_count, total_blocks)
+            return tuple(range(total_blocks - count, total_blocks))
+        if self.policy == "stride":
+            return tuple(range(0, total_blocks, self.stride))
+        raise AssertionError(f"unreachable selector policy: {self.policy}")
+
+
+@dataclass(frozen=True)
 class PrefetchUnit:
     """一个可独立激活和等待的细粒度 prefetch 单元。
 
@@ -69,6 +142,8 @@ class PrefetchPlan:
     plan_id: str
     units: Tuple[PrefetchUnit, ...]
     created_monotonic_ns: int
+    block_selector: str = "dense"
+    profiling_only: bool = False
 
     @property
     def first_unit(self) -> PrefetchUnit:
@@ -176,6 +251,8 @@ class HierarchicalIOConfig:
     num_layers: int = 0
     window_layers: int = 0
     rolling: RollingPrefetchConfig = RollingPrefetchConfig()
+    block_selector: PrefetchBlockSelectorConfig = (
+        PrefetchBlockSelectorConfig())
 
     @classmethod
     def from_env(
@@ -203,14 +280,19 @@ class HierarchicalIOConfig:
         return cls(enabled=True,
                    num_layers=num_layers,
                    window_layers=window_layers,
-                   rolling=RollingPrefetchConfig.from_env(values))
+                   rolling=RollingPrefetchConfig.from_env(values),
+                   block_selector=PrefetchBlockSelectorConfig.from_env(
+                       values))
 
-    def build_plan(self, plan_id: str) -> PrefetchPlan:
+    def build_plan(self, plan_id: str,
+                   num_blocks: Optional[int] = None) -> PrefetchPlan:
         if not self.enabled:
             raise RuntimeError("hierarchical I/O is disabled")
         return build_layer_restore_plan(plan_id=plan_id,
                                         num_layers=self.num_layers,
-                                        window_layers=self.window_layers)
+                                        window_layers=self.window_layers,
+                                        block_selector=self.block_selector,
+                                        num_blocks=num_blocks)
 
 
 def build_layer_restore_plan(
@@ -219,6 +301,9 @@ def build_layer_restore_plan(
     num_layers: int,
     window_layers: int,
     created_monotonic_ns: Optional[int] = None,
+    block_selector: PrefetchBlockSelectorConfig = (
+        PrefetchBlockSelectorConfig()),
+    num_blocks: Optional[int] = None,
 ) -> PrefetchPlan:
     """按模型执行顺序生成连续、无重叠、无空洞的 layer windows。"""
     if not plan_id:
@@ -228,10 +313,18 @@ def build_layer_restore_plan(
     if window_layers <= 0:
         raise ValueError("window_layers must be positive")
 
+    block_indices = None
+    if not block_selector.is_dense:
+        if num_blocks is None:
+            raise ValueError(
+                "num_blocks is required for sparse prefetch selector")
+        block_indices = block_selector.select(num_blocks)
+
     units = tuple(
         PrefetchUnit(index=index,
                      start_layer=start,
-                     end_layer=min(start + window_layers, num_layers))
+                     end_layer=min(start + window_layers, num_layers),
+                     block_indices=block_indices)
         for index, start in enumerate(range(0, num_layers, window_layers)))
     return PrefetchPlan(
         plan_id=plan_id,
@@ -239,4 +332,6 @@ def build_layer_restore_plan(
         created_monotonic_ns=(time.monotonic_ns()
                               if created_monotonic_ns is None else
                               created_monotonic_ns),
+        block_selector=block_selector.policy,
+        profiling_only=block_selector.profiling_only,
     )

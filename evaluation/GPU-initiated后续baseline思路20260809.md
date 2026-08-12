@@ -222,3 +222,88 @@ arrival_rate = 0.25, 0.5, 1.0, 2.0 req/s
 当前优先级最高的是：
 
 > 先完成 baseline 实验闭环，再继续大改 scheduler。
+
+## 10. 当前推进目标：Sparse Attention 驱动的细粒度 KV 调度
+
+前面的 baseline 和 layerwise restore 实验已经给出一个更明确的方向：
+
+```text
+在长上下文 KV restore 中，如果 attention 只访问部分历史 KV block，
+就不应恢复和保留完整 prefix。BaM/MDS 可以按 block 粒度读取需要的数据，
+从而减少实际 SSD 访问量和物理 restore 时间。
+```
+
+当前 profiling 已经验证了这条 I/O 链路的可行性。在 1024-token 输入、
+768-token prefix、28 层模型、4 层/window、7 个 MDS in-flight request
+的测试中：
+
+| 模式 | 每个 layer unit 读取 blocks | physical restore |
+|---|---:|---:|
+| dense | 48 | 14.72 ms |
+| `tail_n=1` | 1 | 7.38 ms |
+| `tail_n=2` | 2 | 12.11 ms |
+| `stride=2` | 24 | 8.43 ms |
+
+因此当前可以支持的保守结论是：
+
+- BaM/MDS 已经能够真实执行 partial-block restore；
+- sparse-style 的部分 block 访问可以降低物理 restore 时间；
+- 小粒度下仍存在 submit、CQ poll、MDS handle 和 scheduler 控制面等固定开销；
+- 目前验证的是 I/O profiling 收益，还不是 sparse attention 端到端
+  TTFT/TPOT 收益。
+
+### 目标系统
+
+后续目标是把 layerwise prefetch 和 sparse-style block 访问结合起来：
+
+```text
+layer window 决定什么时候恢复；
+sparse attention 访问计划决定恢复哪些 KV block；
+BaM/MDS 负责 SSD -> GPU 的细粒度异步读取；
+调度器在多个请求之间管理 restore、priority、in-flight 和 lead distance；
+当前 layer 使用完成且后续不再访问的 KV block 可以逐出 GPU。
+```
+
+这个目标针对两个实际问题：
+
+```text
+1. 长上下文请求的完整 KV 无法长期驻留 GPU；
+2. 多轮对话和多请求 batching 会放大 KV 显存压力，限制并发扩展。
+```
+
+理想的系统行为是：
+
+```text
+请求 A 正在执行当前 layer；
+请求 B 的下一 layer 所需 KV 在后台从 SSD 恢复；
+请求 C 只恢复 sparse attention 实际会访问的 block；
+已消费且不再需要的 block 被释放，供其他请求复用。
+```
+
+最终希望形成：
+
+> 面向长上下文与多轮对话服务，基于 BaM GPU-Initiated 直通存储路径，
+> 按 sparse attention 访问计划恢复部分 KV block，结合 layer-window
+> overlap、多请求细粒度调度和用后逐出，缓解 KV Cache 对 GPU 显存和
+> batch 扩展性的限制。
+
+### 还需要补齐的语义
+
+当前 partial-block restore 仍然是 profiling-only，真正接入 sparse
+attention 前需要补齐：
+
+1. **Partial residency：** 明确哪些 KV block 已在 GPU，哪些仍在 SSD；
+2. **Sparse consumer contract：** 保证 attention 只访问已经恢复的 block；
+3. **Safe eviction：** 根据后续 layer 的访问计划判断 block 何时可以逐出；
+4. **Multi-request scheduling：** 在多个请求之间批量提交和公平调度
+   layer-window restore，避免单个长上下文请求独占 MDS slots。
+
+因此下一步不应直接重写完整 scheduler，而应按以下顺序推进：
+
+```text
+1. 把真实 sparse attention 的 block 访问计划接入 PrefetchPlan；
+2. 验证 partial residency 与 attention block table 的一致性；
+3. 在单请求上验证 layerwise sparse restore 的正确性；
+4. 再加入多请求 batch、in-flight 限制和用后逐出；
+5. 最后与 LMCache dense restore baseline 对比端到端 TTFT/TPOT 和显存占用。
+```

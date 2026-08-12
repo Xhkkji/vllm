@@ -352,14 +352,18 @@ class AsyncKVScheduler(Scheduler):
     ) -> None:
         """按通用 prefetch plan 投影并建立多个 MDS 子请求。"""
         plan = self.hierarchical_io_config.build_plan(
-            reservation.reservation_id)
+            reservation.reservation_id,
+            num_blocks=len(reservation.block_mapping),
+        )
         requests = []
+        selected_block_counts = []
         for unit in plan.units:
-            # 当前 layer plan 的 block_indices 为 None，投影结果与历史逻辑
-            # 完全一致。后续 sparse selector 只改变 unit 的 block 选择，不必
-            # 再复制 reservation、队列和 MDS 生命周期代码。
+            # dense layer plan 的 block_indices 为 None，投影结果与历史逻辑
+            # 完全一致。sparse-style selector 只改变 unit 的 block 选择，不
+            # 复制 reservation、队列和 MDS 生命周期代码。
             block_mapping, logical_blocks = select_prefetch_unit_blocks(
                 unit, reservation.block_mapping, reservation.logical_blocks)
+            selected_block_counts.append(len(block_mapping))
             requests.append(
                 self.async_kv_policy.enqueue(
                     seq_group.request_id,
@@ -378,22 +382,28 @@ class AsyncKVScheduler(Scheduler):
 
         logger.info(
             "[BAM_MDS_HIERARCHICAL] phase=plan_queued plan_id=%s "
-            "seq_group_id=%s windows=%d blocks=%d",
+            "seq_group_id=%s windows=%d blocks=%d selector=%s "
+            "profiling_only=%s selected_blocks_per_unit=%s",
             plan.plan_id,
             seq_group.request_id,
             len(plan.units),
             len(reservation.block_mapping),
+            plan.block_selector,
+            plan.profiling_only,
+            ",".join(str(count) for count in selected_block_counts),
         )
         for request, unit in zip(requests, plan.units):
             logger.info(
                 "[BAM_MDS_HIERARCHICAL] phase=window_queued plan_id=%s "
-                "request_id=%s window=%d/%d layer_range=[%d,%d)",
+                "request_id=%s window=%d/%d layer_range=[%d,%d) "
+                "selected_blocks=%d",
                 plan.plan_id,
                 request.request_id,
                 unit.index,
                 len(plan.units),
                 unit.start_layer,
                 unit.end_layer,
+                len(request.block_mapping),
             )
 
     def _preempt_long_context_victims_for_waiting(self) -> int:
@@ -786,7 +796,7 @@ class AsyncKVScheduler(Scheduler):
             progress.unit.start_layer,
             progress.unit.end_layer,
         )
-        if progress.first_unit_became_ready:
+        if progress.first_unit_became_ready and not progress.profiling_only:
             # 这是 Step 2 的 first-window-ready admission。该集合表示调度器
             # 已接受请求并可在未来交给 layer pipeline；当前不修改 RUNNING
             # 状态，确保 Step 4 之前完整 model forward 看不到半恢复 KV。
@@ -828,7 +838,8 @@ class AsyncKVScheduler(Scheduler):
             return
 
         self.hierarchical_prefix_admitted.discard(progress.plan_id)
-        if progress.all_ready and not progress.cancelled:
+        if (progress.all_ready and not progress.cancelled
+                and not progress.profiling_only):
             restored_prefix_tokens = (
                 self.block_manager.commit_mds_prefix_restore(progress.plan_id))
             # barrier 模式已在首窗 READY 时推进 frontier 并转为 RUNNING；
@@ -855,20 +866,36 @@ class AsyncKVScheduler(Scheduler):
         else:
             # 任一 window 失败，或者首窗准入后用户 abort，都不能发布这个
             # prefix。此处已经确认全部子 DMA 终态，释放 target 才是安全的。
+            terminal_ns = time.monotonic_ns()
             self.block_manager.abort_mds_prefix_restore(progress.plan_id)
-            for seq in seq_group.get_seqs():
-                if not seq.is_finished():
-                    seq.status = (SequenceStatus.FINISHED_ABORTED
-                                  if progress.cancelled else
-                                  SequenceStatus.FINISHED_IGNORED)
-            super()._free_finished_seq_group(seq_group)
+            if progress.profiling_only and progress.all_ready:
+                # 非 dense selector 只用于验证 BaM 细粒度 I/O 形态。因为只恢复
+                # 了 prefix 的部分 blocks，当前还没有 sparse attention consumer
+                # 与 partial-residency 语义，绝不能把完整 prefix 发布为 computed。
+                # 这里把请求标记为 ignored 并释放 reservation/block table；它
+                # 是 profiling 实验终点，不承诺端到端生成。
+                for seq in seq_group.get_seqs():
+                    if not seq.is_finished():
+                        seq.status = SequenceStatus.FINISHED_IGNORED
+                super()._free_finished_seq_group(seq_group)
+            else:
+                for seq in seq_group.get_seqs():
+                    if not seq.is_finished():
+                        seq.status = (SequenceStatus.FINISHED_ABORTED
+                                      if progress.cancelled else
+                                      SequenceStatus.FINISHED_IGNORED)
+                super()._free_finished_seq_group(seq_group)
             logger.info(
                 "[BAM_MDS_HIERARCHICAL] phase=restore_aborted "
-                "plan_id=%s seq_group_id=%s failed=%s cancelled=%s",
+                "plan_id=%s seq_group_id=%s failed=%s cancelled=%s "
+                "profiling_only=%s selector=%s profiling_restore_ms=%.3f",
                 progress.plan_id,
                 seq_group.request_id,
                 progress.failed,
                 progress.cancelled,
+                progress.profiling_only,
+                progress.block_selector,
+                (terminal_ns - progress.plan_created_monotonic_ns) / 1.0e6,
             )
 
         self.hierarchical_prefix_restores.release(progress.plan_id)

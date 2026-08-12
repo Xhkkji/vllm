@@ -83,7 +83,7 @@ class RollingPrefetchRuntime:
             plan_key,
             _PlanState(plan_id=plan_id,
                        units={},
-                       lead_units=self.config.lead_windows))
+                       lead_units=self.config.lead_units))
         if unit_index in plan.units:
             raise RuntimeError(
                 f"duplicate prefetch unit: {plan_id}/{unit_index}")
@@ -187,7 +187,7 @@ class RollingPrefetchRuntime:
             # 不够；只扩大本 plan 的未来窗口，不修改全局 scheduler 优先级。
             target_ns = int(self.config.target_slack_ms * 1.0e6)
             if (target_ns > 0 and wait_ns > target_ns
-                    and plan.lead_units < self.config.max_lead_windows):
+                    and plan.lead_units < self.config.max_lead_units):
                 plan.lead_units += 1
             self._traces.append(
                 PrefetchRuntimeTrace(

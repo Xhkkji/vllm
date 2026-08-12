@@ -22,7 +22,7 @@ from vllm.core.custom_schedulers.async_kv_transfer import (
     AsyncKVTransferOperation, AsyncKVTransferRequest, AsyncKVTransferState)
 from vllm.core.custom_schedulers.hierarchical_io import (
     HierarchicalIOConfig, HierarchicalLayerBarrierConfig,
-    HierarchicalRestoreController)
+    HierarchicalRestoreController, select_prefetch_unit_blocks)
 from vllm.logger import init_logger
 from vllm.sequence import Sequence, SequenceGroup, SequenceStatus
 
@@ -350,20 +350,28 @@ class AsyncKVScheduler(Scheduler):
         seq_group: SequenceGroup,
         reservation: BlockPrefixRestoreReservation,
     ) -> None:
-        """为同一个 prefix reservation 建立多个 layer-window 子请求。"""
+        """按通用 prefetch plan 投影并建立多个 MDS 子请求。"""
         plan = self.hierarchical_io_config.build_plan(
             reservation.reservation_id)
-        requests = tuple(
-            self.async_kv_policy.enqueue(
-                seq_group.request_id,
-                reservation.reservation_id,
-                AsyncKVTransferOperation.READ,
-                reservation.block_mapping,
-                reservation.logical_blocks,
-                layer_range=window.layer_range,
-                prefetch_plan_id=plan.plan_id,
-                prefetch_unit_index=window.index,
-            ) for window in plan.windows)
+        requests = []
+        for unit in plan.units:
+            # 当前 layer plan 的 block_indices 为 None，投影结果与历史逻辑
+            # 完全一致。后续 sparse selector 只改变 unit 的 block 选择，不必
+            # 再复制 reservation、队列和 MDS 生命周期代码。
+            block_mapping, logical_blocks = select_prefetch_unit_blocks(
+                unit, reservation.block_mapping, reservation.logical_blocks)
+            requests.append(
+                self.async_kv_policy.enqueue(
+                    seq_group.request_id,
+                    reservation.reservation_id,
+                    AsyncKVTransferOperation.READ,
+                    block_mapping,
+                    logical_blocks,
+                    layer_range=unit.layer_range,
+                    prefetch_plan_id=plan.plan_id,
+                    prefetch_unit_index=unit.index,
+                ))
+        requests = tuple(requests)
         self.hierarchical_prefix_restores.register(
             plan, tuple(request.request_id for request in requests))
         self.hierarchical_prefix_loading[plan.plan_id] = seq_group
@@ -373,19 +381,19 @@ class AsyncKVScheduler(Scheduler):
             "seq_group_id=%s windows=%d blocks=%d",
             plan.plan_id,
             seq_group.request_id,
-            len(plan.windows),
+            len(plan.units),
             len(reservation.block_mapping),
         )
-        for request, window in zip(requests, plan.windows):
+        for request, unit in zip(requests, plan.units):
             logger.info(
                 "[BAM_MDS_HIERARCHICAL] phase=window_queued plan_id=%s "
                 "request_id=%s window=%d/%d layer_range=[%d,%d)",
                 plan.plan_id,
                 request.request_id,
-                window.index,
-                len(plan.windows),
-                window.start_layer,
-                window.end_layer,
+                unit.index,
+                len(plan.units),
+                unit.start_layer,
+                unit.end_layer,
             )
 
     def _preempt_long_context_victims_for_waiting(self) -> int:
@@ -774,11 +782,11 @@ class AsyncKVScheduler(Scheduler):
             progress.plan_id,
             request.request_id,
             seq_group.request_id,
-            progress.window.index,
-            progress.window.start_layer,
-            progress.window.end_layer,
+            progress.unit.index,
+            progress.unit.start_layer,
+            progress.unit.end_layer,
         )
-        if progress.first_window_became_ready:
+        if progress.first_unit_became_ready:
             # 这是 Step 2 的 first-window-ready admission。该集合表示调度器
             # 已接受请求并可在未来交给 layer pipeline；当前不修改 RUNNING
             # 状态，确保 Step 4 之前完整 model forward 看不到半恢复 KV。
@@ -789,7 +797,7 @@ class AsyncKVScheduler(Scheduler):
                 "dispatch_gate=%s",
                 progress.plan_id,
                 seq_group.request_id,
-                (progress.first_window_ready_monotonic_ns -
+                (progress.first_unit_ready_monotonic_ns -
                  progress.plan_created_monotonic_ns) / 1.0e6,
                 ("layer_barrier" if self.hierarchical_layer_barrier_config.
                  enabled else "closed"),
@@ -841,7 +849,7 @@ class AsyncKVScheduler(Scheduler):
                 progress.plan_id,
                 seq_group.request_id,
                 (committed_ns - progress.plan_created_monotonic_ns) / 1.0e6,
-                (committed_ns - progress.first_window_ready_monotonic_ns)
+                (committed_ns - progress.first_unit_ready_monotonic_ns)
                 / 1.0e6,
             )
         else:
@@ -1118,10 +1126,10 @@ class AsyncKVScheduler(Scheduler):
             if plan_id in self._hierarchical_rolling_staged_plans:
                 continue
             initial = self.async_kv_policy.activate_plan(
-                plan_id, self.hierarchical_io_config.rolling.initial_windows)
+                plan_id, self.hierarchical_io_config.rolling.initial_units)
             # 没拿到完整首批 slot 时暂不 stage。否则 Worker 只有未来模板，
             # 首窗却仍是 QUEUED，首窗 READY admission 永远无法发生。
-            if len(initial) < self.hierarchical_io_config.rolling.initial_windows:
+            if len(initial) < self.hierarchical_io_config.rolling.initial_units:
                 continue
             requests.extend(initial)
             requests.extend(self.async_kv_policy.stage_plan(plan_id))

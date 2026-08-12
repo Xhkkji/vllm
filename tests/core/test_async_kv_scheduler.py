@@ -227,6 +227,11 @@ def test_bam_mds_hierarchical_prefix_first_window_admission(monkeypatch):
     windows = scheduler.drain_async_kv_transfers_to_submit()
     assert [request.layer_range for request in windows] == [(0, 2), (2, 4)]
     assert len({request.reservation_id for request in windows}) == 1
+    # 通用 PrefetchUnit 接口下，dense layer plan 默认仍为每个层窗读取父
+    # reservation 的全部 blocks，不能因为加入可选 block 选择而缩小数据集。
+    assert [len(request.block_mapping) for request in windows] == [2, 2]
+    assert windows[0].block_mapping == windows[1].block_mapping
+    assert windows[0].logical_blocks == windows[1].logical_blocks
 
     # 第一组层已经在 GPU，但完整 block hash 仍不可发布，也不能进入 running。
     scheduler.apply_async_kv_event(
@@ -251,7 +256,7 @@ def test_bam_mds_hierarchical_prefix_first_window_admission(monkeypatch):
         reuse_seq, Device.GPU) == 2
 
 
-def test_bam_mds_layer_barrier_dispatches_after_first_window(monkeypatch):
+def test_bam_mds_layer_barrier_dispatches_after_first_unit(monkeypatch):
     """Step 4 只提前 dispatch，后续 window 完成前仍不可发布 prefix hash。"""
     monkeypatch.setenv("VLLM_BAM_MDS_PREFIX_ENABLE", "1")
     monkeypatch.setenv("VLLM_BAM_MDS_HIERARCHICAL_IO_ENABLE", "1")

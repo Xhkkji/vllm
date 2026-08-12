@@ -2,14 +2,17 @@
 
 """层级 I/O plan 和父事务屏障的纯控制面测试。"""
 
+import pytest
+
+from vllm.core.block_reservation import LogicalBlockKey
 from vllm.core.custom_schedulers.async_kv_transfer import (
     AsyncKVTransferEvent, AsyncKVTransferOperation, AsyncKVTransferPriority,
     AsyncKVTransferRequest, AsyncKVTransferState)
 from vllm.core.custom_schedulers.hierarchical_io import (
     HierarchicalIOConfig, HierarchicalLayerBarrierConfig,
-    HierarchicalRestoreController, RollingPrefetchConfig,
+    HierarchicalRestoreController, PrefetchUnit, RollingPrefetchConfig,
     RollingPrefetchRuntime, activate_layer_barrier, build_layer_restore_plan,
-    wait_for_local_layer)
+    select_prefetch_unit_blocks, wait_for_local_layer)
 
 
 def test_layer_restore_plan_is_contiguous_and_default_disabled():
@@ -19,10 +22,46 @@ def test_layer_restore_plan_is_contiguous_and_default_disabled():
                                     num_layers=10,
                                     window_layers=4,
                                     created_monotonic_ns=100)
-    assert [window.layer_range for window in plan.windows] == [
+    assert [unit.layer_range for unit in plan.units] == [
         (0, 4), (4, 8), (8, 10)
     ]
-    assert [window.index for window in plan.windows] == [0, 1, 2]
+    assert [unit.index for unit in plan.units] == [0, 1, 2]
+    assert all(unit.block_indices is None for unit in plan.units)
+
+
+def test_prefetch_unit_projects_dense_and_sparse_block_sets():
+    """同一个接口应同时表达 layer 全量读取和未来 sparse 子集读取。"""
+    mapping = ((10, 20), (11, 21), (12, 22), (13, 23))
+    logical_blocks = tuple(LogicalBlockKey(7, index) for index in range(4))
+
+    dense = PrefetchUnit(index=0, start_layer=0, end_layer=2)
+    assert select_prefetch_unit_blocks(dense, mapping,
+                                       logical_blocks) == (mapping,
+                                                           logical_blocks)
+
+    sparse = PrefetchUnit(index=1,
+                          start_layer=2,
+                          end_layer=4,
+                          block_indices=(0, 2, 3))
+    selected_mapping, selected_keys = select_prefetch_unit_blocks(
+        sparse, mapping, logical_blocks)
+    assert selected_mapping == ((10, 20), (12, 22), (13, 23))
+    assert [key.logical_index for key in selected_keys] == [0, 2, 3]
+
+
+def test_prefetch_unit_rejects_ambiguous_or_invalid_block_selection():
+    with pytest.raises(ValueError, match="strictly increasing"):
+        PrefetchUnit(index=0,
+                     start_layer=0,
+                     end_layer=2,
+                     block_indices=(1, 1))
+    unit = PrefetchUnit(index=0,
+                        start_layer=0,
+                        end_layer=2,
+                        block_indices=(2, ))
+    with pytest.raises(ValueError, match="outside"):
+        select_prefetch_unit_blocks(unit, ((10, 20), ),
+                                    (LogicalBlockKey(7, 0), ))
 
 
 def test_rolling_config_is_explicit_and_validated():
@@ -33,8 +72,8 @@ def test_rolling_config_is_explicit_and_validated():
         "VLLM_BAM_MDS_HIERARCHICAL_TARGET_SLACK_MS": "0.5",
     })
     assert config.enabled
-    assert config.initial_windows == 2
-    assert config.max_lead_windows == 3
+    assert config.initial_units == 2
+    assert config.max_lead_units == 3
 
 
 def _prefetch_request(index: int, *, activate: bool) -> AsyncKVTransferRequest:
@@ -56,8 +95,8 @@ def _prefetch_request(index: int, *, activate: bool) -> AsyncKVTransferRequest:
 def test_rolling_runtime_activates_future_unit_from_model_progress():
     runtime = RollingPrefetchRuntime(
         RollingPrefetchConfig(enabled=True,
-                              lead_windows=1,
-                              max_lead_windows=1))
+                              lead_units=1,
+                              max_lead_units=1))
     activated = []
     ready = set()
 
@@ -110,13 +149,13 @@ def test_first_window_admission_is_separate_from_full_restore():
 
     # 后续 window 可以乱序完成，但不能冒充 first-window-ready admission。
     progress = controller.mark_ready("w2", now_monotonic_ns=150)
-    assert not progress.first_window_ready
+    assert not progress.first_unit_ready
     assert not progress.all_terminal
 
     progress = controller.mark_ready("w0", now_monotonic_ns=200)
-    assert progress.first_window_became_ready
-    assert progress.first_window_ready
-    assert progress.first_window_ready_monotonic_ns == 200
+    assert progress.first_unit_became_ready
+    assert progress.first_unit_ready
+    assert progress.first_unit_ready_monotonic_ns == 200
     assert not progress.all_terminal
 
     controller.mark_ready("w1", now_monotonic_ns=250)

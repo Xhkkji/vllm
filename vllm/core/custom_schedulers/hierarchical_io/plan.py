@@ -7,21 +7,46 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass
-from typing import Mapping, Optional, Tuple
+from typing import Mapping, Optional, Sequence, Tuple
+
+from vllm.core.block_reservation import BlockMapping, LogicalBlockKey
 
 
 @dataclass(frozen=True)
-class LayerWindow:
-    """一个可独立激活的 prefetch unit。
+class PrefetchUnit:
+    """一个可独立激活和等待的细粒度 prefetch 单元。
 
-    当前 consumer 是模型 layer，因此仍保留 ``start_layer/end_layer`` 命名。
-    sparse attention 后续也可以把一个 token/block tile 映射到相同的线性
-    consumer 区间，而不需要改变 stage/activate/poll/wait 四段生命周期。
+    ``start_layer/end_layer`` 描述数据首次被消费的模型层范围；
+    ``block_indices`` 描述本单元需要从父 reservation 中读取哪些 token
+    blocks。二者正交，因此 layer prefetch 使用“一个层窗 + 全部 blocks”，
+    sparse attention 后续可以使用“一个层窗 + 部分 blocks”，而无需改变
+    stage/activate/poll/wait 四段生命周期。
+
+    ``block_indices=None`` 是显式的 dense 语义，即选择父 reservation 的
+    全部 blocks。索引均相对父 reservation，而不是 SSD/GPU 物理 block id，
+    从而让 plan 保持后端无关，也不持有 allocator 生命周期。
     """
 
     index: int
     start_layer: int
     end_layer: int
+    block_indices: Optional[Tuple[int, ...]] = None
+
+    def __post_init__(self) -> None:
+        if self.index < 0:
+            raise ValueError("prefetch unit index must be non-negative")
+        if self.start_layer < 0 or self.end_layer <= self.start_layer:
+            raise ValueError("prefetch unit layer range must be non-empty")
+        if self.block_indices is None:
+            return
+        if not self.block_indices:
+            raise ValueError("prefetch unit block selection must be non-empty")
+        if any(index < 0 for index in self.block_indices):
+            raise ValueError("prefetch block index must be non-negative")
+        if any(left >= right for left, right in zip(
+                self.block_indices, self.block_indices[1:])):
+            raise ValueError(
+                "prefetch block indices must be strictly increasing")
 
     @property
     def num_layers(self) -> int:
@@ -33,49 +58,75 @@ class LayerWindow:
 
 
 @dataclass(frozen=True)
-class LayerRestorePlan:
+class PrefetchPlan:
     """一次 prefix restore 的不可变 prefetch plan。
 
-    plan 只描述层范围，不持有 block、SequenceGroup 或 MDS handle。这样
-    scheduler 和后续 model runner layer barrier 可以共享它，而不会把
-    allocator 生命周期耦合进通用策略模块。
+    plan 只保存消费范围以及相对 block 选择，不持有物理 block、
+    SequenceGroup 或 MDS handle。scheduler 和 model runner 可以共享它，
+    而不会把 allocator 生命周期耦合进策略模块。
     """
 
     plan_id: str
-    windows: Tuple[LayerWindow, ...]
+    units: Tuple[PrefetchUnit, ...]
     created_monotonic_ns: int
 
     @property
-    def first_window(self) -> LayerWindow:
-        return self.windows[0]
+    def first_unit(self) -> PrefetchUnit:
+        return self.units[0]
 
-    def window_for_layer(self, layer_index: int) -> LayerWindow:
+    def unit_for_layer(self, layer_index: int) -> PrefetchUnit:
         """返回消费 ``layer_index`` 的 unit，并尽早拒绝错误模型配置。"""
-        for window in self.windows:
-            if window.start_layer <= layer_index < window.end_layer:
-                return window
+        for unit in self.units:
+            if unit.start_layer <= layer_index < unit.end_layer:
+                return unit
         raise ValueError(f"layer is outside prefetch plan: {layer_index}")
 
 
-# 通用接口直接复用 layer-window 数据结构，不再额外套一层只有转发作用的
-# wrapper。未来其他策略只需提供相同的 index/consumer range 语义。
-PrefetchUnit = LayerWindow
-PrefetchPlan = LayerRestorePlan
+def select_prefetch_unit_blocks(
+    unit: PrefetchUnit,
+    block_mapping: BlockMapping,
+    logical_blocks: Sequence[LogicalBlockKey],
+) -> Tuple[BlockMapping, Tuple[LogicalBlockKey, ...]]:
+    """把父 reservation 投影为一个 prefetch unit 的实际 I/O 数据集。
+
+    mapping 与 logical key 必须始终一一对应，后者会在完成后更新 residency
+    directory。选择动作集中在这里，可以避免 layer/sparse 策略分别复制
+    scheduler 入队逻辑，也能在提交 MDS 前统一拦截越界或错位的计划。
+    """
+    mapping = tuple(block_mapping)
+    keys = tuple(logical_blocks)
+    if len(mapping) != len(keys):
+        raise ValueError(
+            "block mapping and logical blocks must have the same length")
+
+    # None 是当前 layer prefetch 的默认值：每个 layer window 都读取完整
+    # prefix 的对应层数据。这里返回原 tuple，不创建逐 block 中间对象。
+    if unit.block_indices is None:
+        return mapping, keys
+
+    if unit.block_indices[-1] >= len(mapping):
+        raise ValueError(
+            "prefetch block index is outside the parent reservation")
+    return (tuple(mapping[index] for index in unit.block_indices),
+            tuple(keys[index] for index in unit.block_indices))
 
 
 @dataclass(frozen=True)
 class RollingPrefetchConfig:
     """worker-local rolling activation 配置，默认关闭。
 
-    ``lead_windows`` 表示模型消费当前 window 时，至少再激活多少个未来
-    window。``target_slack_ms`` 为 0 时只使用固定 lead；大于 0 时，如果某次
+    ``lead_units`` 表示模型消费当前 unit 时，至少再激活多少个未来 unit。
+    ``target_slack_ms`` 为 0 时只使用固定 lead；大于 0 时，如果某次
     barrier 仍发生等待，runtime 会临时把 lead 增大 1，最多到
-    ``max_lead_windows``。这是最小的反馈策略，不在 scheduler 中预测 I/O。
+    ``max_lead_units``。这是最小的反馈策略，不在 scheduler 中预测 I/O。
+
+    环境变量继续沿用已发布的 ``*_LEAD_WINDOWS`` 名称，只在读取边界转换为
+    通用 unit 语义，避免破坏现有评测脚本和历史实验配置。
     """
 
     enabled: bool = False
-    lead_windows: int = 1
-    max_lead_windows: int = 1
+    lead_units: int = 1
+    max_lead_units: int = 1
     target_slack_ms: float = 0.0
 
     @classmethod
@@ -89,17 +140,17 @@ class RollingPrefetchConfig:
                 "VLLM_BAM_MDS_HIERARCHICAL_ROLLING_ENABLE", "0")))
         if not enabled:
             return cls()
-        lead_windows = int(values.get(
+        lead_units = int(values.get(
             "VLLM_BAM_MDS_HIERARCHICAL_LEAD_WINDOWS", "1"))
-        max_lead_windows = int(values.get(
+        max_lead_units = int(values.get(
             "VLLM_BAM_MDS_HIERARCHICAL_MAX_LEAD_WINDOWS",
-            str(lead_windows)))
+            str(lead_units)))
         target_slack_ms = float(values.get(
             "VLLM_BAM_MDS_HIERARCHICAL_TARGET_SLACK_MS", "0"))
-        if lead_windows < 0:
+        if lead_units < 0:
             raise ValueError(
                 "VLLM_BAM_MDS_HIERARCHICAL_LEAD_WINDOWS must be non-negative")
-        if max_lead_windows < lead_windows:
+        if max_lead_units < lead_units:
             raise ValueError(
                 "VLLM_BAM_MDS_HIERARCHICAL_MAX_LEAD_WINDOWS must be >= "
                 "VLLM_BAM_MDS_HIERARCHICAL_LEAD_WINDOWS")
@@ -107,14 +158,14 @@ class RollingPrefetchConfig:
             raise ValueError(
                 "VLLM_BAM_MDS_HIERARCHICAL_TARGET_SLACK_MS must be non-negative")
         return cls(enabled=True,
-                   lead_windows=lead_windows,
-                   max_lead_windows=max_lead_windows,
+                   lead_units=lead_units,
+                   max_lead_units=max_lead_units,
                    target_slack_ms=target_slack_ms)
 
     @property
-    def initial_windows(self) -> int:
-        """首批激活窗口数；之后由模型进度滚动激活。"""
-        return max(1, self.lead_windows)
+    def initial_units(self) -> int:
+        """首批激活 unit 数；之后由模型进度滚动激活。"""
+        return max(1, self.lead_units)
 
 
 @dataclass(frozen=True)
@@ -154,7 +205,7 @@ class HierarchicalIOConfig:
                    window_layers=window_layers,
                    rolling=RollingPrefetchConfig.from_env(values))
 
-    def build_plan(self, plan_id: str) -> LayerRestorePlan:
+    def build_plan(self, plan_id: str) -> PrefetchPlan:
         if not self.enabled:
             raise RuntimeError("hierarchical I/O is disabled")
         return build_layer_restore_plan(plan_id=plan_id,
@@ -168,7 +219,7 @@ def build_layer_restore_plan(
     num_layers: int,
     window_layers: int,
     created_monotonic_ns: Optional[int] = None,
-) -> LayerRestorePlan:
+) -> PrefetchPlan:
     """按模型执行顺序生成连续、无重叠、无空洞的 layer windows。"""
     if not plan_id:
         raise ValueError("plan_id must not be empty")
@@ -177,14 +228,14 @@ def build_layer_restore_plan(
     if window_layers <= 0:
         raise ValueError("window_layers must be positive")
 
-    windows = tuple(
-        LayerWindow(index=index,
-                    start_layer=start,
-                    end_layer=min(start + window_layers, num_layers))
+    units = tuple(
+        PrefetchUnit(index=index,
+                     start_layer=start,
+                     end_layer=min(start + window_layers, num_layers))
         for index, start in enumerate(range(0, num_layers, window_layers)))
-    return LayerRestorePlan(
+    return PrefetchPlan(
         plan_id=plan_id,
-        windows=windows,
+        units=units,
         created_monotonic_ns=(time.monotonic_ns()
                               if created_monotonic_ns is None else
                               created_monotonic_ns),

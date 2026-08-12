@@ -6,9 +6,9 @@ from .barrier import (HierarchicalLayerBarrierConfig, activate_layer_barrier,
                       wait_for_local_layer)
 from .lifecycle import (HierarchicalRestoreController,
                         HierarchicalRestoreProgress)
-from .plan import (HierarchicalIOConfig, LayerRestorePlan, LayerWindow,
-                   PrefetchPlan, PrefetchUnit, RollingPrefetchConfig,
-                   build_layer_restore_plan)
+from .plan import (HierarchicalIOConfig, PrefetchPlan, PrefetchUnit,
+                   RollingPrefetchConfig,
+                   build_layer_restore_plan, select_prefetch_unit_blocks)
 from .runtime import PrefetchRuntimeTrace, RollingPrefetchRuntime
 
 __all__ = [
@@ -16,8 +16,6 @@ __all__ = [
     "HierarchicalLayerBarrierConfig",
     "HierarchicalRestoreController",
     "HierarchicalRestoreProgress",
-    "LayerRestorePlan",
-    "LayerWindow",
     "PrefetchPlan",
     "PrefetchUnit",
     "RollingPrefetchConfig",
@@ -25,5 +23,6 @@ __all__ = [
     "PrefetchRuntimeTrace",
     "activate_layer_barrier",
     "build_layer_restore_plan",
+    "select_prefetch_unit_blocks",
     "wait_for_local_layer",
 ]

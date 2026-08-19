@@ -17,10 +17,10 @@ import os
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Callable, Iterator, Mapping, Optional, Sequence
+from typing import Callable, Iterator, Mapping, Optional, Sequence, Tuple
 
 
-LayerWaitCallback = Callable[[int, Sequence[str], int], None]
+LayerWaitCallback = Callable[[int, Sequence[str], int], Optional[Tuple[int, ...]]]
 
 
 @dataclass(frozen=True)
@@ -50,6 +50,8 @@ class _LayerBarrierSession:
 
 _ACTIVE_LAYER_BARRIER: ContextVar[Optional[_LayerBarrierSession]] = ContextVar(
     "bam_hierarchical_layer_barrier", default=None)
+_ACTIVE_SPARSE_KV_BLOCKS: ContextVar[Optional[Tuple[int, ...]]] = ContextVar(
+    "bam_sparse_kv_blocks", default=None)
 
 
 @contextmanager
@@ -75,7 +77,7 @@ def activate_layer_barrier(
         _ACTIVE_LAYER_BARRIER.reset(token)
 
 
-def wait_for_local_layer(layer_index: int) -> None:
+def wait_for_local_layer(layer_index: int) -> Optional[Tuple[int, ...]]:
     """在 attention 使用该层 KV 前确认对应 window READY。
 
     没有活动 session 时直接返回。该情况包括开关关闭、decode batch 以及不属于
@@ -83,5 +85,30 @@ def wait_for_local_layer(layer_index: int) -> None:
     """
     session = _ACTIVE_LAYER_BARRIER.get()
     if session is None:
-        return
-    session.callback(session.virtual_engine, session.request_ids, layer_index)
+        return None
+    return session.callback(session.virtual_engine, session.request_ids,
+                            layer_index)
+
+
+@contextmanager
+def activate_sparse_kv_blocks(
+    block_indices: Optional[Sequence[int]],
+) -> Iterator[None]:
+    """把当前 layer 的 sparse block 集合暴露给 attention backend。
+
+    该接口只传递访问约束，不修改 block table，也不选择具体 sparse kernel。
+    ``None`` 明确表示 dense attention。后续 xFormers/FlashAttention 的 sparse
+    consumer 可以调用 ``get_active_sparse_kv_blocks`` 取得同一份 logical
+    block 集合，而无需依赖 Qwen2 或 scheduler 类型。
+    """
+    selected = (None if block_indices is None else tuple(block_indices))
+    token = _ACTIVE_SPARSE_KV_BLOCKS.set(selected)
+    try:
+        yield
+    finally:
+        _ACTIVE_SPARSE_KV_BLOCKS.reset(token)
+
+
+def get_active_sparse_kv_blocks() -> Optional[Tuple[int, ...]]:
+    """返回当前 layer 允许 attention 访问的 logical KV blocks。"""
+    return _ACTIVE_SPARSE_KV_BLOCKS.get()

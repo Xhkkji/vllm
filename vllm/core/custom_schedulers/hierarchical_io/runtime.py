@@ -17,6 +17,7 @@ from vllm.core.custom_schedulers.async_kv_transfer import (
     AsyncKVTransferEvent, AsyncKVTransferRequest, AsyncKVTransferState)
 
 from .plan import RollingPrefetchConfig
+from .residency import PrefetchResidencyDirectory
 
 
 SubmitCallback = Callable[[AsyncKVTransferRequest, Any], AsyncKVTransferEvent]
@@ -68,6 +69,7 @@ class RollingPrefetchRuntime:
         self._plans: Dict[Tuple[int, str], _PlanState] = {}
         self._events: list[AsyncKVTransferEvent] = []
         self._traces: list[PrefetchRuntimeTrace] = []
+        self.residency = PrefetchResidencyDirectory()
 
     def submit_or_stage(
         self,
@@ -89,6 +91,7 @@ class RollingPrefetchRuntime:
                 f"duplicate prefetch unit: {plan_id}/{unit_index}")
         unit = _UnitState(request=request, mapping=mapping)
         plan.units[unit_index] = unit
+        self.residency.register(request)
         if not request.activate_on_submit:
             return ()
 
@@ -122,6 +125,9 @@ class RollingPrefetchRuntime:
             if (plan.units and all(unit.terminal is not None
                                    and unit.terminal_reported
                                    for unit in plan.units.values())):
+                # transfer 模板已经完成职责，但 long prompt 可能还会经历多个
+                # chunked-prefill iteration。residency 必须保留到 request 真正
+                # finished/abort，不能随 I/O completion 一起提前删除。
                 del self._plans[plan_key]
         return events
 
@@ -217,6 +223,7 @@ class RollingPrefetchRuntime:
                 if unit.active or unit.terminal is not None:
                     raise RuntimeError(
                         "cannot discard an active prefetch unit")
+                self.residency.forget(unit.request.request_id)
                 del plan.units[unit_index]
             if not plan.units:
                 del self._plans[plan_key]
@@ -225,6 +232,18 @@ class RollingPrefetchRuntime:
         traces = tuple(self._traces)
         self._traces.clear()
         return traces
+
+    def require_resident_layer(
+        self,
+        request_ids: Sequence[str],
+        layer_index: int,
+    ) -> Optional[Tuple[int, ...]]:
+        """供 attention/model runner 在消费 sparse KV 前执行一致性校验。"""
+        return self.residency.require_layer(request_ids, layer_index)
+
+    def forget_seq_groups(self, seq_group_ids: Sequence[str]) -> None:
+        """在 vLLM 通知 request finished/abort 时回收 residency 元数据。"""
+        self.residency.forget_seq_groups(seq_group_ids)
 
     def _activate_until(
         self,
@@ -262,6 +281,7 @@ class RollingPrefetchRuntime:
         lead_units: int,
     ) -> AsyncKVTransferEvent:
         unit.active = True
+        self.residency.mark_pending(unit.request.request_id)
         unit.activated_monotonic_ns = time.monotonic_ns()
         if report_activation:
             self._events.append(
@@ -303,6 +323,10 @@ class RollingPrefetchRuntime:
         unit.active = False
         unit.terminal = event
         unit.ready_monotonic_ns = time.monotonic_ns()
+        if event.state == AsyncKVTransferState.READY:
+            self.residency.mark_ready(unit.request.request_id)
+        else:
+            self.residency.mark_error(unit.request.request_id)
         plan_id, unit_index = self._identity(unit.request)
         self._traces.append(
             PrefetchRuntimeTrace(

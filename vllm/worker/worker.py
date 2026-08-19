@@ -603,7 +603,7 @@ class Worker(LocalOrDistributedWorkerBase):
         virtual_engine: int,
         request_ids: Tuple[str, ...],
         layer_index: int,
-    ) -> None:
+    ) -> Optional[Tuple[int, ...]]:
         """按 layer progress 激活未来 unit，并等待当前 unit 物理 READY。"""
         cache_engine = self.cache_engine[virtual_engine]
         self._prefetch_runtime.wait_ready(
@@ -620,7 +620,13 @@ class Worker(LocalOrDistributedWorkerBase):
                 unit.request_id, mapping),
             max_active=envs.VLLM_BAM_MDS_MAX_IN_FLIGHT,
         )
+        # wait_ready 只保证物理 MDS event 到达 READY；随后再用 logical block
+        # 目录验证当前 sparse consumer 的全部 block 已驻留。dense unit 的
+        # consumer_block_indices=None，因此此检查不会改变原有 attention。
+        sparse_kv_blocks = self._prefetch_runtime.require_resident_layer(
+            request_ids, layer_index)
         self._log_prefetch_runtime_traces()
+        return sparse_kv_blocks
 
     def _log_prefetch_runtime_traces(self) -> None:
         """输出 worker 物理 READY 与 barrier wait，避免混入 scheduler 延迟。"""
@@ -689,6 +695,11 @@ class Worker(LocalOrDistributedWorkerBase):
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Optional[List[SamplerOutput]]:
         if execute_model_req is not None:
+            # I/O completion 与请求生命周期不同：长 prompt 在 restore 完成后
+            # 仍可能经过多个 chunked-prefill iteration。只在 Engine 明确通知
+            # finished/abort 时回收 sparse residency，避免提前丢失消费约束。
+            self._prefetch_runtime.forget_seq_groups(
+                execute_model_req.finished_requests_ids)
             new_seq_group_metadata_list = self._get_cached_seq_group_metadata(
                 execute_model_req.seq_group_metadata_list,
                 execute_model_req.finished_requests_ids)

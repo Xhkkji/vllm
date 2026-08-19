@@ -63,9 +63,28 @@ class AsyncKVTransferRequest:
     # restore 使用它在 Worker 中一次 stage 全计划、随后按模型进度激活 unit。
     prefetch_plan_id: Optional[str] = None
     prefetch_unit_index: Optional[int] = None
+    # sparse consumer 的 logical block 集合。它和 block_mapping 不同：前者
+    # 是完整 prefix 的逻辑下标，后者只包含本次 SSD -> GPU 的物理映射。
+    consumer_block_indices: Optional[Tuple[int, ...]] = None
+    consumer_blocks_by_layer: Optional[
+        Tuple[Optional[Tuple[int, ...]], ...]] = None
+    # 完整 prefix 的 logical block 数，用于 residency 区分“已在 HBM”与
+    # “本次从 SSD 恢复”的集合。None 表示普通 transfer 不启用 consumer。
+    consumer_num_blocks: Optional[int] = None
     # False 表示这次 RPC 只把 descriptor template 放进 Worker，不占用 MDS
     # request slot。真正激活时 Worker 会回传 PENDING，再由 Scheduler 更新状态。
     activate_on_submit: bool = True
+
+    def __post_init__(self) -> None:
+        if (self.consumer_num_blocks is not None
+                and self.consumer_num_blocks <= 0):
+            raise ValueError("consumer_num_blocks must be positive")
+        if (self.consumer_block_indices is not None
+                and any(left >= right for left, right in zip(
+                    self.consumer_block_indices,
+                    self.consumer_block_indices[1:]))):
+            raise ValueError(
+                "consumer block indices must be strictly increasing")
 
 
 @dataclass(frozen=True)
@@ -146,6 +165,10 @@ class AsyncKVTransferQueue:
         layer_range: Optional[Tuple[int, int]] = None,
         prefetch_plan_id: Optional[str] = None,
         prefetch_unit_index: Optional[int] = None,
+        consumer_block_indices: Optional[Sequence[int]] = None,
+        consumer_blocks_by_layer: Optional[
+            Sequence[Optional[Sequence[int]]]] = None,
+        consumer_num_blocks: Optional[int] = None,
     ) -> AsyncKVTransferRequest:
         """登记 reservation，但暂不占用 Worker/MDS request slot。"""
         if priority is None:
@@ -164,6 +187,13 @@ class AsyncKVTransferQueue:
             layer_range=layer_range,
             prefetch_plan_id=prefetch_plan_id,
             prefetch_unit_index=prefetch_unit_index,
+            consumer_block_indices=(None if consumer_block_indices is None else
+                                    tuple(consumer_block_indices)),
+            consumer_blocks_by_layer=(
+                None if consumer_blocks_by_layer is None else tuple(
+                    None if indices is None else tuple(indices)
+                    for indices in consumer_blocks_by_layer)),
+            consumer_num_blocks=consumer_num_blocks,
         )
         self._transfers[request_id] = PendingAsyncKVTransfer(request=request)
         return request

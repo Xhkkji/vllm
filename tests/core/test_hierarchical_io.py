@@ -11,8 +11,10 @@ from vllm.core.custom_schedulers.async_kv_transfer import (
 from vllm.core.custom_schedulers.hierarchical_io import (
     HierarchicalIOConfig, HierarchicalLayerBarrierConfig,
     HierarchicalRestoreController, PrefetchBlockSelectorConfig, PrefetchUnit,
-    RollingPrefetchConfig, RollingPrefetchRuntime, activate_layer_barrier,
-    build_layer_restore_plan, select_prefetch_unit_blocks,
+    RollingPrefetchConfig, RollingPrefetchRuntime, SparseKVAccessPlan,
+    activate_layer_barrier, activate_sparse_kv_blocks,
+    build_layer_restore_plan, get_active_sparse_kv_blocks,
+    select_prefetch_unit_blocks,
     wait_for_local_layer)
 
 
@@ -60,9 +62,10 @@ def test_prefetch_unit_rejects_ambiguous_or_invalid_block_selection():
                         start_layer=0,
                         end_layer=2,
                         block_indices=(2, ))
-    with pytest.raises(ValueError, match="outside"):
-        select_prefetch_unit_blocks(unit, ((10, 20), ),
-                                    (LogicalBlockKey(7, 0), ))
+    # logical block 2 可能已经在 HBM，因此不出现在 SSD mapping 中是合法的；
+    # 投影为空只表示当前 unit 无需为它发起物理 read。
+    assert select_prefetch_unit_blocks(
+        unit, ((10, 20), ), (LogicalBlockKey(7, 0), )) == ((), ())
 
 
 def test_sparse_prefetch_selector_builds_profiling_only_plan():
@@ -93,6 +96,39 @@ def test_stride_prefetch_selector_is_deterministic():
     assert config.select(5) == (0, 2, 4)
 
 
+def test_sparse_access_plan_keeps_per_layer_selection_and_window_union():
+    access = SparseKVAccessPlan(
+        num_layers=4,
+        num_blocks=8,
+        block_indices_by_layer=((0, 2), (1, 2), (4, ), (4, 7)),
+        source="attention-mask",
+    )
+    plan = build_layer_restore_plan(
+        plan_id="sparse-layer-plan",
+        num_layers=4,
+        window_layers=2,
+        access_plan=access,
+        created_monotonic_ns=100,
+    )
+    assert plan.units[0].block_indices == (0, 1, 2)
+    assert plan.consumer_blocks_for_layer(0) == (0, 2)
+    assert plan.consumer_blocks_for_layer(1) == (1, 2)
+    assert plan.units[1].block_indices == (4, 7)
+
+
+def test_sparse_mapping_projects_logical_indices_not_mapping_offsets():
+    mapping = ((101, 201), (103, 203))
+    logical_blocks = tuple(LogicalBlockKey(7, index) for index in (1, 3))
+    unit = PrefetchUnit(index=0,
+                        start_layer=0,
+                        end_layer=2,
+                        block_indices=(0, 3))
+    selected_mapping, selected_keys = select_prefetch_unit_blocks(
+        unit, mapping, logical_blocks)
+    assert selected_mapping == ((103, 203), )
+    assert [key.logical_index for key in selected_keys] == [3]
+
+
 def test_rolling_config_is_explicit_and_validated():
     config = RollingPrefetchConfig.from_env({
         "VLLM_BAM_MDS_HIERARCHICAL_ROLLING_ENABLE": "1",
@@ -118,6 +154,23 @@ def _prefetch_request(index: int, *, activate: bool) -> AsyncKVTransferRequest:
         prefetch_plan_id="plan-0",
         prefetch_unit_index=index,
         activate_on_submit=activate,
+    )
+
+
+def _sparse_prefetch_request() -> AsyncKVTransferRequest:
+    return AsyncKVTransferRequest(
+        request_id="sparse-unit-0",
+        seq_group_id="seq-sparse",
+        reservation_id="plan-sparse",
+        operation=AsyncKVTransferOperation.READ,
+        block_mapping=((10, 20), ),
+        logical_blocks=(LogicalBlockKey(9, 3), ),
+        priority=AsyncKVTransferPriority.CRITICAL_READ,
+        layer_range=(0, 2),
+        prefetch_plan_id="plan-sparse",
+        prefetch_unit_index=0,
+        consumer_block_indices=(0, 3),
+        consumer_blocks_by_layer=((0, ), (3, )),
     )
 
 
@@ -166,6 +219,34 @@ def test_rolling_runtime_activates_future_unit_from_model_progress():
         ("physical_ready", 1),
         ("barrier_ready", 0),
     }
+
+
+def test_sparse_residency_is_checked_before_layer_consumption():
+    runtime = RollingPrefetchRuntime(RollingPrefetchConfig())
+    request = _sparse_prefetch_request()
+
+    runtime.submit_or_stage(
+        0, request, "mapping",
+        lambda _request, _mapping: AsyncKVTransferEvent(
+            request.request_id, AsyncKVTransferState.PENDING))
+    with pytest.raises(RuntimeError, match="not ready"):
+        runtime.require_resident_layer(("seq-sparse", ), 0)
+
+    runtime.wait_ready(
+        0,
+        ("seq-sparse", ),
+        0,
+        lambda _request, _mapping: AsyncKVTransferEvent(
+            request.request_id, AsyncKVTransferState.PENDING),
+        lambda _request, _mapping: AsyncKVTransferEvent(
+            request.request_id, AsyncKVTransferState.READY),
+        max_active=1,
+    )
+    assert runtime.require_resident_layer(("seq-sparse", ), 0) == (0, )
+    assert runtime.require_resident_layer(("seq-sparse", ), 1) == (3, )
+    runtime.forget_seq_groups(("seq-sparse", ))
+    # request 完成后目录被清理；无匹配 plan 时自然退化为 dense/no-op。
+    assert runtime.require_resident_layer(("seq-sparse", ), 0) is None
 
 
 def test_first_window_admission_is_separate_from_full_restore():
@@ -228,3 +309,10 @@ def test_layer_barrier_is_forward_scoped_and_default_disabled():
     # context 退出后模型层调用必须自然退化为 no-op，避免状态泄漏到下一 batch。
     wait_for_local_layer(6)
     assert observed == [(3, ("request-a", "request-b"), 5)]
+
+
+def test_sparse_consumer_blocks_are_forward_scoped():
+    assert get_active_sparse_kv_blocks() is None
+    with activate_sparse_kv_blocks((1, 4, 7)):
+        assert get_active_sparse_kv_blocks() == (1, 4, 7)
+    assert get_active_sparse_kv_blocks() is None

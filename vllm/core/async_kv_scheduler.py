@@ -374,6 +374,11 @@ class AsyncKVScheduler(Scheduler):
                     layer_range=unit.layer_range,
                     prefetch_plan_id=plan.plan_id,
                     prefetch_unit_index=unit.index,
+                    consumer_block_indices=unit.block_indices,
+                    consumer_blocks_by_layer=unit.consumer_blocks_by_layer,
+                    consumer_num_blocks=(
+                        None if plan.access_plan is None else
+                        plan.access_plan.num_blocks),
                 ))
         requests = tuple(requests)
         self.hierarchical_prefix_restores.register(

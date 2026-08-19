@@ -32,7 +32,8 @@ from transformers import Qwen2Config
 
 import vllm.envs as envs
 from vllm.attention import Attention, AttentionType
-from vllm.core.custom_schedulers.hierarchical_io import wait_for_local_layer
+from vllm.core.custom_schedulers.hierarchical_io import (
+    activate_sparse_kv_blocks, wait_for_local_layer)
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
@@ -361,8 +362,9 @@ class Qwen2Model(nn.Module):
             # Step 4：仅在显式开启时，在 attention 消费当前层 KV 前确认其
             # MDS restore window 已 ready。关闭时不访问 barrier ContextVar，
             # 保持原生 Qwen2 forward 热路径不变。
+            sparse_kv_blocks = None
             if envs.VLLM_BAM_MDS_HIERARCHICAL_LAYER_BARRIER:
-                wait_for_local_layer(layer_idx)
+                sparse_kv_blocks = wait_for_local_layer(layer_idx)
             token_count = hidden_states.shape[0]
             # 仅在显式打开 VLLM_BAM_LAYER_NVTX_TRACE 时标记每层边界，
             # 用于 Nsight 中判断当前整段 KV 恢复是否具备拆成 layer 级
@@ -370,11 +372,15 @@ class Qwen2Model(nn.Module):
             nvtx_pushed = _qwen2_layer_nvtx_push(
                 f"qwen2_layer:{layer_idx}:tokens={token_count}")
             try:
-                hidden_states, residual = layer(
-                    positions,
-                    hidden_states,
-                    residual,
-                )
+                # consumer context 覆盖整个 decoder layer，attention backend
+                # 可以在不依赖模型类的情况下取得当前层 sparse block 集合。
+                # 当前未接 sparse kernel 时仅建立协议；dense 的 None 是 no-op。
+                with activate_sparse_kv_blocks(sparse_kv_blocks):
+                    hidden_states, residual = layer(
+                        positions,
+                        hidden_states,
+                        residual,
+                    )
             finally:
                 if nvtx_pushed:
                     torch.cuda.nvtx.range_pop()

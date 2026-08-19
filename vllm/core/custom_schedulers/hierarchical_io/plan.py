@@ -86,6 +86,95 @@ class PrefetchBlockSelectorConfig:
 
 
 @dataclass(frozen=True)
+class SparseKVAccessPlan:
+    """描述每一层实际会访问哪些逻辑 KV blocks。
+
+    ``block_indices_by_layer[layer]`` 使用 prefix block table 中的逻辑下标，
+    而不是 MDS mapping 中的相对下标。这样同一份计划既能覆盖已经在 HBM
+    命中的 block，也能覆盖需要从 SSD 恢复的 block；后端只负责把两者的
+    交集转换成真实 I/O。
+
+    ``None`` 表示该层使用完整 prefix，即 dense attention。未来真实 sparse
+    attention 只需要为每层填入 block 下标，不需要修改 scheduler/MDS 的
+    stage、activate、poll 和 barrier 生命周期。
+    """
+
+    num_layers: int
+    num_blocks: int
+    block_indices_by_layer: Tuple[Optional[Tuple[int, ...]], ...]
+    source: str = "dense"
+
+    def __post_init__(self) -> None:
+        if self.num_layers <= 0:
+            raise ValueError("sparse KV access plan requires layers")
+        if self.num_blocks <= 0:
+            raise ValueError("sparse KV access plan requires blocks")
+        if len(self.block_indices_by_layer) != self.num_layers:
+            raise ValueError(
+                "one sparse KV block selection is required per layer")
+        for indices in self.block_indices_by_layer:
+            if indices is None:
+                continue
+            if not indices:
+                raise ValueError("sparse KV layer selection must not be empty")
+            if any(index < 0 or index >= self.num_blocks for index in indices):
+                raise ValueError("sparse KV block index is outside prefix")
+            if any(left >= right for left, right in zip(indices, indices[1:])):
+                raise ValueError(
+                    "sparse KV block indices must be strictly increasing")
+
+    @classmethod
+    def from_selector(
+        cls,
+        *,
+        num_layers: int,
+        num_blocks: int,
+        selector: PrefetchBlockSelectorConfig,
+    ) -> "SparseKVAccessPlan":
+        """把现有环境变量 selector 转成逐层访问计划。
+
+        当前 ``tail_n``/``stride`` 在所有层使用同一 block 集合，便于做可重复
+        profiling。真实 sparse attention 后续可以直接构造本类，为不同层提供
+        不同集合；下面的 PrefetchPlan 会自动按 layer window 取并集。
+        """
+        selected = selector.select(num_blocks)
+        return cls(num_layers=num_layers,
+                   num_blocks=num_blocks,
+                   block_indices_by_layer=(selected, ) * num_layers,
+                   source=selector.policy)
+
+    @property
+    def is_dense(self) -> bool:
+        return all(indices is None
+                   for indices in self.block_indices_by_layer)
+
+    def blocks_for_layer(self,
+                         layer_index: int) -> Optional[Tuple[int, ...]]:
+        if not 0 <= layer_index < self.num_layers:
+            raise ValueError(f"layer is outside sparse KV plan: {layer_index}")
+        return self.block_indices_by_layer[layer_index]
+
+    def blocks_for_range(
+        self,
+        start_layer: int,
+        end_layer: int,
+    ) -> Optional[Tuple[int, ...]]:
+        """返回一个 layer window 需要预取的 block 并集。
+
+        一个 window 内只要有一层仍是 dense，就必须恢复完整 prefix；否则会
+        让 dense consumer 看到未恢复地址。纯 sparse window 则只提交各层访问
+        集合的并集，层内更精确的选择仍保留在本计划中供 consumer 查询。
+        """
+        if not 0 <= start_layer < end_layer <= self.num_layers:
+            raise ValueError("invalid sparse KV layer range")
+        selections = self.block_indices_by_layer[start_layer:end_layer]
+        if any(indices is None for indices in selections):
+            return None
+        return tuple(sorted({index for indices in selections
+                             for index in indices or ()}))
+
+
+@dataclass(frozen=True)
 class PrefetchUnit:
     """一个可独立激活和等待的细粒度 prefetch 单元。
 
@@ -104,12 +193,20 @@ class PrefetchUnit:
     start_layer: int
     end_layer: int
     block_indices: Optional[Tuple[int, ...]] = None
+    # 与 layer_range 等长；每一项是该层 attention 真正允许访问的 blocks。
+    # block_indices 则是这些集合的并集，专供 MDS 一次预取整个 window。
+    consumer_blocks_by_layer: Optional[
+        Tuple[Optional[Tuple[int, ...]], ...]] = None
 
     def __post_init__(self) -> None:
         if self.index < 0:
             raise ValueError("prefetch unit index must be non-negative")
         if self.start_layer < 0 or self.end_layer <= self.start_layer:
             raise ValueError("prefetch unit layer range must be non-empty")
+        if (self.consumer_blocks_by_layer is not None
+                and len(self.consumer_blocks_by_layer) != self.num_layers):
+            raise ValueError(
+                "one consumer block selection is required per unit layer")
         if self.block_indices is None:
             return
         if not self.block_indices:
@@ -144,6 +241,7 @@ class PrefetchPlan:
     created_monotonic_ns: int
     block_selector: str = "dense"
     profiling_only: bool = False
+    access_plan: Optional[SparseKVAccessPlan] = None
 
     @property
     def first_unit(self) -> PrefetchUnit:
@@ -155,6 +253,23 @@ class PrefetchPlan:
             if unit.start_layer <= layer_index < unit.end_layer:
                 return unit
         raise ValueError(f"layer is outside prefetch plan: {layer_index}")
+
+    def consumer_blocks_for_layer(
+        self,
+        layer_index: int,
+    ) -> Optional[Tuple[int, ...]]:
+        """返回 attention consumer 应使用的逻辑 block 集合。
+
+        ``None`` 保持 dense attention 语义。非 ``None`` 时，consumer 必须只
+        访问返回的 blocks，并在访问前通过 worker residency 校验。
+        """
+        if self.access_plan is None:
+            unit = self.unit_for_layer(layer_index)
+            if unit.consumer_blocks_by_layer is None:
+                return unit.block_indices
+            return unit.consumer_blocks_by_layer[layer_index -
+                                                  unit.start_layer]
+        return self.access_plan.blocks_for_layer(layer_index)
 
 
 def select_prefetch_unit_blocks(
@@ -175,15 +290,18 @@ def select_prefetch_unit_blocks(
             "block mapping and logical blocks must have the same length")
 
     # None 是当前 layer prefetch 的默认值：每个 layer window 都读取完整
-    # prefix 的对应层数据。这里返回原 tuple，不创建逐 block 中间对象。
+    # prefix 中尚未驻留 HBM 的数据。这里返回原 tuple，不创建中间对象。
     if unit.block_indices is None:
         return mapping, keys
 
-    if unit.block_indices[-1] >= len(mapping):
-        raise ValueError(
-            "prefetch block index is outside the parent reservation")
-    return (tuple(mapping[index] for index in unit.block_indices),
-            tuple(keys[index] for index in unit.block_indices))
+    # sparse plan 使用完整 prefix 的逻辑 block 下标；reservation mapping 只
+    # 包含尚未在 HBM 的 SSD 扩展部分，因此必须按 LogicalBlockKey 求交集，
+    # 不能再把 sparse 下标误当作 mapping 的数组下标。
+    selected = frozenset(unit.block_indices)
+    projected = tuple((pair, key) for pair, key in zip(mapping, keys)
+                      if key.logical_index in selected)
+    return (tuple(pair for pair, _ in projected),
+            tuple(key for _, key in projected))
 
 
 @dataclass(frozen=True)
@@ -304,6 +422,7 @@ def build_layer_restore_plan(
     block_selector: PrefetchBlockSelectorConfig = (
         PrefetchBlockSelectorConfig()),
     num_blocks: Optional[int] = None,
+    access_plan: Optional[SparseKVAccessPlan] = None,
 ) -> PrefetchPlan:
     """按模型执行顺序生成连续、无重叠、无空洞的 layer windows。"""
     if not plan_id:
@@ -313,25 +432,51 @@ def build_layer_restore_plan(
     if window_layers <= 0:
         raise ValueError("window_layers must be positive")
 
-    block_indices = None
-    if not block_selector.is_dense:
-        if num_blocks is None:
-            raise ValueError(
-                "num_blocks is required for sparse prefetch selector")
-        block_indices = block_selector.select(num_blocks)
+    if access_plan is None:
+        if block_selector.is_dense:
+            # dense 默认路径不构造逐层 block tuple，保持原 layer prefetch 的
+            # 对象数量和热路径不变。只有 sparse selector 才建立 access plan。
+            block_indices_by_unit = None
+        else:
+            if num_blocks is None:
+                raise ValueError(
+                    "num_blocks is required for sparse prefetch selector")
+            access_plan = SparseKVAccessPlan.from_selector(
+                num_layers=num_layers,
+                num_blocks=num_blocks,
+                selector=block_selector,
+            )
+            block_indices_by_unit = access_plan
+    else:
+        if access_plan.num_layers != num_layers:
+            raise ValueError("access plan layer count does not match model")
+        if num_blocks is not None and access_plan.num_blocks != num_blocks:
+            raise ValueError("access plan block count does not match prefix")
+        block_indices_by_unit = access_plan
 
     units = tuple(
         PrefetchUnit(index=index,
                      start_layer=start,
                      end_layer=min(start + window_layers, num_layers),
-                     block_indices=block_indices)
+                     block_indices=(None if block_indices_by_unit is None else
+                                    block_indices_by_unit.blocks_for_range(
+                                        start,
+                                        min(start + window_layers,
+                                            num_layers))),
+                     consumer_blocks_by_layer=(
+                         None if access_plan is None else
+                         access_plan.block_indices_by_layer[
+                             start:min(start + window_layers, num_layers)]))
         for index, start in enumerate(range(0, num_layers, window_layers)))
+    profiling_only = (access_plan is not None and not access_plan.is_dense)
     return PrefetchPlan(
         plan_id=plan_id,
         units=units,
         created_monotonic_ns=(time.monotonic_ns()
                               if created_monotonic_ns is None else
                               created_monotonic_ns),
-        block_selector=block_selector.policy,
-        profiling_only=block_selector.profiling_only,
+        block_selector=(access_plan.source
+                        if access_plan is not None else block_selector.policy),
+        profiling_only=profiling_only,
+        access_plan=access_plan,
     )

@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""层级 MDS restore 的 model-forward 层屏障。
+"""层级 GranuleKV restore 的 model-forward 层屏障。
 
 这个模块故意不依赖 Scheduler、Worker 或具体模型。它只在一次 model
 forward 的动态作用域中保存一个很小的回调：模型进入第 N 层前调用
 ``wait_for_local_layer(N)``，回调负责确认属于当前请求的 N 所在 window
 已经完成 SSD -> HBM DMA。
 
-这样模型代码不知道 MDS request id，Worker 也不需要依赖 Qwen2 的实现。
+这样模型代码不知道 GranuleKV request id，Worker 也不需要依赖 Qwen2 的实现。
 默认没有激活 session，入口立即返回，因此普通 vLLM 路径不改变数据语义。
 """
 
@@ -37,8 +37,7 @@ class HierarchicalLayerBarrierConfig:
     ) -> "HierarchicalLayerBarrierConfig":
         values = environ if environ is not None else os.environ
         return cls(enabled=bool(int(values.get(
-            "VLLM_GRANULEKV_HIERARCHICAL_LAYER_BARRIER",
-            values.get("VLLM_BAM_MDS_HIERARCHICAL_LAYER_BARRIER", "0")))))
+            "VLLM_GRANULEKV_HIERARCHICAL_LAYER_BARRIER", "0"))))
 
 
 @dataclass(frozen=True)
@@ -52,9 +51,9 @@ class _LayerBarrierSession:
 
 
 _ACTIVE_LAYER_BARRIER: ContextVar[Optional[_LayerBarrierSession]] = ContextVar(
-    "bam_hierarchical_layer_barrier", default=None)
+    "granulekv_hierarchical_layer_barrier", default=None)
 _ACTIVE_SPARSE_KV_BLOCKS: ContextVar[Optional[Tuple[int, ...]]] = ContextVar(
-    "bam_sparse_kv_blocks", default=None)
+    "granulekv_sparse_kv_blocks", default=None)
 
 
 @contextmanager
@@ -86,7 +85,7 @@ def wait_for_local_layer(layer_index: int) -> Optional[Tuple[int, ...]]:
     """在 attention 使用该层 KV 前确认对应 window READY。
 
     没有活动 session 时直接返回。该情况包括开关关闭、decode batch 以及不属于
-    MDS hierarchical restore 的普通请求，因此模型代码不需要区分这些路径。
+    GranuleKV hierarchical restore 的普通请求，因此模型代码不需要区分这些路径。
     """
     session = _ACTIVE_LAYER_BARRIER.get()
     if session is None:

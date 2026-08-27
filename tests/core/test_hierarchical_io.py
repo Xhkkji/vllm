@@ -72,8 +72,8 @@ def test_prefetch_unit_rejects_ambiguous_or_invalid_block_selection():
 def test_sparse_prefetch_selector_builds_profiling_only_plan():
     """selector 只改变 block 投影，不改变 layer unit 生命周期。"""
     config = PrefetchBlockSelectorConfig.from_env({
-        "VLLM_BAM_MDS_PREFETCH_BLOCK_SELECTOR": "tail_n",
-        "VLLM_BAM_MDS_PREFETCH_BLOCK_COUNT": "2",
+        "VLLM_GRANULEKV_PREFETCH_BLOCK_SELECTOR": "tail_n",
+        "VLLM_GRANULEKV_PREFETCH_BLOCK_COUNT": "2",
     })
     plan = build_layer_restore_plan(plan_id="restore-sparse",
                                     num_layers=6,
@@ -91,8 +91,8 @@ def test_sparse_prefetch_selector_builds_profiling_only_plan():
 
 def test_stride_prefetch_selector_is_deterministic():
     config = PrefetchBlockSelectorConfig.from_env({
-        "VLLM_BAM_MDS_PREFETCH_BLOCK_SELECTOR": "stride",
-        "VLLM_BAM_MDS_PREFETCH_BLOCK_STRIDE": "2",
+        "VLLM_GRANULEKV_PREFETCH_BLOCK_SELECTOR": "stride",
+        "VLLM_GRANULEKV_PREFETCH_BLOCK_STRIDE": "2",
     })
     assert config.select(5) == (0, 2, 4)
 
@@ -132,10 +132,10 @@ def test_sparse_mapping_projects_logical_indices_not_mapping_offsets():
 
 def test_rolling_config_is_explicit_and_validated():
     config = RollingPrefetchConfig.from_env({
-        "VLLM_BAM_MDS_HIERARCHICAL_ROLLING_ENABLE": "1",
-        "VLLM_BAM_MDS_HIERARCHICAL_LEAD_WINDOWS": "2",
-        "VLLM_BAM_MDS_HIERARCHICAL_MAX_LEAD_WINDOWS": "3",
-        "VLLM_BAM_MDS_HIERARCHICAL_TARGET_SLACK_MS": "0.5",
+        "VLLM_GRANULEKV_HIERARCHICAL_ROLLING_ENABLE": "1",
+        "VLLM_GRANULEKV_HIERARCHICAL_LEAD_WINDOWS": "2",
+        "VLLM_GRANULEKV_HIERARCHICAL_MAX_LEAD_WINDOWS": "3",
+        "VLLM_GRANULEKV_HIERARCHICAL_TARGET_SLACK_MS": "0.5",
     })
     assert config.enabled
     assert config.initial_units == 2
@@ -144,14 +144,14 @@ def test_rolling_config_is_explicit_and_validated():
 
 def test_layer_working_set_regions_cover_current_and_max_lead_windows():
     values = {
-        "VLLM_BAM_MDS_LAYER_WORKING_SET_ENABLE": "1",
-        "VLLM_BAM_MDS_HIERARCHICAL_IO_ENABLE": "1",
-        "VLLM_BAM_MDS_HIERARCHICAL_LAYER_BARRIER": "1",
-        "VLLM_BAM_MDS_HIERARCHICAL_ROLLING_ENABLE": "1",
-        "VLLM_BAM_MDS_HIERARCHICAL_NUM_LAYERS": "28",
-        "VLLM_BAM_MDS_HIERARCHICAL_WINDOW_LAYERS": "2",
-        "VLLM_BAM_MDS_HIERARCHICAL_LEAD_WINDOWS": "1",
-        "VLLM_BAM_MDS_HIERARCHICAL_MAX_LEAD_WINDOWS": "2",
+        "VLLM_GRANULEKV_LAYER_WORKING_SET_ENABLE": "1",
+        "VLLM_GRANULEKV_HIERARCHICAL_IO_ENABLE": "1",
+        "VLLM_GRANULEKV_HIERARCHICAL_LAYER_BARRIER": "1",
+        "VLLM_GRANULEKV_HIERARCHICAL_ROLLING_ENABLE": "1",
+        "VLLM_GRANULEKV_HIERARCHICAL_NUM_LAYERS": "28",
+        "VLLM_GRANULEKV_HIERARCHICAL_WINDOW_LAYERS": "2",
+        "VLLM_GRANULEKV_HIERARCHICAL_LEAD_WINDOWS": "1",
+        "VLLM_GRANULEKV_HIERARCHICAL_MAX_LEAD_WINDOWS": "2",
     }
     assert get_layer_working_set_regions(values) == 6
     assert RollingPrefetchConfig.from_env(values).working_set_enabled
@@ -344,7 +344,7 @@ def test_window_error_prevents_parent_publish_until_all_terminal():
 def test_layer_barrier_is_forward_scoped_and_default_disabled():
     assert not HierarchicalLayerBarrierConfig.from_env({}).enabled
     assert HierarchicalLayerBarrierConfig.from_env({
-        "VLLM_BAM_MDS_HIERARCHICAL_LAYER_BARRIER": "1"
+        "VLLM_GRANULEKV_HIERARCHICAL_LAYER_BARRIER": "1"
     }).enabled
 
     observed = []

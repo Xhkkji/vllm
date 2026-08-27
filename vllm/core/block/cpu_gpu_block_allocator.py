@@ -201,7 +201,7 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
         device: Device,
         extra_hash: Optional[int] = None,
     ) -> List[Block]:
-        """在指定设备分配 BaM MDS 尚未 READY 的不可见 block。"""
+        """在指定设备分配 GranuleKV 尚未 READY 的不可见 block。"""
         allocator = self._allocators[device]
         if not isinstance(allocator, PrefixCachingBlockAllocator):
             raise RuntimeError("pending restore requires prefix caching")
@@ -213,7 +213,7 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
 
     def publish_pending_restore_blocks(self, blocks: List[Block],
                                        device: Device) -> List[int]:
-        """发布一次已经完成的 BaM MDS restore reservation。"""
+        """发布一次已经完成的 GranuleKV restore reservation。"""
         allocator = self._allocators[device]
         if not isinstance(allocator, PrefixCachingBlockAllocator):
             raise RuntimeError("pending restore requires prefix caching")
@@ -354,7 +354,7 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
                                           device: Device) -> None:
         """把指定设备上本轮写入完成的 block 标记为可复用。
 
-        原生 V0 只会在 GPU forward 后标记 GPU block。BaM MDS 的 SSD 写入
+        原生 V0 只会在 GPU forward 后标记 GPU block。GranuleKV 的 SSD 写入
         完成后，还需要显式推进 CPU/storage allocator 的 computed 状态，
         否则相同 token hash 虽然存在，也不能被 prefix lookup 安全命中。
         """

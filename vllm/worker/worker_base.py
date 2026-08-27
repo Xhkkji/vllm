@@ -435,7 +435,7 @@ class LocalOrDistributedWorkerBase(WorkerBase):
         barrier_context = (
             activate_layer_barrier(worker_input.virtual_engine, request_ids)
             if activate_layer_barrier is not None else nullcontext())
-        # 普通 Worker 没有这项可选能力，仍是空上下文；MDS Worker 只在实验
+        # 普通 Worker 没有这项可选能力，仍是空上下文；GranuleKV Worker 只在实验
         # 开关打开时由模型侧逐层调用 barrier，不改变原生执行主循环的语义。
         with barrier_context:
             output = self.model_runner.execute_model(

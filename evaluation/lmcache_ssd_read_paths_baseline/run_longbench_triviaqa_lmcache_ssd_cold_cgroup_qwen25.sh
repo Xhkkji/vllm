@@ -13,7 +13,7 @@ TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 #
 # 这条脚本只用于观察传统路径：
 #   SSD -> Linux/POSIX read -> CPU buffer -> GPU
-# 不打开 BaM/GDS wrapper，也不影响 one-copy / rowctx 分支。
+# 只调用原生 LMCache SSD baseline，不引入其他后端。
 
 CGROUP_ROOT="${CGROUP_ROOT:-/sys/fs/cgroup/memory}"
 CGROUP_NAME="${CGROUP_NAME:-lmcache_ssd_cold_${TIMESTAMP}}"
@@ -81,7 +81,6 @@ if [[ "${EUID}" -ne 0 ]]; then
     "LMCACHE_CHUNK_SIZE=${LMCACHE_CHUNK_SIZE:-}" \
     "LMCACHE_MAX_LOCAL_CPU_SIZE=${LMCACHE_MAX_LOCAL_CPU_SIZE:-}" \
     "LMCACHE_MAX_LOCAL_DISK_SIZE=${LMCACHE_MAX_LOCAL_DISK_SIZE:-}" \
-    "LONGBENCH_DEBUG_LOG=${LONGBENCH_DEBUG_LOG:-0}" \
     "LONGBENCH_DROP_CACHES_SETTLE_S=${LONGBENCH_DROP_CACHES_SETTLE_S:-0}" \
     "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}" \
     "PYTHONPATH=${PYTHONPATH:-}" \

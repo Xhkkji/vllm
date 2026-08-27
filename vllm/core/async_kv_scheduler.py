@@ -42,7 +42,7 @@ class AsyncKVScheduler(Scheduler):
     """带有独立异步 KV 策略扩展的原生 V0 Scheduler。
 
     父类继续负责 prefill、decode、请求顺序和 victim 选择；本类只把同步
-    swap 动作替换为 reserve -> MDS transfer -> commit/abort。实验路径通过
+    swap 动作替换为 reserve -> GranuleKV transfer -> commit/abort。实验路径通过
     ``--scheduler-cls`` 显式选择，默认原生 Scheduler 完全不受影响。
     """
 
@@ -63,22 +63,22 @@ class AsyncKVScheduler(Scheduler):
                          pipeline_parallel_size, output_proc_callback)
         # read 请求从 swapped 队列取出后暂存在 loading；write 请求仍保留
         # 在 swapped 队列，但在 SSD 副本提交前记录于 saving，禁止被重新
-        # swap-in。两个方向共用同一个多槽状态机，容量必须与 MDS request
+        # swap-in。两个方向共用同一个多槽状态机，容量必须与 GranuleKV request
         # table 一致；小于 1 时直接失败，避免运行中出现隐式单槽回退。
         self.async_kv_policy = AsyncKVSchedulePolicy(
             max_in_flight=envs.VLLM_GRANULEKV_MAX_IN_FLIGHT)
         self.async_kv_scheduler_strategy = os.getenv(
-            "VLLM_BAM_ASYNC_SCHEDULER_STRATEGY",
+            "VLLM_GRANULEKV_ASYNC_SCHEDULER_STRATEGY",
             ASYNC_KV_STRATEGY_NATIVE)
         if self.async_kv_scheduler_strategy not in ASYNC_KV_STRATEGIES:
             raise ValueError(
-                "unsupported VLLM_BAM_ASYNC_SCHEDULER_STRATEGY="
+                "unsupported VLLM_GRANULEKV_ASYNC_SCHEDULER_STRATEGY="
                 f"{self.async_kv_scheduler_strategy}; expected one of "
                 f"{sorted(ASYNC_KV_STRATEGIES)}")
         self.loading: dict[str, SequenceGroup] = {}
         self.saving: dict[str, SequenceGroup] = {}
         # prefix populate/restore 与请求 preemption 的 swap 生命周期分开保存。
-        # 两者只复用底层 MDS transfer queue，READY 后的队列迁移语义不同，
+        # 两者只复用底层 GranuleKV transfer queue，READY 后的队列迁移语义不同，
         # 因此不能通过伪造 SWAPPED 状态混在 loading/saving 中。
         self.granulekv_prefix_enabled = envs.VLLM_GRANULEKV_PREFIX_ENABLE
         if (self.granulekv_prefix_enabled
@@ -97,10 +97,10 @@ class AsyncKVScheduler(Scheduler):
         if (self.hierarchical_layer_barrier_config.enabled
                 and not self.hierarchical_io_config.enabled):
             raise ValueError(
-                "hierarchical layer barrier requires hierarchical MDS I/O")
+                "hierarchical layer barrier requires hierarchical GranuleKV I/O")
         if (self.hierarchical_layer_barrier_config.enabled
                 and not self.hierarchical_io_config.rolling.enabled):
-            # forward 期间 Worker 只能轮询已提交的 MDS handle，无法安全地
+            # forward 期间 Worker 只能轮询已提交的 GranuleKV handle，无法安全地
             # 越过 Engine/Scheduler 自己激活 queued request。因此 Step 4 的
             # 最小正确版本要求一个父 restore 的所有 window 同时 in-flight。
             # 否则模型到达第 5 个 window 时可能等待尚未 submit 的第 5 笔 I/O。
@@ -131,12 +131,12 @@ class AsyncKVScheduler(Scheduler):
         self._staged_async_kv_discards: list[str] = []
         self._prefix_restore_admission_blocked = False
         logger.info(
-            "[BAM_MDS_PREFIX] phase=init enabled=%s block_size=%d",
+            "[GRANULEKV_PREFIX] phase=init enabled=%s block_size=%d",
             self.granulekv_prefix_enabled,
             cache_config.block_size,
         )
         logger.info(
-            "[BAM_MDS_HIERARCHICAL] phase=init enabled=%s "
+            "[GRANULEKV_HIERARCHICAL] phase=init enabled=%s "
             "num_layers=%d window_layers=%d dispatch_gate=%s",
             self.hierarchical_io_config.enabled,
             self.hierarchical_io_config.num_layers,
@@ -147,27 +147,27 @@ class AsyncKVScheduler(Scheduler):
         self._chunked_priority_waiting_id: Optional[str] = None
         self._chunked_priority_preempted_victims: Set[str] = set()
         self._long_context_stress_min_free_blocks = int(
-            os.getenv("VLLM_BAM_LONG_CONTEXT_STRESS_MIN_FREE_BLOCKS", "128"))
+            os.getenv("VLLM_GRANULEKV_LONG_CONTEXT_STRESS_MIN_FREE_BLOCKS", "128"))
         self._long_context_stress_min_victim_blocks = int(
-            os.getenv("VLLM_BAM_LONG_CONTEXT_STRESS_MIN_VICTIM_BLOCKS", "64"))
+            os.getenv("VLLM_GRANULEKV_LONG_CONTEXT_STRESS_MIN_VICTIM_BLOCKS", "64"))
         self._long_context_stress_max_preempts_per_waiting = max(
             1,
             int(
                 os.getenv(
-                    "VLLM_BAM_LONG_CONTEXT_STRESS_MAX_PREEMPTS_PER_WAITING",
+                    "VLLM_GRANULEKV_LONG_CONTEXT_STRESS_MAX_PREEMPTS_PER_WAITING",
                     "1")))
         self._long_context_stress_allow_prefill = bool(
-            int(os.getenv("VLLM_BAM_LONG_CONTEXT_STRESS_ALLOW_PREFILL", "1")))
+            int(os.getenv("VLLM_GRANULEKV_LONG_CONTEXT_STRESS_ALLOW_PREFILL", "1")))
         self._long_context_stress_require_priority = bool(
-            int(os.getenv("VLLM_BAM_LONG_CONTEXT_STRESS_REQUIRE_PRIORITY",
+            int(os.getenv("VLLM_GRANULEKV_LONG_CONTEXT_STRESS_REQUIRE_PRIORITY",
                           "1")))
         self._long_context_stress_proactive = bool(
-            int(os.getenv("VLLM_BAM_LONG_CONTEXT_STRESS_PROACTIVE", "0")))
+            int(os.getenv("VLLM_GRANULEKV_LONG_CONTEXT_STRESS_PROACTIVE", "0")))
         # READY 请求先进入 running，真正被 Engine dispatch 前保留一个观测
         # 标记。这样可以区分“状态已经可运行”和“已经进入模型执行 batch”。
         self._async_kv_execution_markers: dict[
             str, AsyncKVExecutionMarker] = {}
-        # active I/O abort 不能立刻释放源或目标 block：MDS 仍可能对这些
+        # active I/O abort 不能立刻释放源或目标 block：GranuleKV 仍可能对这些
         # 地址执行 DMA。先记录取消意图，等 READY/ERROR 后再统一回收。
         self._cancelled_async_kv_requests: Set[str] = set()
 
@@ -262,7 +262,7 @@ class AsyncKVScheduler(Scheduler):
     def _maybe_start_granulekv_prefix_restore(self) -> int:
         """在父类 admission 前尝试恢复一个 SSD prefix。
 
-        每次最多预留当前可用的 sequence slot 和 MDS prefix loading slot。
+        每次最多预留当前可用的 sequence slot 和 GranuleKV prefix loading slot。
         pending target 已由 allocator 隔离，所以 running/swapped/其他 write
         不再阻止 restore；READY 后才把请求放入 running。
         """
@@ -288,12 +288,12 @@ class AsyncKVScheduler(Scheduler):
                 break
             seq = waiting_seqs[0]
             storage_prefix_blocks, gpu_prefix_blocks = (
-                self.block_manager.get_mds_cached_prefix_block_counts(seq))
+                self.block_manager.get_granulekv_cached_prefix_block_counts(seq))
             if storage_prefix_blocks <= gpu_prefix_blocks:
                 # 当前最高优先级请求应先走原生 HBM-hit/recompute admission，
                 # 不能让后面的 SSD restore 提前占用它需要的 sequence/HBM slot。
                 break
-            alloc_status = self.block_manager.can_reserve_mds_prefix_restore(
+            alloc_status = self.block_manager.can_reserve_granulekv_prefix_restore(
                 storage_prefix_blocks, gpu_prefix_blocks)
             if alloc_status == AllocStatus.LATER:
                 self._prefix_restore_admission_blocked = True
@@ -302,7 +302,7 @@ class AsyncKVScheduler(Scheduler):
                 break
 
             try:
-                reservation = self.block_manager.reserve_mds_prefix_restore(
+                reservation = self.block_manager.reserve_granulekv_prefix_restore(
                     seq_group,
                     num_prefix_blocks=storage_prefix_blocks,
                     num_gpu_cached_blocks=gpu_prefix_blocks,
@@ -312,7 +312,7 @@ class AsyncKVScheduler(Scheduler):
                 # 压力边界失败。将它视为本轮 LATER，但不能越过当前请求，也
                 # 不在每个 decode step 输出 INFO 干扰性能。
                 logger.debug(
-                    "[BAM_MDS_PREFIX] phase=restore_deferred "
+                    "[GRANULEKV_PREFIX] phase=restore_deferred "
                     "seq_group_id=%s storage_prefix_blocks=%d "
                     "gpu_prefix_blocks=%d reason=no_free_blocks",
                     seq_group.request_id,
@@ -333,7 +333,7 @@ class AsyncKVScheduler(Scheduler):
                     prefix=True,
                 )
                 logger.info(
-                    "[BAM_MDS_PREFIX] phase=restore_queued request_id=%s "
+                    "[GRANULEKV_PREFIX] phase=restore_queued request_id=%s "
                     "seq_group_id=%s storage_prefix_blocks=%d "
                     "gpu_prefix_blocks=%d read_blocks=%d",
                     request.request_id,
@@ -345,20 +345,12 @@ class AsyncKVScheduler(Scheduler):
             started += 1
         return started
 
-    def _maybe_start_bam_mds_prefix_restore(self) -> int:
-        """Compatibility name for existing tests and external experiments.
-
-        Active callers use GranuleKV; this alias only forwards to that
-        implementation and does not restore the legacy transport path.
-        """
-        return self._maybe_start_granulekv_prefix_restore()
-
     def _enqueue_hierarchical_prefix_restore(
         self,
         seq_group: SequenceGroup,
         reservation: BlockPrefixRestoreReservation,
     ) -> None:
-        """按通用 prefetch plan 投影并建立多个 MDS 子请求。"""
+        """按通用 prefetch plan 投影并建立多个 GranuleKV 子请求。"""
         plan = self.hierarchical_io_config.build_plan(
             reservation.reservation_id,
             num_blocks=len(reservation.block_mapping),
@@ -368,7 +360,7 @@ class AsyncKVScheduler(Scheduler):
         for unit in plan.units:
             # dense layer plan 的 block_indices 为 None，投影结果与历史逻辑
             # 完全一致。sparse-style selector 只改变 unit 的 block 选择，不
-            # 复制 reservation、队列和 MDS 生命周期代码。
+            # 复制 reservation、队列和 GranuleKV 生命周期代码。
             block_mapping, logical_blocks = select_prefetch_unit_blocks(
                 unit, reservation.block_mapping, reservation.logical_blocks)
             selected_block_counts.append(len(block_mapping))
@@ -394,7 +386,7 @@ class AsyncKVScheduler(Scheduler):
         self.hierarchical_prefix_loading[plan.plan_id] = seq_group
 
         logger.info(
-            "[BAM_MDS_HIERARCHICAL] phase=plan_queued plan_id=%s "
+            "[GRANULEKV_HIERARCHICAL] phase=plan_queued plan_id=%s "
             "seq_group_id=%s windows=%d blocks=%d selector=%s "
             "profiling_only=%s selected_blocks_per_unit=%s",
             plan.plan_id,
@@ -407,7 +399,7 @@ class AsyncKVScheduler(Scheduler):
         )
         for request, unit in zip(requests, plan.units):
             logger.info(
-                "[BAM_MDS_HIERARCHICAL] phase=window_queued plan_id=%s "
+                "[GRANULEKV_HIERARCHICAL] phase=window_queued plan_id=%s "
                 "request_id=%s window=%d/%d layer_range=[%d,%d) "
                 "selected_blocks=%d",
                 plan.plan_id,
@@ -582,7 +574,7 @@ class AsyncKVScheduler(Scheduler):
         operation: AsyncKVTransferOperation,
         prefix: bool = False,
     ) -> AsyncKVTransferRequest:
-        """把 block reservation 登记为等待 MDS transfer slot。"""
+        """把 block reservation 登记为等待 GranuleKV transfer slot。"""
         request = self.async_kv_policy.enqueue(
             seq_group.request_id,
             reservation.reservation_id,
@@ -659,7 +651,7 @@ class AsyncKVScheduler(Scheduler):
                 # DMA 已经完成，此时 abort reservation 可以安全释放目标
                 # block；随后释放仍由正式 block table 持有的源 block。
                 if is_prefix_restore:
-                    self.block_manager.abort_mds_prefix_restore(
+                    self.block_manager.abort_granulekv_prefix_restore(
                         request.reservation_id)
                 else:
                     self.block_manager.abort_block_swap(
@@ -669,7 +661,7 @@ class AsyncKVScheduler(Scheduler):
                 continue
 
             if is_prefix_restore:
-                restored_prefix_tokens = self.block_manager.commit_mds_prefix_restore(
+                restored_prefix_tokens = self.block_manager.commit_granulekv_prefix_restore(
                     request.reservation_id)
                 self._advance_restored_prefix_frontier(
                     seq_group, restored_prefix_tokens)
@@ -692,7 +684,7 @@ class AsyncKVScheduler(Scheduler):
                     seq.status = SequenceStatus.RUNNING
                 ready_groups.append(seq_group)
                 logger.info(
-                    "[BAM_MDS_PREFIX] phase=restore_ready request_id=%s "
+                    "[GRANULEKV_PREFIX] phase=restore_ready request_id=%s "
                     "seq_group_id=%s",
                     request.request_id,
                     seq_group.request_id,
@@ -700,10 +692,10 @@ class AsyncKVScheduler(Scheduler):
             elif is_prefix_store:
                 # prefix populate 已完成，正式 table 此时位于 storage；调用
                 # storage 专用释放后，完整 CPU block 留在 prefix allocator
-                # 的 LRU 中，后续相同 token hash 可以获取稳定的 MDS block id。
-                self._free_completed_mds_prefix_store(seq_group)
+                # 的 LRU 中，后续相同 token hash 可以获取稳定的 GranuleKV block id。
+                self._free_completed_granulekv_prefix_store(seq_group)
                 logger.info(
-                    "[BAM_MDS_PREFIX] phase=store_ready request_id=%s "
+                    "[GRANULEKV_PREFIX] phase=store_ready request_id=%s "
                     "seq_group_id=%s",
                     request.request_id,
                     seq_group.request_id,
@@ -730,7 +722,7 @@ class AsyncKVScheduler(Scheduler):
                         marker.promoted_monotonic_ns,
                     )
 
-        # MDS poll 失败时，异步请求已经不能再被 attention 使用。将它们
+        # GranuleKV poll 失败时，异步请求已经不能再被 attention 使用。将它们
         # 标记为 ignored，并释放已经预留的 GPU block，避免 block 泄漏。
         for load in self.async_kv_policy.pop_errors():
             request = load.request
@@ -758,7 +750,7 @@ class AsyncKVScheduler(Scheduler):
                     f"missing failed async KV sequence group: "
                     f"{request.request_id}")
             if is_prefix_restore:
-                self.block_manager.abort_mds_prefix_restore(
+                self.block_manager.abort_granulekv_prefix_restore(
                     request.reservation_id)
             else:
                 self.block_manager.abort_block_swap(request.reservation_id)
@@ -799,7 +791,7 @@ class AsyncKVScheduler(Scheduler):
                 f"missing hierarchical prefix plan: {progress.plan_id}")
 
         logger.info(
-            "[BAM_MDS_HIERARCHICAL] phase=window_%s plan_id=%s "
+            "[GRANULEKV_HIERARCHICAL] phase=window_%s plan_id=%s "
             "request_id=%s seq_group_id=%s window=%d layer_range=[%d,%d)",
             "ready" if succeeded else "error",
             progress.plan_id,
@@ -815,7 +807,7 @@ class AsyncKVScheduler(Scheduler):
             # 状态，确保 Step 4 之前完整 model forward 看不到半恢复 KV。
             self.hierarchical_prefix_admitted.add(progress.plan_id)
             logger.info(
-                "[BAM_MDS_HIERARCHICAL] phase=first_window_admitted "
+                "[GRANULEKV_HIERARCHICAL] phase=first_window_admitted "
                 "plan_id=%s seq_group_id=%s potential_restore_ttft_ms=%.3f "
                 "dispatch_gate=%s",
                 progress.plan_id,
@@ -831,7 +823,7 @@ class AsyncKVScheduler(Scheduler):
                 # 只能由 worker 的逐层 barrier 读取，绝不成为全局 hash 命中。
                 restored_prefix_tokens = (
                     self.block_manager.
-                    admit_mds_prefix_restore_for_layer_barrier(
+                    admit_granulekv_prefix_restore_for_layer_barrier(
                         progress.plan_id))
                 self._advance_restored_prefix_frontier(
                     seq_group, restored_prefix_tokens)
@@ -840,7 +832,7 @@ class AsyncKVScheduler(Scheduler):
                     seq.status = SequenceStatus.RUNNING
                 ready_groups.append(seq_group)
                 logger.info(
-                    "[BAM_MDS_HIERARCHICAL] phase=layer_barrier_dispatch "
+                    "[GRANULEKV_HIERARCHICAL] phase=layer_barrier_dispatch "
                     "plan_id=%s seq_group_id=%s restored_prefix_tokens=%d",
                     progress.plan_id,
                     seq_group.request_id,
@@ -857,11 +849,11 @@ class AsyncKVScheduler(Scheduler):
                 # 环形 regions 中早期层已被后续层覆盖，只结束 reservation，
                 # 不能把它发布成全局 GPU prefix cache 命中。
                 restored_prefix_tokens = (
-                    self.block_manager.finalize_mds_prefix_working_set(
+                    self.block_manager.finalize_granulekv_prefix_working_set(
                         progress.plan_id))
             else:
                 restored_prefix_tokens = (
-                    self.block_manager.commit_mds_prefix_restore(
+                    self.block_manager.commit_granulekv_prefix_restore(
                         progress.plan_id))
             # barrier 模式已在首窗 READY 时推进 frontier 并转为 RUNNING；
             # 全部 window 结束时仅发布 hash/SSD replica，不能重复入队。
@@ -875,7 +867,7 @@ class AsyncKVScheduler(Scheduler):
                     seq.status = SequenceStatus.RUNNING
                 ready_groups.append(seq_group)
             logger.info(
-                "[BAM_MDS_HIERARCHICAL] phase=full_restore_ready "
+                "[GRANULEKV_HIERARCHICAL] phase=full_restore_ready "
                 "plan_id=%s seq_group_id=%s full_restore_ms=%.3f "
                 "first_to_full_gap_ms=%.3f",
                 progress.plan_id,
@@ -888,9 +880,9 @@ class AsyncKVScheduler(Scheduler):
             # 任一 window 失败，或者首窗准入后用户 abort，都不能发布这个
             # prefix。此处已经确认全部子 DMA 终态，释放 target 才是安全的。
             terminal_ns = time.monotonic_ns()
-            self.block_manager.abort_mds_prefix_restore(progress.plan_id)
+            self.block_manager.abort_granulekv_prefix_restore(progress.plan_id)
             if progress.profiling_only and progress.all_ready:
-                # 非 dense selector 只用于验证 BaM 细粒度 I/O 形态。因为只恢复
+                # 非 dense selector 只用于验证 GranuleKV 细粒度 I/O 形态。因为只恢复
                 # 了 prefix 的部分 blocks，当前还没有 sparse attention consumer
                 # 与 partial-residency 语义，绝不能把完整 prefix 发布为 computed。
                 # 这里把请求标记为 ignored 并释放 reservation/block table；它
@@ -907,7 +899,7 @@ class AsyncKVScheduler(Scheduler):
                                       SequenceStatus.FINISHED_IGNORED)
                 super()._free_finished_seq_group(seq_group)
             logger.info(
-                "[BAM_MDS_HIERARCHICAL] phase=restore_aborted "
+                "[GRANULEKV_HIERARCHICAL] phase=restore_aborted "
                 "plan_id=%s seq_group_id=%s failed=%s cancelled=%s "
                 "profiling_only=%s selector=%s profiling_restore_ms=%.3f",
                 progress.plan_id,
@@ -932,7 +924,7 @@ class AsyncKVScheduler(Scheduler):
 
         原生 prefix admission 会把 ``cached + uncached`` 一起放进第一次
         ScheduledSequenceGroup；output processor 随后一次性推进 sequence 的
-        computed frontier。MDS restore READY 后直接进入 running，绕过了这次
+        computed frontier。GranuleKV restore READY 后直接进入 running，绕过了这次
         waiting admission。如果只发布 block hash 而不推进 sequence frontier，
         running scheduler 会把同一小段 suffix 重复执行，直到累计 token 数
         追上 prefix。
@@ -954,14 +946,14 @@ class AsyncKVScheduler(Scheduler):
             for plan_id, seq_group in self.hierarchical_prefix_loading.items()
             if plan_id in self.hierarchical_prefix_admitted)
 
-    def _free_completed_mds_prefix_store(
+    def _free_completed_granulekv_prefix_store(
             self, seq_group: SequenceGroup) -> None:
         """完成 finished bookkeeping，并释放 storage-resident table。"""
         self._free_seq_group_cross_attn_blocks(seq_group)
         self._finished_requests_ids.append(seq_group.request_id)
         for seq in seq_group.get_seqs():
             if seq.is_finished():
-                self.block_manager.free_mds_prefix_store(seq)
+                self.block_manager.free_granulekv_prefix_store(seq)
 
     def _remove_from_swapped(self, seq_group: SequenceGroup) -> None:
         """按对象身份移除可能仍在原生 swapped 队列中的 write 请求。"""
@@ -990,8 +982,8 @@ class AsyncKVScheduler(Scheduler):
         """拦截 single-step output processor 的即时 finished free。
 
         V0 会在 stop checker 返回 finished 后立刻调用 ``free_seq``，早于
-        ``free_finished_seq_groups``。BaM prefix 必须在这里保住 GPU table，
-        否则稍后的 group hook 已经没有可写入 MDS 的 KV source。
+        ``free_finished_seq_groups``。GranuleKV prefix 必须在这里保住 GPU table，
+        否则稍后的 group hook 已经没有可写入 GranuleKV 的 KV source。
         """
         if (self.granulekv_prefix_enabled and seq.is_finished()
                 and seq.seq_id in self.block_manager.block_tables):
@@ -1001,7 +993,7 @@ class AsyncKVScheduler(Scheduler):
                 None,
             )
             if (seq_group is not None
-                    and self._try_start_mds_prefix_store(seq_group)):
+                    and self._try_start_granulekv_prefix_store(seq_group)):
                 return
         super().free_seq(seq)
 
@@ -1009,17 +1001,17 @@ class AsyncKVScheduler(Scheduler):
         """完成 group 清理时避免重复提交已经开始的 prefix store。"""
         if any(group is seq_group for group in self.prefix_saving.values()):
             return
-        if self._try_start_mds_prefix_store(seq_group):
+        if self._try_start_granulekv_prefix_store(seq_group):
             return
         super()._free_finished_seq_group(seq_group)
 
-    def _try_start_mds_prefix_store(self,
+    def _try_start_granulekv_prefix_store(self,
                                     seq_group: SequenceGroup) -> bool:
-        """正常释放前，用 MDS 异步保存可复用的完整 prefix block。
+        """正常释放前，用 GranuleKV 异步保存可复用的完整 prefix block。
 
-        这是 BaM prefix populate 唯一挂点，并且只存在于显式选择的
+        这是 GranuleKV prefix populate 唯一挂点，并且只存在于显式选择的
         ``AsyncKVScheduler``。原生 Scheduler 的 finished/free 行为没有改动。
-        请求对客户端已经完成，但 block 资源会保留到 MDS DONE；Engine 通过
+        请求对客户端已经完成，但 block 资源会保留到 GranuleKV DONE；Engine 通过
         ``prefix_saving`` 继续推进空调度轮次，不会提前复用 DMA source。
         """
         if (not self.granulekv_prefix_enabled or not seq_group.is_finished()
@@ -1037,10 +1029,10 @@ class AsyncKVScheduler(Scheduler):
         has_block_table = all(seq.seq_id in self.block_manager.block_tables
                               for seq in seqs)
         if (not normally_finished or not has_full_block or not has_block_table
-                or not self.block_manager.can_reserve_mds_prefix_store(
+                or not self.block_manager.can_reserve_granulekv_prefix_store(
                     seq_group)):
             logger.debug(
-                "[BAM_MDS_PREFIX] phase=store_skipped request_id=%s "
+                "[GRANULEKV_PREFIX] phase=store_skipped request_id=%s "
                 "normally_finished=%s has_full_block=%s has_block_table=%s",
                 seq_group.request_id,
                 normally_finished,
@@ -1050,12 +1042,12 @@ class AsyncKVScheduler(Scheduler):
             return False
 
         try:
-            reservation = self.block_manager.reserve_mds_prefix_store(seq_group)
+            reservation = self.block_manager.reserve_granulekv_prefix_store(seq_group)
         except Exception as exc:
             # Prefix 是可选的缓存优化；storage 紧张时保留正常完成语义，
             # 不把用户请求失败扩大成服务失败。
             logger.warning(
-                "[BAM_MDS_PREFIX] skip store request_id=%s error=%s",
+                "[GRANULEKV_PREFIX] skip store request_id=%s error=%s",
                 seq_group.request_id,
                 exc,
             )
@@ -1067,7 +1059,7 @@ class AsyncKVScheduler(Scheduler):
             prefix=True,
         )
         logger.info(
-            "[BAM_MDS_PREFIX] phase=store_queued request_id=%s "
+            "[GRANULEKV_PREFIX] phase=store_queued request_id=%s "
             "seq_group_id=%s write_blocks=%d reused_blocks=%d",
             request.request_id,
             seq_group.request_id,
@@ -1085,7 +1077,7 @@ class AsyncKVScheduler(Scheduler):
 
         原生 Scheduler 只扫描 waiting/running/swapped 三个队列；loading
         请求不在这些队列中，因此需要在调用父类逻辑后单独检查。这里不
-        尝试伪造 MDS cancel 协议，而是让 resident MDS 完成对应 slot 的 I/O，
+        尝试伪造 GranuleKV cancel 协议，而是让 resident GranuleKV 完成对应 slot 的 I/O，
         再由 ``complete_ready_async_kv_transfers`` 执行最终清理。
         """
         if isinstance(request_id, str):
@@ -1094,7 +1086,7 @@ class AsyncKVScheduler(Scheduler):
             request_ids = set(request_id)
         seq_id_to_seq_group = seq_id_to_seq_group or {}
 
-        # saving 请求虽然状态为 SWAPPED，但正式 block table 仍指向 MDS
+        # saving 请求虽然状态为 SWAPPED，但正式 block table 仍指向 GranuleKV
         # 正在读取的 GPU source。先从原生 swapped 队列摘出目标请求，避免
         # 父类 abort 提前 free_seq，造成 DMA 写盘期间地址被复用。
         for seq_group in tuple(self.saving.values()):
@@ -1164,7 +1156,7 @@ class AsyncKVScheduler(Scheduler):
             self) -> Tuple[AsyncKVTransferRequest, ...]:
         """生成本轮 submit/stage 批次。
 
-        rolling plan 的首个 unit 占用真实 MDS slot；其余 unit 只把完整
+        rolling plan 的首个 unit 占用真实 GranuleKV slot；其余 unit 只把完整
         mapping 预授权给 Worker，``activate_on_submit=False``，由 barrier
         按模型进度稍后激活。普通 swap 和 rolling 关闭时仍走原队列逻辑。
         """
@@ -1203,7 +1195,7 @@ class AsyncKVScheduler(Scheduler):
         seq_group: SequenceGroup,
         blocks_to_swap_out: List[Tuple[int, int]],
     ) -> None:
-        """把原生同步 swap-out 改为 reservation + 后台 MDS write。
+        """把原生同步 swap-out 改为 reservation + 后台 GranuleKV write。
 
         ``blocks_to_swap_out`` 故意保持为空，防止 Worker.execute_worker
         再执行一次同步写。源 GPU block 在 write READY 前仍由 reservation
@@ -1251,10 +1243,10 @@ class AsyncKVScheduler(Scheduler):
         1. 检查 GPU block 是否足够；
         2. 预留目标 GPU block，正式 block table 仍指向 storage；
         3. 将逻辑请求登记为 loading；
-        4. 等待 Worker/MDS 返回 READY；
+        4. 等待 Worker/GranuleKV 返回 READY；
         5. 下一轮才进入 running。
 
-        read/write 可以提前排队，并由统一 policy 按 MDS slot 容量激活。
+        read/write 可以提前排队，并由统一 policy 按 GranuleKV slot 容量激活。
         """
         empty = SchedulerSwappedInOutputs.create_empty()
         # read reservation 会占用真实 GPU target，因此最多保留与后端 slot

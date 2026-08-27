@@ -32,7 +32,7 @@ class Figure13Point:
 class Figure13SweepConfig:
     """经过 block 对齐检查的不可变 sweep 配置。
 
-    这个对象不依赖 tokenizer、Scheduler 或 MDS。评测 runner 和单元测试
+    这个对象不依赖 tokenizer、Scheduler 或 GranuleKV。评测 runner 和单元测试
     使用同一份配置生成实验点，避免 shell、Python runner 和结果聚合器各自
     维护一套 prefix 比例。
     """

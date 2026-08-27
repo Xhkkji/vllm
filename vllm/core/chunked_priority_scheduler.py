@@ -6,7 +6,7 @@ This scheduler keeps vLLM's native chunked-prefill / continuous-batching path
 and only adds one small admission hook: when a high-priority waiting request
 cannot allocate KV blocks, preempt one lower-priority running request. Native
 vLLM recompute preemption is used, so this scheduler is suitable for vLLM /
-LMCache baselines and does not depend on BaM/MDS.
+LMCache baselines and does not depend on GranuleKV.
 """
 
 from __future__ import annotations

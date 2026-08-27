@@ -3,7 +3,7 @@
 """层级/稀疏 KV 的最小驻留目录。
 
 这个目录只记录 scheduler 已声明的 logical block 是否可被当前 layer
-consumer 使用，不持有 GPU tensor、allocator block 或 MDS handle。真正的
+consumer 使用，不持有 GPU tensor、allocator block 或 GranuleKV handle。真正的
 物理 block 释放仍由 BlockSpaceManager 负责；因此它可以安全地留在
 Worker-local runtime 中，不改变 vLLM 原生 block table。
 """
@@ -32,7 +32,7 @@ class _UnitResidency:
 class PrefetchResidencyDirectory:
     """维护 prefetch unit 的 logical block 可见性。
 
-    sparse consumer 只需要调用 ``require_layer``。它不会读取 MDS，也不会
+    sparse consumer 只需要调用 ``require_layer``。它不会读取 GranuleKV，也不会
     触碰 allocator；如果某个尚未 READY 的 block 被使用，会立即报错，避免
     以后把“部分恢复”错误地当成完整 prefix 命中。
     """

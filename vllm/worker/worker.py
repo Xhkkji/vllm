@@ -72,7 +72,7 @@ class Worker(LocalOrDistributedWorkerBase):
             Tuple[int, str], torch.Tensor] = {}
         # layer-window 和未来 sparse unit 共用一个 plan runtime。Scheduler
         # 仍是 block/reservation 的唯一所有者；这里仅保存预授权 mapping，
-        # 根据 model progress 激活 MDS handle，并缓存 completion event。
+        # 根据 model progress 激活 GranuleKV handle，并缓存 completion event。
         self._prefetch_runtime = RollingPrefetchRuntime(
             RollingPrefetchConfig.from_env())
         if self.model_config.trust_remote_code:
@@ -450,7 +450,7 @@ class Worker(LocalOrDistributedWorkerBase):
                 if not cache_engine.swap_in_async(
                         worker_input.blocks_to_swap_in):
                     # 当前 scheduler output 已经为 swap-in 分配了目标 GPU
-                    # blocks。在 MDS logical request 完成前，必须保留同一批输入
+                    # blocks。在 GranuleKV logical request 完成前，必须保留同一批输入
                     # 并禁止 attention 读取尚未恢复完整的 KV。
                     raise DeferredModelExecution(
                         request_ids=[],
@@ -498,7 +498,7 @@ class Worker(LocalOrDistributedWorkerBase):
 
         该 RPC 只执行非阻塞 submit。mapping 转成 CPU int64 tensor 后保存在
         Worker 内，后续 poll 必须使用完全相同的 tensor 内容。后端容量由
-        scheduler policy 与 MDS request table 共同限制。
+        scheduler policy 与 GranuleKV request table 共同限制。
         """
         cache_engine = self.cache_engine[virtual_engine]
         events: List[AsyncKVTransferEvent] = []
@@ -515,7 +515,7 @@ class Worker(LocalOrDistributedWorkerBase):
             ).view(-1, 2)
             prepared.append((request, mapping))
 
-        # stage 是 plan 级动作：所有 descriptor template 一次下沉到 MDS
+        # stage 是 plan 级动作：所有 descriptor template 一次下沉到 GranuleKV
         # connector，但只有 activate_on_submit=True 的首批 unit 会占 slot。
         plans: dict[str, list[tuple[str, torch.Tensor,
                                     AsyncKVTransferOperation,
@@ -607,7 +607,7 @@ class Worker(LocalOrDistributedWorkerBase):
     ) -> None:
         """模型消费完 window 后，把对应环形 KV region 标记为可覆盖。"""
         if envs.VLLM_GRANULEKV_LAYER_WORKING_SET_ENABLE:
-            # layer.forward 返回只表示 kernel 已入队。MDS DMA 不属于 PyTorch
+            # layer.forward 返回只表示 kernel 已入队。GranuleKV DMA 不属于 PyTorch
             # stream，若此时立刻覆盖同一 region，可能与尚未结束的 attention
             # 读发生竞争。验证版在 window 边界显式同步，先保证语义正确；后续
             # 可改成 CUDA event -> MDS activation 的非阻塞依赖协议。
@@ -638,7 +638,7 @@ class Worker(LocalOrDistributedWorkerBase):
                 unit.request_id, mapping),
             max_active=envs.VLLM_GRANULEKV_MAX_IN_FLIGHT,
         )
-        # wait_ready 只保证物理 MDS event 到达 READY；随后再用 logical block
+            # wait_ready 只保证物理 GranuleKV event 到达 READY；随后再用 logical block
         # 目录验证当前 sparse consumer 的全部 block 已驻留。dense unit 的
         # consumer_block_indices=None，因此此检查不会改变原有 attention。
         sparse_kv_blocks = self._prefetch_runtime.require_resident_layer(

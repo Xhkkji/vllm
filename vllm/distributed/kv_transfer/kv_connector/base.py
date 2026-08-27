@@ -132,7 +132,7 @@ class KVReceiveStatus(Enum):
     这里的状态机是“request/batch 级”的，而不是 page 级的：
 
     - page/chunk 的 read_ready / cache_ready / consumable 仍然由底层
-      BaM store 跟踪。
+      GranuleKV store 跟踪。
     - connector/runtime 这一层只关心：
       1. 这轮能不能直接 bypass
       2. 这轮要不要继续 forward

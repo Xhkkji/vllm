@@ -37,7 +37,7 @@ class BlockSwapReservation:
 
     reservation 只暴露后端执行 I/O 所需的物理 block mapping。源 block、
     目标 block 对象以及 refcount 的具体处理仍由 BlockSpaceManager 私有
-    持有，避免 Scheduler 或 MDS connector 直接依赖 vLLM allocator 实现。
+    持有，避免 Scheduler 或 GranuleKV connector 直接依赖 vLLM allocator 实现。
     """
 
     reservation_id: str
@@ -55,7 +55,7 @@ class BlockSwapReservation:
 
 @dataclass(frozen=True)
 class BlockPrefixRestoreReservation:
-    """一次 BaM MDS prefix SSD -> GPU 恢复事务。
+    """一次 GranuleKV prefix SSD -> GPU 恢复事务。
 
     与 swap-in 不同，目标请求原本没有 storage block table。Block manager
     会先为新请求建立 GPU table，再把命中的连续 prefix 映射到这些目标

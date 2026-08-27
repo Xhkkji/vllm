@@ -66,11 +66,11 @@ def _cache_config() -> CacheConfig:
 
 
 def _enable_hierarchical_figure13(monkeypatch) -> None:
-    monkeypatch.setenv("VLLM_BAM_MDS_PREFIX_ENABLE", "1")
-    monkeypatch.setenv("VLLM_BAM_MDS_HIERARCHICAL_IO_ENABLE", "1")
-    monkeypatch.setenv("VLLM_BAM_MDS_HIERARCHICAL_NUM_LAYERS", "4")
-    monkeypatch.setenv("VLLM_BAM_MDS_HIERARCHICAL_WINDOW_LAYERS", "2")
-    monkeypatch.setenv("VLLM_BAM_ASYNC_SCHEDULER_STRATEGY", "native")
+    monkeypatch.setenv("VLLM_GRANULEKV_PREFIX_ENABLE", "1")
+    monkeypatch.setenv("VLLM_GRANULEKV_HIERARCHICAL_IO_ENABLE", "1")
+    monkeypatch.setenv("VLLM_GRANULEKV_HIERARCHICAL_NUM_LAYERS", "4")
+    monkeypatch.setenv("VLLM_GRANULEKV_HIERARCHICAL_WINDOW_LAYERS", "2")
+    monkeypatch.setenv("VLLM_GRANULEKV_ASYNC_SCHEDULER_STRATEGY", "native")
 
 
 def test_figure13_scheduler_is_explicit_fcfs_single_request(monkeypatch):

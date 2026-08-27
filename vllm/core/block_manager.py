@@ -12,7 +12,7 @@ from vllm.core.block.cpu_gpu_block_allocator import CpuGpuBlockAllocator
 from vllm.core.block.interfaces import Block
 from vllm.core.block.prefix_caching_block import (ComputedBlocksTracker,
                                                   LastAccessBlocksTracker)
-from vllm.core.custom_schedulers.bam_mds_prefix import (
+from vllm.core.custom_schedulers.granulekv_prefix import (
     compute_full_prefix_block_hashes)
 from vllm.core.block.utils import check_no_caching_or_swa_for_blockmgr_encdec
 from vllm.core.block_reservation import (BlockPrefixRestoreReservation,
@@ -509,6 +509,8 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         """一次 hash 计算同时返回 ``(storage_blocks, gpu_blocks)``。"""
         if not self.enable_caching:
             return 0, 0
+        if envs.VLLM_GRANULEKV_TRUST_PREPOPULATED_PREFIX:
+            self._seed_trusted_mds_storage_prefix(seq)
         block_hashes = compute_full_prefix_block_hashes(
             seq.get_token_ids(), self.block_size, seq.extra_hash())
         storage_blocks = len(
@@ -518,6 +520,53 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             self.block_allocator.find_cached_blocks_prefix(
                 block_hashes, device=Device.GPU))
         return storage_blocks, gpu_blocks
+
+    def _seed_trusted_mds_storage_prefix(self, seq: Sequence) -> None:
+        """为两阶段实验重建已经写入 SSD 的 prefix allocator 元数据。
+
+        此函数不执行任何 I/O，只能在第一阶段使用相同模型、token、block size、
+        storage 容量和全新 allocator 顺序写过 SSD 后启用。显式 block 数防止把
+        第二阶段人为修改的 suffix 也声明为命中。创建出的 block 立即 free 到
+        CPU prefix-cache evictor；后续正常 lookup/reservation 会重新持有引用。
+        """
+        if not envs.VLLM_GRANULEKV_LAYER_WORKING_SET_ENABLE:
+            raise RuntimeError(
+                "trusted prepopulated prefix is only valid in working-set mode")
+        trusted_blocks = envs.VLLM_GRANULEKV_TRUSTED_PREFIX_BLOCKS
+        max_full_blocks = len(seq.get_token_ids()) // self.block_size
+        if trusted_blocks <= 0 or trusted_blocks > max_full_blocks:
+            raise ValueError(
+                "VLLM_GRANULEKV_TRUSTED_PREFIX_BLOCKS must describe a positive "
+                "complete prefix of the current request")
+        token_ids = seq.get_token_ids()[:trusted_blocks * self.block_size]
+        hashes = compute_full_prefix_block_hashes(token_ids, self.block_size,
+                                                  seq.extra_hash())
+        if len(self.block_allocator.find_cached_blocks_prefix(
+                hashes, device=Device.CPU)) == trusted_blocks:
+            return
+
+        token_blocks = [
+            token_ids[index:index + self.block_size]
+            for index in range(0, len(token_ids), self.block_size)
+        ]
+        seeded = self.block_allocator.allocate_immutable_blocks(
+            prev_block=None,
+            block_token_ids=token_blocks,
+            device=Device.CPU,
+            extra_hash=seq.extra_hash(),
+        )
+        block_ids = [block.block_id for block in seeded
+                     if block.block_id is not None]
+        if len(block_ids) != trusted_blocks:
+            raise RuntimeError("failed to seed complete trusted SSD prefix")
+        self.block_allocator.mark_blocks_as_computed_on_device(
+            block_ids, Device.CPU)
+        for block in seeded:
+            self.block_allocator.free(block)
+        logger.warning(
+            "[BAM_MDS_WORKING_SET] trusted prepopulated SSD prefix seeded "
+            "seq_id=%s blocks=%d; payload integrity is an experiment premise",
+            seq.seq_id, trusted_blocks)
 
     def can_reserve_mds_prefix_restore(
         self,

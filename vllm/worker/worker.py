@@ -343,11 +343,11 @@ class Worker(LocalOrDistributedWorkerBase):
         with context:
             self._init_cache_engine()
         self._warm_up_model()
-        # 【BaM KVStore 直通调用链】BaM direct runtime 必须在模型 warmup、
+        # GranuleKV runtime 必须在模型 warmup、
         # CUDA Graph capture 和 workspace allocation 全部结束后再注册 vLLM KV
         # allocation。persistent CQ worker 仍到首次 submit 才真正启动。
         for cache_engine in self.cache_engine:
-            cache_engine.initialize_bam_direct_kv_store()
+            cache_engine.initialize_granulekv()
 
     def _init_cache_engine(self):
         assert self.cache_config.num_gpu_blocks is not None
@@ -446,7 +446,7 @@ class Worker(LocalOrDistributedWorkerBase):
                     worker_input.blocks_to_swap_in.shape[0],
                 )
             cache_engine = self.cache_engine[virtual_engine]
-            if cache_engine.bam_mds_connector is not None:
+            if cache_engine.granulekv_connector is not None:
                 if not cache_engine.swap_in_async(
                         worker_input.blocks_to_swap_in):
                     # 当前 scheduler output 已经为 swap-in 分配了目标 GPU
@@ -455,7 +455,7 @@ class Worker(LocalOrDistributedWorkerBase):
                     raise DeferredModelExecution(
                         request_ids=[],
                         message=(
-                            "resident MDS swap-in is still in flight; retry "
+                            "resident GranuleKV swap-in is still in flight; retry "
                             f"virtual_engine={virtual_engine}"),
                     )
             else:
@@ -606,7 +606,7 @@ class Worker(LocalOrDistributedWorkerBase):
         layer_index: int,
     ) -> None:
         """模型消费完 window 后，把对应环形 KV region 标记为可覆盖。"""
-        if envs.VLLM_BAM_MDS_LAYER_WORKING_SET_ENABLE:
+        if envs.VLLM_GRANULEKV_LAYER_WORKING_SET_ENABLE:
             # layer.forward 返回只表示 kernel 已入队。MDS DMA 不属于 PyTorch
             # stream，若此时立刻覆盖同一 region，可能与尚未结束的 attention
             # 读发生竞争。验证版在 window 边界显式同步，先保证语义正确；后续
@@ -636,7 +636,7 @@ class Worker(LocalOrDistributedWorkerBase):
                 prefetch_plan_id=unit.prefetch_plan_id),
             lambda unit, mapping: cache_engine.poll_async_kv_transfer(
                 unit.request_id, mapping),
-            max_active=envs.VLLM_BAM_MDS_MAX_IN_FLIGHT,
+            max_active=envs.VLLM_GRANULEKV_MAX_IN_FLIGHT,
         )
         # wait_ready 只保证物理 MDS event 到达 READY；随后再用 logical block
         # 目录验证当前 sparse consumer 的全部 block 已驻留。dense unit 的
@@ -653,7 +653,7 @@ class Worker(LocalOrDistributedWorkerBase):
             return
         for trace in traces:
             logger.info(
-                "[BAM_MDS_PREFETCH][Worker] phase=%s plan_id=%s "
+                "[GRANULEKV_PREFETCH][Worker] phase=%s plan_id=%s "
                 "request_id=%s unit=%d monotonic_ns=%d layer=%s "
                 "wait_ms=%.3f lead_units=%d",
                 trace.phase,

@@ -12,6 +12,11 @@ from typing import Mapping, Optional, Sequence, Tuple
 from vllm.core.block_reservation import BlockMapping, LogicalBlockKey
 
 
+def _env(values: Mapping[str, str], name: str, legacy_name: str,
+         default: str) -> str:
+    return values.get(name, values.get(legacy_name, default))
+
+
 @dataclass(frozen=True)
 class PrefetchBlockSelectorConfig:
     """把父 reservation 的 block 集合裁剪成可 profiling 的小粒度 I/O。
@@ -33,27 +38,28 @@ class PrefetchBlockSelectorConfig:
         environ: Optional[Mapping[str, str]] = None,
     ) -> "PrefetchBlockSelectorConfig":
         values = os.environ if environ is None else environ
-        policy = values.get(
-            "VLLM_BAM_MDS_PREFETCH_BLOCK_SELECTOR",
-            "dense",
-        ).strip().lower()
+        policy = _env(values, "VLLM_GRANULEKV_PREFETCH_BLOCK_SELECTOR",
+                      "VLLM_BAM_MDS_PREFETCH_BLOCK_SELECTOR",
+                      "dense").strip().lower()
         block_count = int(
-            values.get("VLLM_BAM_MDS_PREFETCH_BLOCK_COUNT", "0"))
-        stride = int(values.get("VLLM_BAM_MDS_PREFETCH_BLOCK_STRIDE", "1"))
+            _env(values, "VLLM_GRANULEKV_PREFETCH_BLOCK_COUNT",
+                 "VLLM_BAM_MDS_PREFETCH_BLOCK_COUNT", "0"))
+        stride = int(_env(values, "VLLM_GRANULEKV_PREFETCH_BLOCK_STRIDE",
+                          "VLLM_BAM_MDS_PREFETCH_BLOCK_STRIDE", "1"))
 
         if policy in ("", "none", "all"):
             policy = "dense"
         if policy not in ("dense", "tail_n", "recent_n", "stride"):
             raise ValueError(
-                "VLLM_BAM_MDS_PREFETCH_BLOCK_SELECTOR must be one of "
+                "VLLM_GRANULEKV_PREFETCH_BLOCK_SELECTOR must be one of "
                 "dense, tail_n, recent_n, stride")
         if policy in ("tail_n", "recent_n") and block_count <= 0:
             raise ValueError(
-                "VLLM_BAM_MDS_PREFETCH_BLOCK_COUNT must be positive for "
+                "VLLM_GRANULEKV_PREFETCH_BLOCK_COUNT must be positive for "
                 f"{policy}")
         if policy == "stride" and stride <= 0:
             raise ValueError(
-                "VLLM_BAM_MDS_PREFETCH_BLOCK_STRIDE must be positive")
+                "VLLM_GRANULEKV_PREFETCH_BLOCK_STRIDE must be positive")
         return cls(policy=policy, block_count=block_count, stride=stride)
 
     @property
@@ -330,29 +336,33 @@ class RollingPrefetchConfig:
     ) -> "RollingPrefetchConfig":
         values = os.environ if environ is None else environ
         enabled = bool(
-            int(values.get(
-                "VLLM_BAM_MDS_HIERARCHICAL_ROLLING_ENABLE", "0")))
+            int(_env(values, "VLLM_GRANULEKV_HIERARCHICAL_ROLLING_ENABLE",
+                     "VLLM_BAM_MDS_HIERARCHICAL_ROLLING_ENABLE", "0")))
         if not enabled:
             return cls()
-        lead_units = int(values.get(
+        lead_units = int(_env(
+            values, "VLLM_GRANULEKV_HIERARCHICAL_LEAD_WINDOWS",
             "VLLM_BAM_MDS_HIERARCHICAL_LEAD_WINDOWS", "1"))
-        max_lead_units = int(values.get(
+        max_lead_units = int(_env(
+            values, "VLLM_GRANULEKV_HIERARCHICAL_MAX_LEAD_WINDOWS",
             "VLLM_BAM_MDS_HIERARCHICAL_MAX_LEAD_WINDOWS",
             str(lead_units)))
-        target_slack_ms = float(values.get(
+        target_slack_ms = float(_env(
+            values, "VLLM_GRANULEKV_HIERARCHICAL_TARGET_SLACK_MS",
             "VLLM_BAM_MDS_HIERARCHICAL_TARGET_SLACK_MS", "0"))
         working_set_enabled = bool(
-            int(values.get("VLLM_BAM_MDS_LAYER_WORKING_SET_ENABLE", "0")))
+            int(_env(values, "VLLM_GRANULEKV_LAYER_WORKING_SET_ENABLE",
+                     "VLLM_BAM_MDS_LAYER_WORKING_SET_ENABLE", "0")))
         if lead_units < 0:
             raise ValueError(
-                "VLLM_BAM_MDS_HIERARCHICAL_LEAD_WINDOWS must be non-negative")
+                "VLLM_GRANULEKV_HIERARCHICAL_LEAD_WINDOWS must be non-negative")
         if max_lead_units < lead_units:
             raise ValueError(
-                "VLLM_BAM_MDS_HIERARCHICAL_MAX_LEAD_WINDOWS must be >= "
-                "VLLM_BAM_MDS_HIERARCHICAL_LEAD_WINDOWS")
+                "VLLM_GRANULEKV_HIERARCHICAL_MAX_LEAD_WINDOWS must be >= "
+                "VLLM_GRANULEKV_HIERARCHICAL_LEAD_WINDOWS")
         if target_slack_ms < 0:
             raise ValueError(
-                "VLLM_BAM_MDS_HIERARCHICAL_TARGET_SLACK_MS must be non-negative")
+                "VLLM_GRANULEKV_HIERARCHICAL_TARGET_SLACK_MS must be non-negative")
         return cls(enabled=True,
                    lead_units=lead_units,
                    max_lead_units=max_lead_units,
@@ -373,24 +383,37 @@ def get_layer_working_set_regions(
     因此 region 数固定为 ``window_layers * (max_lead_units + 1)``。
     """
     values = os.environ if environ is None else environ
-    if not bool(int(values.get("VLLM_BAM_MDS_LAYER_WORKING_SET_ENABLE", "0"))):
+    if not bool(int(_env(values, "VLLM_GRANULEKV_LAYER_WORKING_SET_ENABLE",
+                         "VLLM_BAM_MDS_LAYER_WORKING_SET_ENABLE", "0"))):
         return 0
     required_switches = (
-        "VLLM_BAM_MDS_HIERARCHICAL_IO_ENABLE",
-        "VLLM_BAM_MDS_HIERARCHICAL_LAYER_BARRIER",
-        "VLLM_BAM_MDS_HIERARCHICAL_ROLLING_ENABLE",
+        "VLLM_GRANULEKV_HIERARCHICAL_IO_ENABLE",
+        "VLLM_GRANULEKV_HIERARCHICAL_LAYER_BARRIER",
+        "VLLM_GRANULEKV_HIERARCHICAL_ROLLING_ENABLE",
     )
-    if any(not bool(int(values.get(name, "0")))
+    legacy_switches = {
+        "VLLM_GRANULEKV_HIERARCHICAL_IO_ENABLE":
+        "VLLM_BAM_MDS_HIERARCHICAL_IO_ENABLE",
+        "VLLM_GRANULEKV_HIERARCHICAL_LAYER_BARRIER":
+        "VLLM_BAM_MDS_HIERARCHICAL_LAYER_BARRIER",
+        "VLLM_GRANULEKV_HIERARCHICAL_ROLLING_ENABLE":
+        "VLLM_BAM_MDS_HIERARCHICAL_ROLLING_ENABLE",
+    }
+    if any(not bool(int(_env(values, name, legacy_switches[name], "0")))
            for name in required_switches):
         raise ValueError(
             "layer working set requires hierarchical I/O, layer barrier and "
             "rolling prefetch")
-    num_layers = int(values.get("VLLM_BAM_MDS_HIERARCHICAL_NUM_LAYERS", "0"))
+    num_layers = int(_env(values, "VLLM_GRANULEKV_HIERARCHICAL_NUM_LAYERS",
+                          "VLLM_BAM_MDS_HIERARCHICAL_NUM_LAYERS", "0"))
     window_layers = int(
-        values.get("VLLM_BAM_MDS_HIERARCHICAL_WINDOW_LAYERS", "0"))
-    max_lead = int(values.get(
+        _env(values, "VLLM_GRANULEKV_HIERARCHICAL_WINDOW_LAYERS",
+             "VLLM_BAM_MDS_HIERARCHICAL_WINDOW_LAYERS", "0"))
+    max_lead = int(_env(
+        values, "VLLM_GRANULEKV_HIERARCHICAL_MAX_LEAD_WINDOWS",
         "VLLM_BAM_MDS_HIERARCHICAL_MAX_LEAD_WINDOWS",
-        values.get("VLLM_BAM_MDS_HIERARCHICAL_LEAD_WINDOWS", "1")))
+        _env(values, "VLLM_GRANULEKV_HIERARCHICAL_LEAD_WINDOWS",
+             "VLLM_BAM_MDS_HIERARCHICAL_LEAD_WINDOWS", "1")))
     if num_layers <= 0 or window_layers <= 0 or max_lead < 0:
         raise ValueError("invalid layer working-set configuration")
     regions = window_layers * (max_lead + 1)
@@ -417,22 +440,25 @@ class HierarchicalIOConfig:
     ) -> "HierarchicalIOConfig":
         values = os.environ if environ is None else environ
         enabled = bool(
-            int(values.get("VLLM_BAM_MDS_HIERARCHICAL_IO_ENABLE", "0")))
+            int(_env(values, "VLLM_GRANULEKV_HIERARCHICAL_IO_ENABLE",
+                     "VLLM_BAM_MDS_HIERARCHICAL_IO_ENABLE", "0")))
         if not enabled:
             return cls()
 
         # SchedulerConfig 不携带模型层数；这里显式使用 PP rank 的本地层数，
         # 避免从模型名称或全局层数猜测。单卡模型通常就是总 hidden layers。
-        num_layers = int(
-            values.get("VLLM_BAM_MDS_HIERARCHICAL_NUM_LAYERS", "0"))
-        window_layers = int(
-            values.get("VLLM_BAM_MDS_HIERARCHICAL_WINDOW_LAYERS", "0"))
+        num_layers = int(_env(
+            values, "VLLM_GRANULEKV_HIERARCHICAL_NUM_LAYERS",
+            "VLLM_BAM_MDS_HIERARCHICAL_NUM_LAYERS", "0"))
+        window_layers = int(_env(
+            values, "VLLM_GRANULEKV_HIERARCHICAL_WINDOW_LAYERS",
+            "VLLM_BAM_MDS_HIERARCHICAL_WINDOW_LAYERS", "0"))
         if num_layers <= 0:
             raise ValueError(
-                "VLLM_BAM_MDS_HIERARCHICAL_NUM_LAYERS must be positive")
+                "VLLM_GRANULEKV_HIERARCHICAL_NUM_LAYERS must be positive")
         if window_layers <= 0:
             raise ValueError(
-                "VLLM_BAM_MDS_HIERARCHICAL_WINDOW_LAYERS must be positive")
+                "VLLM_GRANULEKV_HIERARCHICAL_WINDOW_LAYERS must be positive")
         return cls(enabled=True,
                    num_layers=num_layers,
                    window_layers=window_layers,

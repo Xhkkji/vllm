@@ -463,7 +463,7 @@ class LLMEngine:
             if self.parallel_config.pipeline_parallel_size != 1:
                 raise ValueError(
                     "layer working-set validation currently requires PP=1")
-            num_layers = envs.VLLM_BAM_MDS_HIERARCHICAL_NUM_LAYERS
+            num_layers = envs.VLLM_GRANULEKV_HIERARCHICAL_NUM_LAYERS
             # profiler 给出的 block 数对应“全部层常驻”。工作集只分配少量
             # regions，因此在相同 HBM 预算内可扩大每个 region 的 block 维度。
             physical_capacity = (profiled_num_gpu_blocks * num_layers

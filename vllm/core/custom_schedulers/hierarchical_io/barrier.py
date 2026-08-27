@@ -36,8 +36,9 @@ class HierarchicalLayerBarrierConfig:
         environ: Optional[Mapping[str, str]] = None,
     ) -> "HierarchicalLayerBarrierConfig":
         values = environ if environ is not None else os.environ
-        return cls(enabled=bool(
-            int(values.get("VLLM_BAM_MDS_HIERARCHICAL_LAYER_BARRIER", "0"))))
+        return cls(enabled=bool(int(values.get(
+            "VLLM_GRANULEKV_HIERARCHICAL_LAYER_BARRIER",
+            values.get("VLLM_BAM_MDS_HIERARCHICAL_LAYER_BARRIER", "0")))))
 
 
 @dataclass(frozen=True)

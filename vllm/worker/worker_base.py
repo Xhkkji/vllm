@@ -429,7 +429,7 @@ class LocalOrDistributedWorkerBase(WorkerBase):
 
         activate_layer_barrier = (
             getattr(self, "activate_hierarchical_layer_barrier", None)
-            if envs.VLLM_BAM_MDS_HIERARCHICAL_LAYER_BARRIER else None)
+            if envs.VLLM_GRANULEKV_HIERARCHICAL_LAYER_BARRIER else None)
         request_ids = tuple(
             (model_input.request_ids_to_seq_ids or {}).keys())
         barrier_context = (

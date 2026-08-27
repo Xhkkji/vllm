@@ -76,9 +76,36 @@ if TYPE_CHECKING:
     VLLM_BAM_MDS_HIERARCHICAL_MAX_LEAD_WINDOWS: int = 1
     VLLM_BAM_MDS_HIERARCHICAL_TARGET_SLACK_MS: float = 0.0
     VLLM_BAM_MDS_LAYER_WORKING_SET_ENABLE: bool = False
+    VLLM_BAM_MDS_TRUST_PREPOPULATED_PREFIX: bool = False
+    VLLM_BAM_MDS_TRUSTED_PREFIX_BLOCKS: int = 0
     VLLM_BAM_MDS_PREFETCH_BLOCK_SELECTOR: str = "dense"
     VLLM_BAM_MDS_PREFETCH_BLOCK_COUNT: int = 0
     VLLM_BAM_MDS_PREFETCH_BLOCK_STRIDE: int = 1
+    VLLM_GRANULEKV_ENABLE: bool = False
+    VLLM_GRANULEKV_IOSTACK_ROOT: Optional[str] = None
+    VLLM_GRANULEKV_CONTROL_DIR: Optional[str] = None
+    VLLM_GRANULEKV_CUDA_IPC_LIBRARY: Optional[str] = None
+    VLLM_GRANULEKV_TORCH_BRIDGE_DIR: Optional[str] = None
+    VLLM_GRANULEKV_TIMEOUT_SECONDS: float = 120.0
+    VLLM_GRANULEKV_MAX_IN_FLIGHT: int = 4
+    VLLM_GRANULEKV_SERVICE_LIFETIME: str = "resident"
+    VLLM_GRANULEKV_SERVICE_LOW_PRIORITY: bool = False
+    VLLM_GRANULEKV_IDLE_STOP_DELAY_MS: int = 0
+    VLLM_GRANULEKV_PREFIX_ENABLE: bool = False
+    VLLM_GRANULEKV_HIERARCHICAL_IO_ENABLE: bool = False
+    VLLM_GRANULEKV_HIERARCHICAL_NUM_LAYERS: int = 0
+    VLLM_GRANULEKV_HIERARCHICAL_WINDOW_LAYERS: int = 0
+    VLLM_GRANULEKV_HIERARCHICAL_LAYER_BARRIER: bool = False
+    VLLM_GRANULEKV_HIERARCHICAL_ROLLING_ENABLE: bool = False
+    VLLM_GRANULEKV_HIERARCHICAL_LEAD_WINDOWS: int = 1
+    VLLM_GRANULEKV_HIERARCHICAL_MAX_LEAD_WINDOWS: int = 1
+    VLLM_GRANULEKV_HIERARCHICAL_TARGET_SLACK_MS: float = 0.0
+    VLLM_GRANULEKV_LAYER_WORKING_SET_ENABLE: bool = False
+    VLLM_GRANULEKV_TRUST_PREPOPULATED_PREFIX: bool = False
+    VLLM_GRANULEKV_TRUSTED_PREFIX_BLOCKS: int = 0
+    VLLM_GRANULEKV_PREFETCH_BLOCK_SELECTOR: str = "dense"
+    VLLM_GRANULEKV_PREFETCH_BLOCK_COUNT: int = 0
+    VLLM_GRANULEKV_PREFETCH_BLOCK_STRIDE: int = 1
     VLLM_BAM_DIRECT_PLACEMENT: bool = False
     VLLM_BAM_DIRECT_PLACEMENT_IMPL: str = "lmcache"
     VLLM_BAM_DIRECT_PLACEMENT_RUNTIME_ONE_COPY: bool = False
@@ -197,6 +224,11 @@ def maybe_convert_int(value: Optional[str]) -> Optional[int]:
     if value is None:
         return None
     return int(value)
+
+
+def _granulekv_env(name: str, legacy_name: str, default: str) -> str:
+    """Read canonical GranuleKV configuration with an old-script fallback."""
+    return os.getenv(name, os.getenv(legacy_name, default))
 
 
 # The begin-* and end* here are used by the documentation generator
@@ -577,6 +609,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 消费后的 region 会被后续层覆盖，目前仅用于首轮 forward/max_tokens=1。
     "VLLM_BAM_MDS_LAYER_WORKING_SET_ENABLE":
     lambda: bool(int(os.getenv("VLLM_BAM_MDS_LAYER_WORKING_SET_ENABLE", "0"))),
+    # 两阶段可行性实验专用：第一阶段已用完整布局写盘，第二阶段只重建
+    # storage hash/physical-id 元数据。必须同时给出可信的完整 prefix block 数。
+    "VLLM_BAM_MDS_TRUST_PREPOPULATED_PREFIX":
+    lambda: bool(int(os.getenv("VLLM_BAM_MDS_TRUST_PREPOPULATED_PREFIX", "0"))),
+    "VLLM_BAM_MDS_TRUSTED_PREFIX_BLOCKS":
+    lambda: int(os.getenv("VLLM_BAM_MDS_TRUSTED_PREFIX_BLOCKS", "0")),
 
     "VLLM_BAM_MDS_PREFETCH_BLOCK_SELECTOR":
     lambda: os.getenv("VLLM_BAM_MDS_PREFETCH_BLOCK_SELECTOR", "dense"),
@@ -584,6 +622,93 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: int(os.getenv("VLLM_BAM_MDS_PREFETCH_BLOCK_COUNT", "0")),
     "VLLM_BAM_MDS_PREFETCH_BLOCK_STRIDE":
     lambda: int(os.getenv("VLLM_BAM_MDS_PREFETCH_BLOCK_STRIDE", "1")),
+
+    # Canonical GranuleKV names. Existing MDS experiment scripts remain
+    # readable through the explicit legacy fallback, while active GranuleKV
+    # code only consumes this namespace.
+    "VLLM_GRANULEKV_ENABLE":
+    lambda: bool(int(_granulekv_env(
+        "VLLM_GRANULEKV_ENABLE", "VLLM_BAM_MDS_ENABLE", "0"))),
+    "VLLM_GRANULEKV_IOSTACK_ROOT":
+    lambda: _granulekv_env("VLLM_GRANULEKV_IOSTACK_ROOT",
+                           "VLLM_BAM_MDS_IOSTACK_ROOT", "") or None,
+    "VLLM_GRANULEKV_CONTROL_DIR":
+    lambda: _granulekv_env("VLLM_GRANULEKV_CONTROL_DIR",
+                           "VLLM_BAM_MDS_CONTROL_DIR", "") or None,
+    "VLLM_GRANULEKV_CUDA_IPC_LIBRARY":
+    lambda: _granulekv_env("VLLM_GRANULEKV_CUDA_IPC_LIBRARY",
+                           "VLLM_BAM_MDS_CUDA_IPC_LIBRARY", "") or None,
+    "VLLM_GRANULEKV_TORCH_BRIDGE_DIR":
+    lambda: _granulekv_env("VLLM_GRANULEKV_TORCH_BRIDGE_DIR",
+                           "VLLM_BAM_MDS_TORCH_BRIDGE_DIR", "") or None,
+    "VLLM_GRANULEKV_TIMEOUT_SECONDS":
+    lambda: float(_granulekv_env("VLLM_GRANULEKV_TIMEOUT_SECONDS",
+                                 "VLLM_BAM_MDS_TIMEOUT_SECONDS", "120")),
+    "VLLM_GRANULEKV_MAX_IN_FLIGHT":
+    lambda: int(_granulekv_env("VLLM_GRANULEKV_MAX_IN_FLIGHT",
+                               "VLLM_BAM_MDS_MAX_IN_FLIGHT", "4")),
+    "VLLM_GRANULEKV_SERVICE_LIFETIME":
+    lambda: _granulekv_env("VLLM_GRANULEKV_SERVICE_LIFETIME",
+                           "VLLM_BAM_MDS_SERVICE_LIFETIME", "resident"),
+    "VLLM_GRANULEKV_SERVICE_LOW_PRIORITY":
+    lambda: bool(int(_granulekv_env(
+        "VLLM_GRANULEKV_SERVICE_LOW_PRIORITY",
+        "VLLM_BAM_DIRECT_SERVICE_LOW_PRIORITY", "0"))),
+    "VLLM_GRANULEKV_IDLE_STOP_DELAY_MS":
+    lambda: int(_granulekv_env("VLLM_GRANULEKV_IDLE_STOP_DELAY_MS",
+                               "VLLM_BAM_MDS_IDLE_STOP_DELAY_MS", "0")),
+    "VLLM_GRANULEKV_PREFIX_ENABLE":
+    lambda: bool(int(_granulekv_env(
+        "VLLM_GRANULEKV_PREFIX_ENABLE", "VLLM_BAM_MDS_PREFIX_ENABLE", "0"))),
+    "VLLM_GRANULEKV_HIERARCHICAL_IO_ENABLE":
+    lambda: bool(int(_granulekv_env(
+        "VLLM_GRANULEKV_HIERARCHICAL_IO_ENABLE",
+        "VLLM_BAM_MDS_HIERARCHICAL_IO_ENABLE", "0"))),
+    "VLLM_GRANULEKV_HIERARCHICAL_NUM_LAYERS":
+    lambda: int(_granulekv_env("VLLM_GRANULEKV_HIERARCHICAL_NUM_LAYERS",
+                               "VLLM_BAM_MDS_HIERARCHICAL_NUM_LAYERS", "0")),
+    "VLLM_GRANULEKV_HIERARCHICAL_WINDOW_LAYERS":
+    lambda: int(_granulekv_env("VLLM_GRANULEKV_HIERARCHICAL_WINDOW_LAYERS",
+                               "VLLM_BAM_MDS_HIERARCHICAL_WINDOW_LAYERS", "0")),
+    "VLLM_GRANULEKV_HIERARCHICAL_LAYER_BARRIER":
+    lambda: bool(int(_granulekv_env(
+        "VLLM_GRANULEKV_HIERARCHICAL_LAYER_BARRIER",
+        "VLLM_BAM_MDS_HIERARCHICAL_LAYER_BARRIER", "0"))),
+    "VLLM_GRANULEKV_HIERARCHICAL_ROLLING_ENABLE":
+    lambda: bool(int(_granulekv_env(
+        "VLLM_GRANULEKV_HIERARCHICAL_ROLLING_ENABLE",
+        "VLLM_BAM_MDS_HIERARCHICAL_ROLLING_ENABLE", "0"))),
+    "VLLM_GRANULEKV_HIERARCHICAL_LEAD_WINDOWS":
+    lambda: int(_granulekv_env("VLLM_GRANULEKV_HIERARCHICAL_LEAD_WINDOWS",
+                               "VLLM_BAM_MDS_HIERARCHICAL_LEAD_WINDOWS", "1")),
+    "VLLM_GRANULEKV_HIERARCHICAL_MAX_LEAD_WINDOWS":
+    lambda: int(_granulekv_env(
+        "VLLM_GRANULEKV_HIERARCHICAL_MAX_LEAD_WINDOWS",
+        "VLLM_BAM_MDS_HIERARCHICAL_MAX_LEAD_WINDOWS", "1")),
+    "VLLM_GRANULEKV_HIERARCHICAL_TARGET_SLACK_MS":
+    lambda: float(_granulekv_env(
+        "VLLM_GRANULEKV_HIERARCHICAL_TARGET_SLACK_MS",
+        "VLLM_BAM_MDS_HIERARCHICAL_TARGET_SLACK_MS", "0")),
+    "VLLM_GRANULEKV_LAYER_WORKING_SET_ENABLE":
+    lambda: bool(int(_granulekv_env(
+        "VLLM_GRANULEKV_LAYER_WORKING_SET_ENABLE",
+        "VLLM_BAM_MDS_LAYER_WORKING_SET_ENABLE", "0"))),
+    "VLLM_GRANULEKV_TRUST_PREPOPULATED_PREFIX":
+    lambda: bool(int(_granulekv_env(
+        "VLLM_GRANULEKV_TRUST_PREPOPULATED_PREFIX",
+        "VLLM_BAM_MDS_TRUST_PREPOPULATED_PREFIX", "0"))),
+    "VLLM_GRANULEKV_TRUSTED_PREFIX_BLOCKS":
+    lambda: int(_granulekv_env("VLLM_GRANULEKV_TRUSTED_PREFIX_BLOCKS",
+                               "VLLM_BAM_MDS_TRUSTED_PREFIX_BLOCKS", "0")),
+    "VLLM_GRANULEKV_PREFETCH_BLOCK_SELECTOR":
+    lambda: _granulekv_env("VLLM_GRANULEKV_PREFETCH_BLOCK_SELECTOR",
+                           "VLLM_BAM_MDS_PREFETCH_BLOCK_SELECTOR", "dense"),
+    "VLLM_GRANULEKV_PREFETCH_BLOCK_COUNT":
+    lambda: int(_granulekv_env("VLLM_GRANULEKV_PREFETCH_BLOCK_COUNT",
+                               "VLLM_BAM_MDS_PREFETCH_BLOCK_COUNT", "0")),
+    "VLLM_GRANULEKV_PREFETCH_BLOCK_STRIDE":
+    lambda: int(_granulekv_env("VLLM_GRANULEKV_PREFETCH_BLOCK_STRIDE",
+                               "VLLM_BAM_MDS_PREFETCH_BLOCK_STRIDE", "1")),
 
     # 是否启用 Direct Placement v0。
     # 开启后 LMCache retrieve 会优先尝试：

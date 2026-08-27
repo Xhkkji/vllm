@@ -21,6 +21,7 @@ from typing import Callable, Iterator, Mapping, Optional, Sequence, Tuple
 
 
 LayerWaitCallback = Callable[[int, Sequence[str], int], Optional[Tuple[int, ...]]]
+LayerReleaseCallback = Callable[[int, Sequence[str], int], None]
 
 
 @dataclass(frozen=True)
@@ -44,6 +45,7 @@ class _LayerBarrierSession:
     """一次 forward 对应的 worker-local barrier 上下文。"""
 
     callback: LayerWaitCallback
+    release_callback: Optional[LayerReleaseCallback]
     virtual_engine: int
     request_ids: tuple[str, ...]
 
@@ -60,6 +62,7 @@ def activate_layer_barrier(
     *,
     virtual_engine: int,
     request_ids: Sequence[str],
+    release_callback: Optional[LayerReleaseCallback] = None,
 ) -> Iterator[None]:
     """在 model forward 的动态范围内安装 worker-local 回调。
 
@@ -69,6 +72,7 @@ def activate_layer_barrier(
     """
     token = _ACTIVE_LAYER_BARRIER.set(
         _LayerBarrierSession(callback=callback,
+                             release_callback=release_callback,
                              virtual_engine=virtual_engine,
                              request_ids=tuple(request_ids)))
     try:
@@ -88,6 +92,15 @@ def wait_for_local_layer(layer_index: int) -> Optional[Tuple[int, ...]]:
         return None
     return session.callback(session.virtual_engine, session.request_ids,
                             layer_index)
+
+
+def release_local_layer(layer_index: int) -> None:
+    """通知 runtime 当前层消费完成，window 末尾可逐出对应 KV region。"""
+    session = _ACTIVE_LAYER_BARRIER.get()
+    if session is None or session.release_callback is None:
+        return
+    session.release_callback(session.virtual_engine, session.request_ids,
+                             layer_index)
 
 
 @contextmanager

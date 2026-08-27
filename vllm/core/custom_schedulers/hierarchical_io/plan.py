@@ -321,6 +321,7 @@ class RollingPrefetchConfig:
     lead_units: int = 1
     max_lead_units: int = 1
     target_slack_ms: float = 0.0
+    working_set_enabled: bool = False
 
     @classmethod
     def from_env(
@@ -340,6 +341,8 @@ class RollingPrefetchConfig:
             str(lead_units)))
         target_slack_ms = float(values.get(
             "VLLM_BAM_MDS_HIERARCHICAL_TARGET_SLACK_MS", "0"))
+        working_set_enabled = bool(
+            int(values.get("VLLM_BAM_MDS_LAYER_WORKING_SET_ENABLE", "0")))
         if lead_units < 0:
             raise ValueError(
                 "VLLM_BAM_MDS_HIERARCHICAL_LEAD_WINDOWS must be non-negative")
@@ -353,12 +356,47 @@ class RollingPrefetchConfig:
         return cls(enabled=True,
                    lead_units=lead_units,
                    max_lead_units=max_lead_units,
-                   target_slack_ms=target_slack_ms)
+                   target_slack_ms=target_slack_ms,
+                   working_set_enabled=working_set_enabled)
 
     @property
     def initial_units(self) -> int:
         """首批激活 unit 数；之后由模型进度滚动激活。"""
         return max(1, self.lead_units)
+
+
+def get_layer_working_set_regions(
+        environ: Optional[Mapping[str, str]] = None) -> int:
+    """计算 layer working-set 的真实 GPU region 数，关闭时返回 0。
+
+    当前 window 消费期间还要允许 ``max_lead_units`` 个未来 window 读入，
+    因此 region 数固定为 ``window_layers * (max_lead_units + 1)``。
+    """
+    values = os.environ if environ is None else environ
+    if not bool(int(values.get("VLLM_BAM_MDS_LAYER_WORKING_SET_ENABLE", "0"))):
+        return 0
+    required_switches = (
+        "VLLM_BAM_MDS_HIERARCHICAL_IO_ENABLE",
+        "VLLM_BAM_MDS_HIERARCHICAL_LAYER_BARRIER",
+        "VLLM_BAM_MDS_HIERARCHICAL_ROLLING_ENABLE",
+    )
+    if any(not bool(int(values.get(name, "0")))
+           for name in required_switches):
+        raise ValueError(
+            "layer working set requires hierarchical I/O, layer barrier and "
+            "rolling prefetch")
+    num_layers = int(values.get("VLLM_BAM_MDS_HIERARCHICAL_NUM_LAYERS", "0"))
+    window_layers = int(
+        values.get("VLLM_BAM_MDS_HIERARCHICAL_WINDOW_LAYERS", "0"))
+    max_lead = int(values.get(
+        "VLLM_BAM_MDS_HIERARCHICAL_MAX_LEAD_WINDOWS",
+        values.get("VLLM_BAM_MDS_HIERARCHICAL_LEAD_WINDOWS", "1")))
+    if num_layers <= 0 or window_layers <= 0 or max_lead < 0:
+        raise ValueError("invalid layer working-set configuration")
+    regions = window_layers * (max_lead + 1)
+    if regions > num_layers:
+        raise ValueError("layer working set cannot exceed model layer count")
+    return regions
 
 
 @dataclass(frozen=True)

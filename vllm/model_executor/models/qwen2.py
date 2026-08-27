@@ -33,7 +33,7 @@ from transformers import Qwen2Config
 import vllm.envs as envs
 from vllm.attention import Attention, AttentionType
 from vllm.core.custom_schedulers.hierarchical_io import (
-    activate_sparse_kv_blocks, wait_for_local_layer)
+    activate_sparse_kv_blocks, release_local_layer, wait_for_local_layer)
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
@@ -384,6 +384,10 @@ class Qwen2Model(nn.Module):
             finally:
                 if nvtx_pushed:
                     torch.cuda.nvtx.range_pop()
+            # 只有 layer 正常执行完成才发布消费信号。window 内非末层回调是
+            # no-op；末层会允许后续 MDS unit 覆盖已经不再访问的 HBM region。
+            if envs.VLLM_BAM_MDS_HIERARCHICAL_LAYER_BARRIER:
+                release_local_layer(layer_idx)
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
                 "hidden_states": hidden_states,

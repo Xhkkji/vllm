@@ -75,6 +75,7 @@ if TYPE_CHECKING:
     VLLM_BAM_MDS_HIERARCHICAL_LEAD_WINDOWS: int = 1
     VLLM_BAM_MDS_HIERARCHICAL_MAX_LEAD_WINDOWS: int = 1
     VLLM_BAM_MDS_HIERARCHICAL_TARGET_SLACK_MS: float = 0.0
+    VLLM_BAM_MDS_LAYER_WORKING_SET_ENABLE: bool = False
     VLLM_BAM_MDS_PREFETCH_BLOCK_SELECTOR: str = "dense"
     VLLM_BAM_MDS_PREFETCH_BLOCK_COUNT: int = 0
     VLLM_BAM_MDS_PREFETCH_BLOCK_STRIDE: int = 1
@@ -572,6 +573,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_BAM_MDS_HIERARCHICAL_TARGET_SLACK_MS":
     lambda: float(
         os.getenv("VLLM_BAM_MDS_HIERARCHICAL_TARGET_SLACK_MS", "0")),
+    # 一次性超长 prefix 可行性验证：只保留 current + lead layer windows。
+    # 消费后的 region 会被后续层覆盖，目前仅用于首轮 forward/max_tokens=1。
+    "VLLM_BAM_MDS_LAYER_WORKING_SET_ENABLE":
+    lambda: bool(int(os.getenv("VLLM_BAM_MDS_LAYER_WORKING_SET_ENABLE", "0"))),
 
     "VLLM_BAM_MDS_PREFETCH_BLOCK_SELECTOR":
     lambda: os.getenv("VLLM_BAM_MDS_PREFETCH_BLOCK_SELECTOR", "dense"),

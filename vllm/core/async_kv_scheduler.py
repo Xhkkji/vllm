@@ -845,8 +845,16 @@ class AsyncKVScheduler(Scheduler):
         self.hierarchical_prefix_admitted.discard(progress.plan_id)
         if (progress.all_ready and not progress.cancelled
                 and not progress.profiling_only):
-            restored_prefix_tokens = (
-                self.block_manager.commit_mds_prefix_restore(progress.plan_id))
+            if envs.VLLM_BAM_MDS_LAYER_WORKING_SET_ENABLE:
+                # 环形 regions 中早期层已被后续层覆盖，只结束 reservation，
+                # 不能把它发布成全局 GPU prefix cache 命中。
+                restored_prefix_tokens = (
+                    self.block_manager.finalize_mds_prefix_working_set(
+                        progress.plan_id))
+            else:
+                restored_prefix_tokens = (
+                    self.block_manager.commit_mds_prefix_restore(
+                        progress.plan_id))
             # barrier 模式已在首窗 READY 时推进 frontier 并转为 RUNNING；
             # 全部 window 结束时仅发布 hash/SSD replica，不能重复入队。
             already_dispatched = self.hierarchical_layer_barrier_config.enabled
@@ -1006,7 +1014,10 @@ class AsyncKVScheduler(Scheduler):
         请求对客户端已经完成，但 block 资源会保留到 MDS DONE；Engine 通过
         ``prefix_saving`` 继续推进空调度轮次，不会提前复用 DMA source。
         """
-        if not self.bam_mds_prefix_enabled or not seq_group.is_finished():
+        if (not self.bam_mds_prefix_enabled or not seq_group.is_finished()
+                or envs.VLLM_BAM_MDS_LAYER_WORKING_SET_ENABLE):
+            # working-set 已覆盖早期层，不能从当前 HBM regions 回写完整 KV。
+            # 该验证模式直接丢弃结果，已有 SSD prefix 仍由 source replica 保留。
             return False
         seqs = seq_group.get_seqs()
         normally_finished = all(

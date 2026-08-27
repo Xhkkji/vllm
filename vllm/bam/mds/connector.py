@@ -44,6 +44,7 @@ class BaMMDSConnector:
         dtype: torch.dtype,
         device_index: int,
         num_layers: int,
+        num_gpu_regions: int,
         num_gpu_blocks: int,
         num_storage_blocks: int,
     ) -> None:
@@ -63,6 +64,7 @@ class BaMMDSConnector:
             stride_order=stride_order,
             dtype=dtype,
             num_layers=num_layers,
+            num_gpu_regions=num_gpu_regions,
             num_gpu_blocks=num_gpu_blocks,
             num_storage_blocks=num_storage_blocks,
             device_index=device_index)
@@ -120,7 +122,7 @@ class BaMMDSConnector:
                 "MDS request-slot mismatch: daemon="
                 f"{self.max_in_flight}, vLLM="
                 f"{envs.VLLM_BAM_MDS_MAX_IN_FLIGHT}")
-        tensors: list[torch.Tensor] = []
+        physical_regions: list[torch.Tensor] = []
         for region in result.regions:
             tensor = self.bridge.tensor_from_cuda_ptr(
                 region.region_ptr,
@@ -133,18 +135,27 @@ class BaMMDSConnector:
                     or tuple(tensor.stride()) != self.layout.tensor_strides
                     or region.region_bytes != self.layout.region_bytes):
                 raise RuntimeError("imported MDS tensor metadata mismatch")
-            tensors.append(tensor)
+            physical_regions.append(tensor)
 
         # daemon 使用 cudaMalloc，必须由 client 显式恢复原生 CacheEngine 的
         # torch.zeros 语义，尤其是 null block 和 warmup 前的初始状态。
-        for tensor in tensors:
+        for tensor in physical_regions:
             tensor.zero_()
         torch.cuda.synchronize(self.layout.device_index)
+        # Attention 仍按真实模型层索引 KV tensor；工作集模式把多个模型层绑定
+        # 到同一个环形 region。MDS 会在每个 layer barrier 前写入该层数据，
+        # 因而模型和 attention backend 都无需理解 region 生命周期。
+        tensors = [
+            physical_regions[layer % self.layout.num_gpu_regions]
+            for layer in range(self.layout.num_layers)
+        ]
         logger.info(
-            "[BAM_MDS] imported daemon KV cache layers=%d gpu_blocks=%d "
+            "[BAM_MDS] imported daemon KV cache layers=%d gpu_regions=%d "
+            "gpu_blocks=%d "
             "storage_blocks=%d fragment_bytes=%d pool_capacity=%d "
             "max_blocks_per_pool=%d max_in_flight=%d",
-            self.layout.num_layers, self.layout.num_gpu_blocks,
+            self.layout.num_layers, self.layout.num_gpu_regions,
+            self.layout.num_gpu_blocks,
             self.layout.num_storage_blocks, self.layout.fragment_bytes,
             self.descriptor_pool_capacity, self.max_blocks_per_pool,
             self.max_in_flight)
@@ -414,8 +425,8 @@ class BaMMDSConnector:
         else:
             self.client.submit_read(payload)
 
-    @staticmethod
     def _mapping_payload(
+        self,
         src_to_dst: torch.Tensor,
         *,
         operation: str,
@@ -440,6 +451,19 @@ class BaMMDSConnector:
         if layer_range is not None:
             payload["layer_start"] = layer_range[0]
             payload["layer_end"] = layer_range[1]
+            # layer window 起点按 region pool 取模。region 数是 window 大小的
+            # 整数倍，因此一个 window 不会在内部回绕；后端会据此覆盖已消费槽。
+            num_gpu_regions = getattr(self.layout, "num_gpu_regions",
+                                      self.layout.num_layers)
+            if num_gpu_regions < self.layout.num_layers:
+                payload["gpu_region_start"] = (
+                    layer_range[0] % num_gpu_regions)
+        elif (getattr(getattr(self, "layout", None), "num_gpu_regions",
+                      getattr(getattr(self, "layout", None), "num_layers",
+                              0))
+              < getattr(getattr(self, "layout", None), "num_layers", 0)):
+            raise RuntimeError(
+                "layer working-set mode only supports layer-ranged MDS I/O")
         return mappings, payload
 
     def _validate_layer_range(

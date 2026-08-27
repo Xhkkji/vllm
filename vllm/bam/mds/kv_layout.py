@@ -34,6 +34,7 @@ class VLLMKVLayout:
     region_bytes: int
     fragment_bytes: int
     num_layers: int
+    num_gpu_regions: int
     num_gpu_blocks: int
     num_storage_blocks: int
     device_index: int
@@ -46,6 +47,7 @@ class VLLMKVLayout:
         stride_order: Sequence[int],
         dtype: torch.dtype,
         num_layers: int,
+        num_gpu_regions: int,
         num_gpu_blocks: int,
         num_storage_blocks: int,
         device_index: int,
@@ -58,6 +60,8 @@ class VLLMKVLayout:
             raise ValueError(f"unsupported MDS KV dtype: {dtype}")
         if num_storage_blocks <= 0:
             raise ValueError("MDS KVStore requires positive storage blocks")
+        if not 0 < num_gpu_regions <= num_layers:
+            raise ValueError("invalid MDS GPU layer-region count")
 
         # 精确复现原生 ``zeros(allocation_shape).permute(stride_order)``，但不在
         # vLLM 进程额外分配一份同尺寸 CUDA tensor。
@@ -85,6 +89,7 @@ class VLLMKVLayout:
                    region_bytes=region_bytes,
                    fragment_bytes=fragment_bytes,
                    num_layers=int(num_layers),
+                   num_gpu_regions=int(num_gpu_regions),
                    num_gpu_blocks=int(num_gpu_blocks),
                    num_storage_blocks=int(num_storage_blocks),
                    device_index=int(device_index))
@@ -94,6 +99,7 @@ class VLLMKVLayout:
             "client_pid": int(client_pid),
             "device_index": self.device_index,
             "num_layers": self.num_layers,
+            "num_gpu_regions": self.num_gpu_regions,
             "num_gpu_blocks": self.num_gpu_blocks,
             "num_storage_blocks": self.num_storage_blocks,
             "region_bytes": self.region_bytes,
@@ -112,5 +118,5 @@ class VLLMKVLayout:
                 or tuple(manifest["tensor_strides"]) != self.tensor_strides
                 or manifest["dtype"] != self.dtype_name):
             raise RuntimeError("MDS allocation manifest layout mismatch")
-        if len(manifest["regions"]) != self.num_layers:
-            raise RuntimeError("MDS allocation manifest layer count mismatch")
+        if len(manifest["regions"]) != self.num_gpu_regions:
+            raise RuntimeError("MDS allocation manifest region count mismatch")

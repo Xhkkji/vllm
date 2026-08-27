@@ -12,6 +12,8 @@ from vllm.config import CacheConfig, DeviceConfig, ModelConfig, ParallelConfig
 from vllm.core.custom_schedulers.async_kv_transfer import (
     AsyncKVTransferEvent, AsyncKVTransferOperation, AsyncKVTransferState)
 from vllm.logger import init_logger
+from vllm.core.custom_schedulers.hierarchical_io import (
+    get_layer_working_set_regions)
 from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, LayerBlockType,
                         get_dtype_size, is_pin_memory_available)
 
@@ -216,12 +218,15 @@ class CacheEngine:
 
         if self.bam_mds_enabled and device == "cuda":
             from vllm.bam.mds.connector import BaMMDSConnector
+            working_set_regions = get_layer_working_set_regions()
             self.bam_mds_connector = BaMMDSConnector(
                 allocation_shape=kv_cache_allocation_shape,
                 stride_order=kv_cache_stride_order,
                 dtype=self.dtype,
                 device_index=self.device_config.device.index or 0,
                 num_layers=self.num_attention_layers,
+                num_gpu_regions=(working_set_regions
+                                 or self.num_attention_layers),
                 num_gpu_blocks=num_blocks,
                 num_storage_blocks=self.num_cpu_blocks,
             )

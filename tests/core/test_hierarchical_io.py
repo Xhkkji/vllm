@@ -14,6 +14,7 @@ from vllm.core.custom_schedulers.hierarchical_io import (
     RollingPrefetchConfig, RollingPrefetchRuntime, SparseKVAccessPlan,
     activate_layer_barrier, activate_sparse_kv_blocks,
     build_layer_restore_plan, get_active_sparse_kv_blocks,
+    get_layer_working_set_regions, release_local_layer,
     select_prefetch_unit_blocks,
     wait_for_local_layer)
 
@@ -141,6 +142,35 @@ def test_rolling_config_is_explicit_and_validated():
     assert config.max_lead_units == 3
 
 
+def test_layer_working_set_regions_cover_current_and_max_lead_windows():
+    values = {
+        "VLLM_BAM_MDS_LAYER_WORKING_SET_ENABLE": "1",
+        "VLLM_BAM_MDS_HIERARCHICAL_IO_ENABLE": "1",
+        "VLLM_BAM_MDS_HIERARCHICAL_LAYER_BARRIER": "1",
+        "VLLM_BAM_MDS_HIERARCHICAL_ROLLING_ENABLE": "1",
+        "VLLM_BAM_MDS_HIERARCHICAL_NUM_LAYERS": "28",
+        "VLLM_BAM_MDS_HIERARCHICAL_WINDOW_LAYERS": "2",
+        "VLLM_BAM_MDS_HIERARCHICAL_LEAD_WINDOWS": "1",
+        "VLLM_BAM_MDS_HIERARCHICAL_MAX_LEAD_WINDOWS": "2",
+    }
+    assert get_layer_working_set_regions(values) == 6
+    assert RollingPrefetchConfig.from_env(values).working_set_enabled
+
+
+def test_layer_barrier_reports_consumption_after_wait():
+    events = []
+    with activate_layer_barrier(
+            lambda engine, request_ids, layer: events.append(
+                ("wait", engine, tuple(request_ids), layer)),
+            virtual_engine=0,
+            request_ids=("request-0", ),
+            release_callback=lambda engine, request_ids, layer: events.append(
+                ("release", engine, tuple(request_ids), layer))):
+        wait_for_local_layer(3)
+        release_local_layer(3)
+    assert [event[0] for event in events] == ["wait", "release"]
+
+
 def _prefetch_request(index: int, *, activate: bool) -> AsyncKVTransferRequest:
     return AsyncKVTransferRequest(
         request_id=f"unit-{index}",
@@ -219,6 +249,25 @@ def test_rolling_runtime_activates_future_unit_from_model_progress():
         ("physical_ready", 1),
         ("barrier_ready", 0),
     }
+
+
+def test_working_set_unit_is_rejected_after_consumption():
+    runtime = RollingPrefetchRuntime(
+        RollingPrefetchConfig(enabled=True,
+                              lead_units=0,
+                              max_lead_units=0,
+                              working_set_enabled=True))
+    request = _prefetch_request(0, activate=True)
+
+    def ready(current, _mapping):
+        return AsyncKVTransferEvent(current.request_id,
+                                    AsyncKVTransferState.READY)
+
+    runtime.submit_or_stage(0, request, "mapping", ready)
+    runtime.wait_ready(0, ("seq-0", ), 0, ready, ready, max_active=1)
+    runtime.release_layer(0, ("seq-0", ), 1)
+    with pytest.raises(RuntimeError, match="already evicted"):
+        runtime.wait_ready(0, ("seq-0", ), 0, ready, ready, max_active=1)
 
 
 def test_sparse_residency_is_checked_before_layer_consumption():

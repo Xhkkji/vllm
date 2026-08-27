@@ -700,6 +700,27 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             self._storage_replicas[key] = source_block
         return record.public.num_prefix_blocks * self.block_size
 
+    def finalize_mds_prefix_working_set(self, reservation_id: str) -> int:
+        """结束一次 one-shot working-set restore，但不发布全局 prefix hash。
+
+        各模型层共用少量环形 HBM regions，forward 结束时早期层已经被覆盖，
+        因此这些 block id 绝不能作为“完整 KV 常驻 GPU”的 prefix cache 命中。
+        target 保持 pending/hashless 状态，sequence 结束时沿用 allocator 的 pending
+        free 路径回收；SSD source 则继续作为干净副本保存在 residency directory。
+        """
+        record = self._prefix_restore_reservations.pop(reservation_id)
+        self._computed_blocks_tracker.set_num_cached_tokens(
+            record.seq,
+            record.public.num_prefix_blocks * self.block_size,
+        )
+        old_replicas = self._pop_storage_replicas(record.seq.seq_id)
+        for replica in old_replicas:
+            self.block_allocator.free(replica)
+        for logical_index, source_block in enumerate(record.source_blocks):
+            self._storage_replicas[LogicalBlockKey(
+                record.seq.seq_id, logical_index)] = source_block
+        return record.public.num_prefix_blocks * self.block_size
+
     def admit_mds_prefix_restore_for_layer_barrier(
             self, reservation_id: str) -> int:
         """允许层屏障请求跳过 prefix 重新计算，但暂不发布 hash。

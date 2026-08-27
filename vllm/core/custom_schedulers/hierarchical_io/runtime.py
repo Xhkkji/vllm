@@ -47,6 +47,7 @@ class _UnitState:
     activated_monotonic_ns: Optional[int] = None
     ready_monotonic_ns: Optional[int] = None
     terminal_reported: bool = False
+    consumed: bool = False
 
 
 @dataclass
@@ -166,10 +167,13 @@ class RollingPrefetchRuntime:
                 and unit.request.layer_range[0] <= consumer_index <
                 unit.request.layer_range[1])
             current_index = self._identity(current.request)[1]
+            if current.consumed:
+                raise RuntimeError(
+                    "layer working-set KV was already evicted; this minimal "
+                    "validation path only supports one model forward")
             self._activate_until(virtual_engine, plan, request_id_set,
                                  current_index + plan.lead_units, consumer_index,
                                  submit, poll, max_active, sleep_seconds)
-
             wait_started_ns = time.monotonic_ns()
             while current.terminal is None:
                 if not current.active:
@@ -209,6 +213,48 @@ class RollingPrefetchRuntime:
             self._activate_until(virtual_engine, plan, request_id_set,
                                  current_index + plan.lead_units, consumer_index,
                                  submit, poll, max_active, sleep_seconds)
+
+    def release_layer(
+        self,
+        virtual_engine: int,
+        request_ids: Sequence[str],
+        layer_index: int,
+    ) -> None:
+        """在 window 最后一层完成后允许后续 prefetch 覆盖其 GPU region。
+
+        SSD 上的 prefix 是干净副本，因此逐出不需要 writeback。这里只记录消费
+        完成并建立防重用检查；真正释放 HBM 的动作是后续 unit 写入同一环形
+        region。普通 layerwise 路径关闭 working-set 时保持原来的常驻语义。
+        """
+        if not self.config.working_set_enabled:
+            return
+        request_id_set = frozenset(request_ids)
+        for (engine, plan_id), plan in self._plans.items():
+            if engine != virtual_engine:
+                continue
+            for unit_index, unit in plan.units.items():
+                request = unit.request
+                if (request.seq_group_id not in request_id_set
+                        or request.layer_range is None
+                        or layer_index + 1 != request.layer_range[1]):
+                    continue
+                if unit.terminal is None or unit.terminal.state != (
+                        AsyncKVTransferState.READY):
+                    raise RuntimeError(
+                        "cannot evict layer working-set unit before READY")
+                if unit.consumed:
+                    raise RuntimeError("layer working-set unit consumed twice")
+                unit.consumed = True
+                self._traces.append(
+                    PrefetchRuntimeTrace(
+                        phase="working_set_evicted",
+                        plan_id=plan_id,
+                        request_id=request.request_id,
+                        unit_index=unit_index,
+                        monotonic_ns=time.monotonic_ns(),
+                        layer_index=layer_index,
+                        lead_units=plan.lead_units,
+                    ))
 
     def discard_units(self, virtual_engine: int,
                       request_ids: Iterable[str]) -> None:

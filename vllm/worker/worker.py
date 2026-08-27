@@ -596,7 +596,25 @@ class Worker(LocalOrDistributedWorkerBase):
             self._wait_for_hierarchical_layer,
             virtual_engine=virtual_engine,
             request_ids=request_ids,
+            release_callback=self._release_hierarchical_layer,
         )
+
+    def _release_hierarchical_layer(
+        self,
+        virtual_engine: int,
+        request_ids: Tuple[str, ...],
+        layer_index: int,
+    ) -> None:
+        """模型消费完 window 后，把对应环形 KV region 标记为可覆盖。"""
+        if envs.VLLM_BAM_MDS_LAYER_WORKING_SET_ENABLE:
+            # layer.forward 返回只表示 kernel 已入队。MDS DMA 不属于 PyTorch
+            # stream，若此时立刻覆盖同一 region，可能与尚未结束的 attention
+            # 读发生竞争。验证版在 window 边界显式同步，先保证语义正确；后续
+            # 可改成 CUDA event -> MDS activation 的非阻塞依赖协议。
+            torch.cuda.synchronize()
+        self._prefetch_runtime.release_layer(virtual_engine, request_ids,
+                                             layer_index)
+        self._log_prefetch_runtime_traces()
 
     def _wait_for_hierarchical_layer(
         self,

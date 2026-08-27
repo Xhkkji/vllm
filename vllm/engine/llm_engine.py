@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import copy
+import math
 import os
 import time
 from collections import Counter as collectionsCounter
@@ -21,6 +22,8 @@ from vllm.config import (DecodingConfig, LoRAConfig, ModelConfig,
                          ObservabilityConfig, ParallelConfig, SchedulerConfig,
                          VllmConfig)
 from vllm.core.scheduler import ScheduledSequenceGroup, SchedulerOutputs
+from vllm.core.custom_schedulers.hierarchical_io import (
+    get_layer_working_set_regions)
 from vllm.engine.arg_utils import EngineArgs
 from vllm.engine.metrics_types import StatLoggerBase, Stats
 from vllm.engine.output_processor.interfaces import (
@@ -445,6 +448,7 @@ class LLMEngine:
         start = time.time()
         num_gpu_blocks, num_cpu_blocks = (
             self.model_executor.determine_num_available_blocks())
+        profiled_num_gpu_blocks = num_gpu_blocks
 
         if self.cache_config.num_gpu_blocks_override is not None:
             num_gpu_blocks_override = self.cache_config.num_gpu_blocks_override
@@ -453,6 +457,33 @@ class LLMEngine:
                 "num_gpu_blocks_override=%d", num_gpu_blocks,
                 num_gpu_blocks_override)
             num_gpu_blocks = num_gpu_blocks_override
+
+        working_set_regions = get_layer_working_set_regions()
+        if working_set_regions:
+            if self.parallel_config.pipeline_parallel_size != 1:
+                raise ValueError(
+                    "layer working-set validation currently requires PP=1")
+            num_layers = envs.VLLM_BAM_MDS_HIERARCHICAL_NUM_LAYERS
+            # profiler 给出的 block 数对应“全部层常驻”。工作集只分配少量
+            # regions，因此在相同 HBM 预算内可扩大每个 region 的 block 维度。
+            physical_capacity = (profiled_num_gpu_blocks * num_layers
+                                 // working_set_regions)
+            prompt_blocks = math.ceil(self.model_config.max_model_len
+                                      / self.cache_config.block_size)
+            # BlockSpaceManager 默认保留 1% watermark。这里按同一口径预留，
+            # 避免刚好等于 prompt blocks 时仍被 can_allocate 判为 NEVER。
+            required_blocks = math.ceil(prompt_blocks / 0.99) + 1
+            if required_blocks > physical_capacity:
+                raise ValueError(
+                    "layer working set cannot fit max_model_len in profiled "
+                    f"HBM: required_blocks={required_blocks}, "
+                    f"capacity={physical_capacity}")
+            logger.info(
+                "Layer working-set validation expands logical KV blocks "
+                "from %d to %d using %d/%d resident layer regions",
+                num_gpu_blocks, required_blocks, working_set_regions,
+                num_layers)
+            num_gpu_blocks = required_blocks
 
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks

@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib
 import os
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 import sys
 import time
@@ -29,6 +30,31 @@ class _PendingTransfer:
     layer_range: Optional[Tuple[int, int]]
     submitted_at_ns: int
     prefetch_plan_id: Optional[str] = None
+
+
+class GranuleKVTransferState(str, Enum):
+    """Stable vLLM-side state for both ordinary and prefetched transfers."""
+
+    SUBMITTED = "submitted"
+    IN_FLIGHT = "in_flight"
+    READY = "ready"
+    ERROR = "error"
+
+
+@dataclass(frozen=True)
+class GranuleKVTransferStatus:
+    """Side-effect-free status returned by the canonical transfer API."""
+
+    request_id: str
+    state: GranuleKVTransferState
+    operation: str
+    prefetch_plan_id: Optional[str] = None
+    io_elapsed_ns: int = 0
+    error: Optional[str] = None
+
+    @property
+    def ready(self) -> bool:
+        return self.state is GranuleKVTransferState.READY
 
 
 class GranuleKVConnector:
@@ -151,53 +177,124 @@ class GranuleKVConnector:
         self.client.start()
         logger.info("[GRANULEKV] resident async service enabled after model warmup")
 
+    def close(self) -> None:
+        """Close outstanding control-plane resources owned by the connector."""
+        self._pending_transfers.clear()
+        self._prefetch_templates.clear()
+        self.client.close()
+
     def swap_out(self, src_to_dst: torch.Tensor) -> None:
         self._transfer_mapping(src_to_dst, operation="write")
 
     def swap_in(self, src_to_dst: torch.Tensor) -> None:
         self._transfer_mapping(src_to_dst, operation="read")
 
-    def swap_in_async(self, src_to_dst: torch.Tensor) -> bool:
-        request_id = "legacy-deferred-swap-in"
-        if request_id not in self._pending_transfers:
-            if self.submit_transfer_async(request_id, src_to_dst, operation="read"):
-                return True
-        return self.poll_transfer_async(request_id)
-
-    def submit_transfer_async(
+    def submit_request(
         self,
-        scheduler_request_id: str,
+        request_id: str,
         src_to_dst: torch.Tensor,
         *,
         operation: str,
         layer_range: Optional[Tuple[int, int]] = None,
-    ) -> bool:
-        if not scheduler_request_id:
-            raise ValueError("scheduler_request_id must not be empty")
+        prefetch_plan_id: Optional[str] = None,
+    ) -> GranuleKVTransferStatus:
+        """Submit one ordinary or prefetched transfer.
+
+        This is the canonical asynchronous entry point. A prefetched unit is
+        the same request type with an already staged ``prefetch_plan_id``.
+        """
+        if not request_id:
+            raise ValueError("request_id must not be empty")
         if operation not in ("read", "write"):
             raise ValueError(f"unsupported GranuleKV operation: {operation}")
         layer_range = self._validate_layer_range(layer_range)
         if src_to_dst.numel() == 0:
-            return True
-        if scheduler_request_id in self._pending_transfers:
-            pending = self._pending_transfers[scheduler_request_id]
-            mapping, _ = self._mapping_payload(
-                src_to_dst, operation=operation, layer_range=layer_range)
-            if (mapping != pending.mapping or operation != pending.operation
-                    or layer_range != pending.layer_range):
-                raise RuntimeError("GranuleKV transfer changed while in flight")
-            return False
+            return GranuleKVTransferStatus(
+                request_id, GranuleKVTransferState.READY, operation,
+                prefetch_plan_id=prefetch_plan_id)
+
         mapping, payload = self._mapping_payload(
             src_to_dst, operation=operation, layer_range=layer_range)
-        submit = (self.client.submit_read_async
-                  if operation == "read" else self.client.submit_write_async)
-        handle = submit(payload)
-        self._pending_transfers[scheduler_request_id] = _PendingTransfer(
-            handle=handle, mapping=mapping, operation=operation,
-            layer_range=layer_range, submitted_at_ns=time.monotonic_ns())
-        return False
+        pending = self._pending_transfers.get(request_id)
+        if pending is not None:
+            if (mapping != pending.mapping or operation != pending.operation
+                    or layer_range != pending.layer_range
+                    or prefetch_plan_id != pending.prefetch_plan_id):
+                raise RuntimeError("GranuleKV transfer changed while in flight")
+            return self.query_request(request_id)
 
-    def stage_prefetch_plan(
+        try:
+            if prefetch_plan_id is None:
+                handle = self.client.submit(payload, operation=operation)
+            else:
+                handle = self.client.activate_prefetch_units(
+                    prefetch_plan_id, (request_id,))[0]
+        except Exception:
+            if prefetch_plan_id is not None:
+                self.client.discard_prefetch_units(
+                    prefetch_plan_id, (request_id,))
+                self._prefetch_templates.pop(request_id, None)
+                self._maybe_release_prefetch_plan(prefetch_plan_id)
+            raise
+        self._pending_transfers[request_id] = _PendingTransfer(
+            handle=handle, mapping=mapping, operation=operation,
+            layer_range=layer_range, submitted_at_ns=time.monotonic_ns(),
+            prefetch_plan_id=prefetch_plan_id)
+        return GranuleKVTransferStatus(
+            request_id, GranuleKVTransferState.SUBMITTED, operation,
+            prefetch_plan_id=prefetch_plan_id)
+
+    def query_request(self, request_id: str) -> GranuleKVTransferStatus:
+        """Observe one request without completing or releasing its slot."""
+        pending = self._pending_transfers.get(request_id)
+        if pending is None:
+            raise RuntimeError(
+                f"cannot query GranuleKV transfer without a pending request: {request_id}")
+        client_status = self.client.status(pending.handle)
+        state = GranuleKVTransferState(client_status.state.value)
+        error = (None if state is not GranuleKVTransferState.ERROR else
+                 f"GranuleKV request failed: error={client_status.error_code}")
+        return GranuleKVTransferStatus(
+            request_id, state, pending.operation,
+            prefetch_plan_id=pending.prefetch_plan_id,
+            io_elapsed_ns=client_status.io_elapsed_ns,
+            error=error)
+
+    def complete_request(self, request_id: str) -> GranuleKVTransferStatus:
+        """Release a READY ordinary or prefetched request."""
+        pending = self._pending_transfers.get(request_id)
+        if pending is None:
+            raise RuntimeError(f"unknown GranuleKV transfer: {request_id}")
+        status = self.query_request(request_id)
+        if status.state is GranuleKVTransferState.ERROR:
+            raise RuntimeError(status.error or "GranuleKV request failed")
+        if not status.ready:
+            raise RuntimeError("GranuleKV transfer is not complete")
+        if pending.prefetch_plan_id is None:
+            self.client.complete(pending.handle)
+        else:
+            self.client.finish_prefetch_unit(
+                pending.prefetch_plan_id, request_id)
+        del self._pending_transfers[request_id]
+        if pending.prefetch_plan_id is not None:
+            self._prefetch_templates.pop(request_id, None)
+            self._maybe_release_prefetch_plan(pending.prefetch_plan_id)
+        return status
+
+    def cancel_request(self, request_id: str) -> None:
+        """Forget a request after failure; does not fake-cancel device I/O."""
+        pending = self._pending_transfers.pop(request_id, None)
+        if pending is None:
+            raise RuntimeError(f"unknown GranuleKV transfer: {request_id}")
+        if pending.prefetch_plan_id is None:
+            self.client.cancel(pending.handle)
+        else:
+            self.client.fail_prefetch_unit(
+                pending.prefetch_plan_id, request_id)
+            self._prefetch_templates.pop(request_id, None)
+            self._maybe_release_prefetch_plan(pending.prefetch_plan_id)
+
+    def stage_plan(
         self,
         plan_id: str,
         units: Sequence[tuple[str, torch.Tensor, str,
@@ -222,39 +319,7 @@ class GranuleKVConnector:
                 self._prefetch_templates.pop(request_id, None)
             raise
 
-    def activate_prefetch_transfer_async(
-        self,
-        plan_id: str,
-        scheduler_request_id: str,
-        src_to_dst: torch.Tensor,
-        *,
-        operation: str,
-        layer_range: Optional[Tuple[int, int]],
-    ) -> bool:
-        template = self._prefetch_templates.get(scheduler_request_id)
-        if template is None or template[0] != plan_id:
-            raise RuntimeError("unknown staged GranuleKV prefetch unit")
-        layer_range = self._validate_layer_range(layer_range)
-        mapping, _ = self._mapping_payload(
-            src_to_dst, operation=operation, layer_range=layer_range)
-        if (mapping, operation, layer_range) != template[1:]:
-            raise RuntimeError("GranuleKV prefetch unit changed after staging")
-        try:
-            handle = self.client.activate_prefetch_units(
-                plan_id, (scheduler_request_id,))[0]
-        except Exception:
-            self.client.discard_prefetch_units(
-                plan_id, (scheduler_request_id,))
-            del self._prefetch_templates[scheduler_request_id]
-            self._maybe_release_prefetch_plan(plan_id)
-            raise
-        self._pending_transfers[scheduler_request_id] = _PendingTransfer(
-            handle=handle, mapping=mapping, operation=operation,
-            layer_range=layer_range, submitted_at_ns=time.monotonic_ns(),
-            prefetch_plan_id=plan_id)
-        return False
-
-    def discard_staged_prefetch_units(self, scheduler_request_ids: Sequence[str]) -> None:
+    def cancel_staged_units(self, scheduler_request_ids: Sequence[str]) -> None:
         by_plan: dict[str, list[str]] = {}
         for request_id in scheduler_request_ids:
             template = self._prefetch_templates.get(request_id)
@@ -267,34 +332,6 @@ class GranuleKVConnector:
                 del self._prefetch_templates[request_id]
             self._maybe_release_prefetch_plan(plan_id)
 
-    def poll_transfer_async(self, scheduler_request_id: str) -> bool:
-        pending = self._pending_transfers.get(scheduler_request_id)
-        if pending is None:
-            raise RuntimeError("cannot poll GranuleKV transfer without a pending request")
-        try:
-            if not self.client.poll(pending.handle):
-                return False
-        except Exception:
-            if pending.prefetch_plan_id is None:
-                self.client.discard(pending.handle)
-            else:
-                self.client.fail_prefetch_unit(
-                    pending.prefetch_plan_id, scheduler_request_id)
-                del self._prefetch_templates[scheduler_request_id]
-                self._maybe_release_prefetch_plan(pending.prefetch_plan_id)
-            del self._pending_transfers[scheduler_request_id]
-            raise
-        if pending.prefetch_plan_id is None:
-            self.client.finish(pending.handle)
-        else:
-            self.client.finish_prefetch_unit(
-                pending.prefetch_plan_id, scheduler_request_id)
-        del self._pending_transfers[scheduler_request_id]
-        if pending.prefetch_plan_id is not None:
-            del self._prefetch_templates[scheduler_request_id]
-            self._maybe_release_prefetch_plan(pending.prefetch_plan_id)
-        return True
-
     def _maybe_release_prefetch_plan(self, plan_id: str) -> None:
         if any(template[0] == plan_id
                for template in self._prefetch_templates.values()):
@@ -305,10 +342,7 @@ class GranuleKVConnector:
         if src_to_dst.numel() == 0:
             return
         _, payload = self._mapping_payload(src_to_dst, operation=operation)
-        if operation == "write":
-            self.client.submit_write(payload)
-        else:
-            self.client.submit_read(payload)
+        self.client.wait(self.client.submit(payload, operation=operation))
 
     def _mapping_payload(
         self,

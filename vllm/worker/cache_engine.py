@@ -14,6 +14,7 @@ from vllm.core.custom_schedulers.async_kv_transfer import (
 from vllm.logger import init_logger
 from vllm.core.custom_schedulers.hierarchical_io import (
     get_layer_working_set_regions)
+from vllm.granulekv.connector import GranuleKVTransferState
 from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, LayerBlockType,
                         get_dtype_size, is_pin_memory_available)
 
@@ -214,9 +215,18 @@ class CacheEngine:
             raise RuntimeError("async swap-in is only supported by GranuleKV")
         if self._granulekv_transfer_started_at is None:
             self._granulekv_transfer_started_at = time.perf_counter()
-        ready = self.granulekv_connector.swap_in_async(src_to_dst)
-        if not ready:
+        request_id = "legacy-deferred-swap-in"
+        status = self.granulekv_connector.submit_request(
+            request_id, src_to_dst, operation="read")
+        if status.state is not GranuleKVTransferState.READY:
+            status = self.granulekv_connector.query_request(request_id)
+        if not status.ready:
+            if status.state is GranuleKVTransferState.ERROR:
+                self.granulekv_connector.cancel_request(request_id)
+                raise RuntimeError(status.error or "GranuleKV swap-in failed")
             return False
+        if src_to_dst.numel() != 0:
+            self.granulekv_connector.complete_request(request_id)
         elapsed_s = time.perf_counter() - self._granulekv_transfer_started_at
         self._granulekv_transfer_started_at = None
         self._log_swap_event("swap_in", src_to_dst, elapsed_s)
@@ -258,24 +268,24 @@ class CacheEngine:
             )
         try:
             if prefetch_plan_id is None:
-                ready = self.granulekv_connector.submit_transfer_async(
+                status = self.granulekv_connector.submit_request(
                     request_id,
                     src_to_dst,
                     operation=operation.value,
                     layer_range=layer_range)
             else:
-                ready = self.granulekv_connector.activate_prefetch_transfer_async(
-                    prefetch_plan_id,
+                status = self.granulekv_connector.submit_request(
                     request_id,
                     src_to_dst,
                     operation=operation.value,
-                    layer_range=layer_range)
+                    layer_range=layer_range,
+                    prefetch_plan_id=prefetch_plan_id)
         except Exception as exc:
             del self._granulekv_async_kv_traces[request_id]
             return AsyncKVTransferEvent(request_id,
                                         AsyncKVTransferState.ERROR,
                                         error=str(exc))
-        if ready:
+        if status.ready:
             self._finish_async_kv_transfer_trace(request_id, src_to_dst)
             return AsyncKVTransferEvent(request_id,
                                         AsyncKVTransferState.READY)
@@ -291,7 +301,7 @@ class CacheEngine:
         if self.granulekv_connector is None:
             raise RuntimeError(
                 "prefetch plan requires the resident GranuleKV connector")
-        self.granulekv_connector.stage_prefetch_plan(
+        self.granulekv_connector.stage_plan(
             plan_id,
             tuple((request_id, mapping, operation.value, layer_range)
                   for request_id, mapping, operation, layer_range in units),
@@ -302,7 +312,7 @@ class CacheEngine:
         if self.granulekv_connector is None:
             raise RuntimeError(
                 "prefetch plan requires the resident GranuleKV connector")
-        self.granulekv_connector.discard_staged_prefetch_units(request_ids)
+        self.granulekv_connector.cancel_staged_units(request_ids)
 
     def poll_async_kv_transfer(
             self, request_id: str,
@@ -329,15 +339,33 @@ class CacheEngine:
                 )
 
         try:
-            ready = self.granulekv_connector.poll_transfer_async(request_id)
+            status = self.granulekv_connector.query_request(request_id)
         except Exception as exc:
             del self._granulekv_async_kv_traces[request_id]
             return AsyncKVTransferEvent(request_id,
                                         AsyncKVTransferState.ERROR,
                                         error=str(exc))
-        if not ready:
+        if status.state is GranuleKVTransferState.ERROR:
+            try:
+                self.granulekv_connector.cancel_request(request_id)
+            except Exception:
+                logger.exception(
+                    "failed to release GranuleKV request after error: %s",
+                    request_id)
+            del self._granulekv_async_kv_traces[request_id]
+            return AsyncKVTransferEvent(request_id,
+                                        AsyncKVTransferState.ERROR,
+                                        error=status.error)
+        if not status.ready:
             return AsyncKVTransferEvent(request_id,
                                         AsyncKVTransferState.PENDING)
+        try:
+            self.granulekv_connector.complete_request(request_id)
+        except Exception as exc:
+            del self._granulekv_async_kv_traces[request_id]
+            return AsyncKVTransferEvent(request_id,
+                                        AsyncKVTransferState.ERROR,
+                                        error=str(exc))
         self._finish_async_kv_transfer_trace(request_id, src_to_dst)
         return AsyncKVTransferEvent(request_id, AsyncKVTransferState.READY)
 

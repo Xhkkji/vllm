@@ -342,19 +342,19 @@ max_blocks_per_batch = floor(1024 / 56) = 18
 当前每个 batch 直接调用：
 
 ```python
-self.client.submit_write(payload)
-self.client.submit_read(payload)
+self.client.wait(self.client.submit(payload, operation="write"))
+self.client.wait(self.client.submit(payload, operation="read"))
 ```
 
-## 12. MDSClient 当前仍是同步接口
+## 12. GranuleKV Client 统一请求接口
 
 代码位置：
 
 ```text
-BaM_IOStack/gids_module/bam_mds/client.py:106
+GranuleKV/gids_module/granulekv/client.py
 ```
 
-`submit_write/read()` 当前实际执行：
+`submit(payload, operation)` 与同步 `wait()` 便利包装实际执行：
 
 ```text
 生成 request_id / generation
@@ -418,8 +418,10 @@ for layer in 0..27:
 
 ```python
 handle = direct_io.submit(**descriptors)
-while not direct_io.poll(handle):
-    ...
+while handle.generation not in {
+    item.generation for item in direct_io.progress()
+}:
+    pass
 direct_io.finish(handle)
 ```
 
@@ -525,10 +527,10 @@ vllm/worker/model_runner.py:1879
 目标 MDSClient API：
 
 ```python
-handle = client.submit_read(payload)
-ready = client.poll(handle)
-client.wait(handle)
-client.finish(handle)
+handle = client.submit(payload, operation="read")
+status = client.status(handle)
+if status.ready:
+    client.complete(handle)
 ```
 
 稳定 handle 至少包含：

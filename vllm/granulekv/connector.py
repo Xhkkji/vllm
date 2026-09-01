@@ -111,7 +111,7 @@ class GranuleKVConnector:
             self.gpu_cache = self._allocate_and_wrap()
         except Exception:
             self.client.publish_error()
-            self.client.close_imports()
+            self.client.close()
             raise
 
     def _resolve_cuda_library(self) -> Path:
@@ -179,9 +179,9 @@ class GranuleKVConnector:
 
     def close(self) -> None:
         """Close outstanding control-plane resources owned by the connector."""
+        self.client.close()
         self._pending_transfers.clear()
         self._prefetch_templates.clear()
-        self.client.close()
 
     def swap_out(self, src_to_dst: torch.Tensor) -> None:
         self._transfer_mapping(src_to_dst, operation="write")
@@ -227,11 +227,15 @@ class GranuleKVConnector:
             if prefetch_plan_id is None:
                 handle = self.client.submit(payload, operation=operation)
             else:
-                handle = self.client.activate_prefetch_units(
-                    prefetch_plan_id, (request_id,))[0]
+                handle = self.client.submit(
+                    payload,
+                    operation=operation,
+                    prefetch_plan_id=prefetch_plan_id,
+                    prefetch_unit_id=request_id,
+                )
         except Exception:
             if prefetch_plan_id is not None:
-                self.client.discard_prefetch_units(
+                self.client.cancel_staged_units(
                     prefetch_plan_id, (request_id,))
                 self._prefetch_templates.pop(request_id, None)
                 self._maybe_release_prefetch_plan(prefetch_plan_id)
@@ -270,11 +274,7 @@ class GranuleKVConnector:
             raise RuntimeError(status.error or "GranuleKV request failed")
         if not status.ready:
             raise RuntimeError("GranuleKV transfer is not complete")
-        if pending.prefetch_plan_id is None:
-            self.client.complete(pending.handle)
-        else:
-            self.client.finish_prefetch_unit(
-                pending.prefetch_plan_id, request_id)
+        self.client.complete(pending.handle)
         del self._pending_transfers[request_id]
         if pending.prefetch_plan_id is not None:
             self._prefetch_templates.pop(request_id, None)
@@ -286,11 +286,8 @@ class GranuleKVConnector:
         pending = self._pending_transfers.pop(request_id, None)
         if pending is None:
             raise RuntimeError(f"unknown GranuleKV transfer: {request_id}")
-        if pending.prefetch_plan_id is None:
-            self.client.cancel(pending.handle)
-        else:
-            self.client.fail_prefetch_unit(
-                pending.prefetch_plan_id, request_id)
+        self.client.cancel(pending.handle)
+        if pending.prefetch_plan_id is not None:
             self._prefetch_templates.pop(request_id, None)
             self._maybe_release_prefetch_plan(pending.prefetch_plan_id)
 
@@ -307,13 +304,22 @@ class GranuleKVConnector:
             layer_range = self._validate_layer_range(layer_range)
             mapping, payload = self._mapping_payload(
                 mapping_tensor, operation=operation, layer_range=layer_range)
-            if request_id in self._prefetch_templates:
-                raise RuntimeError(f"duplicate staged prefetch unit: {request_id}")
+            previous = self._prefetch_templates.get(request_id)
+            if previous is not None:
+                previous_plan, previous_mapping, previous_operation, previous_range = previous
+                if (previous_plan != plan_id or previous_mapping != mapping
+                        or previous_operation != operation
+                        or previous_range != layer_range):
+                    raise RuntimeError(
+                        f"staged prefetch unit changed after staging: {request_id}")
+                continue
             staged[request_id] = (payload, operation)
             self._prefetch_templates[request_id] = (
                 plan_id, mapping, operation, layer_range)
+        if not staged:
+            return
         try:
-            self.client.register_prefetch_plan(plan_id, staged)
+            self.client.stage_plan(plan_id, staged)
         except Exception:
             for request_id in staged:
                 self._prefetch_templates.pop(request_id, None)
@@ -327,7 +333,7 @@ class GranuleKVConnector:
                 raise RuntimeError(f"unknown staged prefetch unit: {request_id}")
             by_plan.setdefault(template[0], []).append(request_id)
         for plan_id, request_ids in by_plan.items():
-            self.client.discard_prefetch_units(plan_id, tuple(request_ids))
+            self.client.cancel_staged_units(plan_id, tuple(request_ids))
             for request_id in request_ids:
                 del self._prefetch_templates[request_id]
             self._maybe_release_prefetch_plan(plan_id)
@@ -336,7 +342,7 @@ class GranuleKVConnector:
         if any(template[0] == plan_id
                for template in self._prefetch_templates.values()):
             return
-        self.client.release_prefetch_plan(plan_id)
+        self.client.release_plan(plan_id)
 
     def _transfer_mapping(self, src_to_dst: torch.Tensor, *, operation: str) -> None:
         if src_to_dst.numel() == 0:

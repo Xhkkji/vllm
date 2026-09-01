@@ -14,7 +14,7 @@ from vllm.core.async_kv_scheduler import (ASYNC_KV_STRATEGY_NATIVE,
 class TuttiFigure13Scheduler(AsyncKVScheduler):
     """为单请求 prefix/suffix sweep 提供显式且封闭的调度入口。
 
-    所有实际 admission、prefix reservation 和 MDS window transfer 都继续由
+    所有实际 admission、prefix reservation 和 GranuleKV window transfer 都继续由
     ``AsyncKVScheduler`` 负责。本类只固定 Figure 13 的实验不变量，不复制
     父类调度实现：
 
@@ -44,7 +44,7 @@ class TuttiFigure13Scheduler(AsyncKVScheduler):
                          pipeline_parallel_size, output_proc_callback)
         if not self.hierarchical_io_config.enabled:
             raise ValueError(
-                "TuttiFigure13Scheduler requires hierarchical MDS I/O")
+                "TuttiFigure13Scheduler requires hierarchical GranuleKV I/O")
         if self.async_kv_scheduler_strategy != ASYNC_KV_STRATEGY_NATIVE:
             raise ValueError(
                 "TuttiFigure13Scheduler requires native async strategy")

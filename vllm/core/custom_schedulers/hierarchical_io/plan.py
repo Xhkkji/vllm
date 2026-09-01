@@ -12,6 +12,16 @@ from typing import Mapping, Optional, Sequence, Tuple
 from vllm.core.block_reservation import BlockMapping, LogicalBlockKey
 
 
+def _env(values: Mapping[str, str], name: str, _legacy_name: str,
+         default: str) -> str:
+    """Read a canonical GranuleKV setting.
+
+    The unused legacy parameter is kept locally so the existing plan-building
+    call sites remain easy to audit while no old namespace is consulted.
+    """
+    return values.get(name, default)
+
+
 @dataclass(frozen=True)
 class PrefetchBlockSelectorConfig:
     """把父 reservation 的 block 集合裁剪成可 profiling 的小粒度 I/O。
@@ -19,7 +29,7 @@ class PrefetchBlockSelectorConfig:
     默认 ``dense`` 保持现有 layer-prefetch 语义：每个 unit 都恢复父
     reservation 的全部 blocks。非 dense selector 只是为 sparse attention
     的访问模式提前打通 I/O 控制面，当前必须视为 profiling-only：它可以
-    测 BaM 小粒度 restore 的提交、完成和带宽，但不能把完整 prefix hash
+    测 GranuleKV 小粒度 restore 的提交、完成和带宽，但不能把完整 prefix hash
     发布给 vLLM 原生 prefix cache。
     """
 
@@ -33,27 +43,25 @@ class PrefetchBlockSelectorConfig:
         environ: Optional[Mapping[str, str]] = None,
     ) -> "PrefetchBlockSelectorConfig":
         values = os.environ if environ is None else environ
-        policy = values.get(
-            "VLLM_BAM_MDS_PREFETCH_BLOCK_SELECTOR",
-            "dense",
-        ).strip().lower()
+        policy = values.get("VLLM_GRANULEKV_PREFETCH_BLOCK_SELECTOR",
+                           "dense").strip().lower()
         block_count = int(
-            values.get("VLLM_BAM_MDS_PREFETCH_BLOCK_COUNT", "0"))
-        stride = int(values.get("VLLM_BAM_MDS_PREFETCH_BLOCK_STRIDE", "1"))
+            values.get("VLLM_GRANULEKV_PREFETCH_BLOCK_COUNT", "0"))
+        stride = int(values.get("VLLM_GRANULEKV_PREFETCH_BLOCK_STRIDE", "1"))
 
         if policy in ("", "none", "all"):
             policy = "dense"
         if policy not in ("dense", "tail_n", "recent_n", "stride"):
             raise ValueError(
-                "VLLM_BAM_MDS_PREFETCH_BLOCK_SELECTOR must be one of "
+                "VLLM_GRANULEKV_PREFETCH_BLOCK_SELECTOR must be one of "
                 "dense, tail_n, recent_n, stride")
         if policy in ("tail_n", "recent_n") and block_count <= 0:
             raise ValueError(
-                "VLLM_BAM_MDS_PREFETCH_BLOCK_COUNT must be positive for "
+                "VLLM_GRANULEKV_PREFETCH_BLOCK_COUNT must be positive for "
                 f"{policy}")
         if policy == "stride" and stride <= 0:
             raise ValueError(
-                "VLLM_BAM_MDS_PREFETCH_BLOCK_STRIDE must be positive")
+                "VLLM_GRANULEKV_PREFETCH_BLOCK_STRIDE must be positive")
         return cls(policy=policy, block_count=block_count, stride=stride)
 
     @property
@@ -71,7 +79,7 @@ class PrefetchBlockSelectorConfig:
         这里故意只提供两个最小 selector：
         - ``tail_n/recent_n``：模拟 sparse attention 常见的近邻 KV 访问。
         - ``stride``：制造可重复的稀疏采样，用于观察随机/跨段 restore 开销。
-        后续真实 sparse mask 也应只替换这个选择函数，而不改 MDS 生命周期。
+        后续真实 sparse mask 也应只替换这个选择函数，而不改 GranuleKV 生命周期。
         """
         if total_blocks <= 0:
             raise ValueError("prefetch selector requires at least one block")
@@ -90,12 +98,12 @@ class SparseKVAccessPlan:
     """描述每一层实际会访问哪些逻辑 KV blocks。
 
     ``block_indices_by_layer[layer]`` 使用 prefix block table 中的逻辑下标，
-    而不是 MDS mapping 中的相对下标。这样同一份计划既能覆盖已经在 HBM
+    而不是 GranuleKV mapping 中的相对下标。这样同一份计划既能覆盖已经在 HBM
     命中的 block，也能覆盖需要从 SSD 恢复的 block；后端只负责把两者的
     交集转换成真实 I/O。
 
     ``None`` 表示该层使用完整 prefix，即 dense attention。未来真实 sparse
-    attention 只需要为每层填入 block 下标，不需要修改 scheduler/MDS 的
+    attention 只需要为每层填入 block 下标，不需要修改 scheduler/GranuleKV 的
     stage、activate、poll 和 barrier 生命周期。
     """
 
@@ -194,7 +202,7 @@ class PrefetchUnit:
     end_layer: int
     block_indices: Optional[Tuple[int, ...]] = None
     # 与 layer_range 等长；每一项是该层 attention 真正允许访问的 blocks。
-    # block_indices 则是这些集合的并集，专供 MDS 一次预取整个 window。
+    # block_indices 则是这些集合的并集，专供 GranuleKV 一次预取整个 window。
     consumer_blocks_by_layer: Optional[
         Tuple[Optional[Tuple[int, ...]], ...]] = None
 
@@ -232,7 +240,7 @@ class PrefetchPlan:
     """一次 prefix restore 的不可变 prefetch plan。
 
     plan 只保存消费范围以及相对 block 选择，不持有物理 block、
-    SequenceGroup 或 MDS handle。scheduler 和 model runner 可以共享它，
+    SequenceGroup 或 GranuleKV handle。scheduler 和 model runner 可以共享它，
     而不会把 allocator 生命周期耦合进策略模块。
     """
 
@@ -281,7 +289,7 @@ def select_prefetch_unit_blocks(
 
     mapping 与 logical key 必须始终一一对应，后者会在完成后更新 residency
     directory。选择动作集中在这里，可以避免 layer/sparse 策略分别复制
-    scheduler 入队逻辑，也能在提交 MDS 前统一拦截越界或错位的计划。
+    scheduler 入队逻辑，也能在提交 GranuleKV 前统一拦截越界或错位的计划。
     """
     mapping = tuple(block_mapping)
     keys = tuple(logical_blocks)
@@ -330,29 +338,33 @@ class RollingPrefetchConfig:
     ) -> "RollingPrefetchConfig":
         values = os.environ if environ is None else environ
         enabled = bool(
-            int(values.get(
-                "VLLM_BAM_MDS_HIERARCHICAL_ROLLING_ENABLE", "0")))
+            int(_env(values, "VLLM_GRANULEKV_HIERARCHICAL_ROLLING_ENABLE",
+                     "VLLM_GRANULEKV_HIERARCHICAL_ROLLING_ENABLE", "0")))
         if not enabled:
             return cls()
-        lead_units = int(values.get(
-            "VLLM_BAM_MDS_HIERARCHICAL_LEAD_WINDOWS", "1"))
-        max_lead_units = int(values.get(
-            "VLLM_BAM_MDS_HIERARCHICAL_MAX_LEAD_WINDOWS",
+        lead_units = int(_env(
+            values, "VLLM_GRANULEKV_HIERARCHICAL_LEAD_WINDOWS",
+            "VLLM_GRANULEKV_HIERARCHICAL_LEAD_WINDOWS", "1"))
+        max_lead_units = int(_env(
+            values, "VLLM_GRANULEKV_HIERARCHICAL_MAX_LEAD_WINDOWS",
+            "VLLM_GRANULEKV_HIERARCHICAL_MAX_LEAD_WINDOWS",
             str(lead_units)))
-        target_slack_ms = float(values.get(
-            "VLLM_BAM_MDS_HIERARCHICAL_TARGET_SLACK_MS", "0"))
+        target_slack_ms = float(_env(
+            values, "VLLM_GRANULEKV_HIERARCHICAL_TARGET_SLACK_MS",
+            "VLLM_GRANULEKV_HIERARCHICAL_TARGET_SLACK_MS", "0"))
         working_set_enabled = bool(
-            int(values.get("VLLM_BAM_MDS_LAYER_WORKING_SET_ENABLE", "0")))
+            int(_env(values, "VLLM_GRANULEKV_LAYER_WORKING_SET_ENABLE",
+                     "VLLM_GRANULEKV_LAYER_WORKING_SET_ENABLE", "0")))
         if lead_units < 0:
             raise ValueError(
-                "VLLM_BAM_MDS_HIERARCHICAL_LEAD_WINDOWS must be non-negative")
+                "VLLM_GRANULEKV_HIERARCHICAL_LEAD_WINDOWS must be non-negative")
         if max_lead_units < lead_units:
             raise ValueError(
-                "VLLM_BAM_MDS_HIERARCHICAL_MAX_LEAD_WINDOWS must be >= "
-                "VLLM_BAM_MDS_HIERARCHICAL_LEAD_WINDOWS")
+                "VLLM_GRANULEKV_HIERARCHICAL_MAX_LEAD_WINDOWS must be >= "
+                "VLLM_GRANULEKV_HIERARCHICAL_LEAD_WINDOWS")
         if target_slack_ms < 0:
             raise ValueError(
-                "VLLM_BAM_MDS_HIERARCHICAL_TARGET_SLACK_MS must be non-negative")
+                "VLLM_GRANULEKV_HIERARCHICAL_TARGET_SLACK_MS must be non-negative")
         return cls(enabled=True,
                    lead_units=lead_units,
                    max_lead_units=max_lead_units,
@@ -373,24 +385,37 @@ def get_layer_working_set_regions(
     因此 region 数固定为 ``window_layers * (max_lead_units + 1)``。
     """
     values = os.environ if environ is None else environ
-    if not bool(int(values.get("VLLM_BAM_MDS_LAYER_WORKING_SET_ENABLE", "0"))):
+    if not bool(int(_env(values, "VLLM_GRANULEKV_LAYER_WORKING_SET_ENABLE",
+                         "VLLM_GRANULEKV_LAYER_WORKING_SET_ENABLE", "0"))):
         return 0
     required_switches = (
-        "VLLM_BAM_MDS_HIERARCHICAL_IO_ENABLE",
-        "VLLM_BAM_MDS_HIERARCHICAL_LAYER_BARRIER",
-        "VLLM_BAM_MDS_HIERARCHICAL_ROLLING_ENABLE",
+        "VLLM_GRANULEKV_HIERARCHICAL_IO_ENABLE",
+        "VLLM_GRANULEKV_HIERARCHICAL_LAYER_BARRIER",
+        "VLLM_GRANULEKV_HIERARCHICAL_ROLLING_ENABLE",
     )
-    if any(not bool(int(values.get(name, "0")))
+    legacy_switches = {
+        "VLLM_GRANULEKV_HIERARCHICAL_IO_ENABLE":
+        "VLLM_GRANULEKV_HIERARCHICAL_IO_ENABLE",
+        "VLLM_GRANULEKV_HIERARCHICAL_LAYER_BARRIER":
+        "VLLM_GRANULEKV_HIERARCHICAL_LAYER_BARRIER",
+        "VLLM_GRANULEKV_HIERARCHICAL_ROLLING_ENABLE":
+        "VLLM_GRANULEKV_HIERARCHICAL_ROLLING_ENABLE",
+    }
+    if any(not bool(int(_env(values, name, legacy_switches[name], "0")))
            for name in required_switches):
         raise ValueError(
             "layer working set requires hierarchical I/O, layer barrier and "
             "rolling prefetch")
-    num_layers = int(values.get("VLLM_BAM_MDS_HIERARCHICAL_NUM_LAYERS", "0"))
+    num_layers = int(_env(values, "VLLM_GRANULEKV_HIERARCHICAL_NUM_LAYERS",
+                          "VLLM_GRANULEKV_HIERARCHICAL_NUM_LAYERS", "0"))
     window_layers = int(
-        values.get("VLLM_BAM_MDS_HIERARCHICAL_WINDOW_LAYERS", "0"))
-    max_lead = int(values.get(
-        "VLLM_BAM_MDS_HIERARCHICAL_MAX_LEAD_WINDOWS",
-        values.get("VLLM_BAM_MDS_HIERARCHICAL_LEAD_WINDOWS", "1")))
+        _env(values, "VLLM_GRANULEKV_HIERARCHICAL_WINDOW_LAYERS",
+             "VLLM_GRANULEKV_HIERARCHICAL_WINDOW_LAYERS", "0"))
+    max_lead = int(_env(
+        values, "VLLM_GRANULEKV_HIERARCHICAL_MAX_LEAD_WINDOWS",
+        "VLLM_GRANULEKV_HIERARCHICAL_MAX_LEAD_WINDOWS",
+        _env(values, "VLLM_GRANULEKV_HIERARCHICAL_LEAD_WINDOWS",
+             "VLLM_GRANULEKV_HIERARCHICAL_LEAD_WINDOWS", "1")))
     if num_layers <= 0 or window_layers <= 0 or max_lead < 0:
         raise ValueError("invalid layer working-set configuration")
     regions = window_layers * (max_lead + 1)
@@ -417,22 +442,25 @@ class HierarchicalIOConfig:
     ) -> "HierarchicalIOConfig":
         values = os.environ if environ is None else environ
         enabled = bool(
-            int(values.get("VLLM_BAM_MDS_HIERARCHICAL_IO_ENABLE", "0")))
+            int(_env(values, "VLLM_GRANULEKV_HIERARCHICAL_IO_ENABLE",
+                     "VLLM_GRANULEKV_HIERARCHICAL_IO_ENABLE", "0")))
         if not enabled:
             return cls()
 
         # SchedulerConfig 不携带模型层数；这里显式使用 PP rank 的本地层数，
         # 避免从模型名称或全局层数猜测。单卡模型通常就是总 hidden layers。
-        num_layers = int(
-            values.get("VLLM_BAM_MDS_HIERARCHICAL_NUM_LAYERS", "0"))
-        window_layers = int(
-            values.get("VLLM_BAM_MDS_HIERARCHICAL_WINDOW_LAYERS", "0"))
+        num_layers = int(_env(
+            values, "VLLM_GRANULEKV_HIERARCHICAL_NUM_LAYERS",
+            "VLLM_GRANULEKV_HIERARCHICAL_NUM_LAYERS", "0"))
+        window_layers = int(_env(
+            values, "VLLM_GRANULEKV_HIERARCHICAL_WINDOW_LAYERS",
+            "VLLM_GRANULEKV_HIERARCHICAL_WINDOW_LAYERS", "0"))
         if num_layers <= 0:
             raise ValueError(
-                "VLLM_BAM_MDS_HIERARCHICAL_NUM_LAYERS must be positive")
+                "VLLM_GRANULEKV_HIERARCHICAL_NUM_LAYERS must be positive")
         if window_layers <= 0:
             raise ValueError(
-                "VLLM_BAM_MDS_HIERARCHICAL_WINDOW_LAYERS must be positive")
+                "VLLM_GRANULEKV_HIERARCHICAL_WINDOW_LAYERS must be positive")
         return cls(enabled=True,
                    num_layers=num_layers,
                    window_layers=window_layers,

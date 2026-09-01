@@ -12,7 +12,7 @@ from vllm.core.block.cpu_gpu_block_allocator import CpuGpuBlockAllocator
 from vllm.core.block.interfaces import Block
 from vllm.core.block.prefix_caching_block import (ComputedBlocksTracker,
                                                   LastAccessBlocksTracker)
-from vllm.core.custom_schedulers.bam_mds_prefix import (
+from vllm.core.custom_schedulers.granulekv_prefix import (
     compute_full_prefix_block_hashes)
 from vllm.core.block.utils import check_no_caching_or_swa_for_blockmgr_encdec
 from vllm.core.block_reservation import (BlockPrefixRestoreReservation,
@@ -332,7 +332,7 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         self.block_tables[seq_id].free()
         del self.block_tables[seq_id]
 
-    def free_mds_prefix_store(self, seq: Sequence) -> None:
+    def free_granulekv_prefix_store(self, seq: Sequence) -> None:
         """释放 prefix populate 后位于 storage 的正式 block table。
 
         原生 ``free`` 的 last-access tracker 只支持 GPU id；prefix store
@@ -493,22 +493,24 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         return self._reserve_swap(seq_group, SequenceStatus.SWAPPED,
                                   Device.CPU, Device.GPU)
 
-    def get_mds_cached_prefix_blocks(self, seq: Sequence,
+    def get_granulekv_cached_prefix_blocks(self, seq: Sequence,
                                      device: Device) -> int:
         """返回指定层级中从 token 0 连续命中的完整 block 数。
 
         这里直接查询 allocator，不写入 ``ComputedBlocksTracker``。restore
         READY 之前缓存长度仍不应对原生 Scheduler 可见。
         """
-        storage_blocks, gpu_blocks = self.get_mds_cached_prefix_block_counts(
+        storage_blocks, gpu_blocks = self.get_granulekv_cached_prefix_block_counts(
             seq)
         return storage_blocks if device == Device.CPU else gpu_blocks
 
-    def get_mds_cached_prefix_block_counts(
+    def get_granulekv_cached_prefix_block_counts(
             self, seq: Sequence) -> Tuple[int, int]:
         """一次 hash 计算同时返回 ``(storage_blocks, gpu_blocks)``。"""
         if not self.enable_caching:
             return 0, 0
+        if envs.VLLM_GRANULEKV_TRUST_PREPOPULATED_PREFIX:
+            self._seed_trusted_granulekv_storage_prefix(seq)
         block_hashes = compute_full_prefix_block_hashes(
             seq.get_token_ids(), self.block_size, seq.extra_hash())
         storage_blocks = len(
@@ -519,7 +521,54 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
                 block_hashes, device=Device.GPU))
         return storage_blocks, gpu_blocks
 
-    def can_reserve_mds_prefix_restore(
+    def _seed_trusted_granulekv_storage_prefix(self, seq: Sequence) -> None:
+        """为两阶段实验重建已经写入 SSD 的 prefix allocator 元数据。
+
+        此函数不执行任何 I/O，只能在第一阶段使用相同模型、token、block size、
+        storage 容量和全新 allocator 顺序写过 SSD 后启用。显式 block 数防止把
+        第二阶段人为修改的 suffix 也声明为命中。创建出的 block 立即 free 到
+        CPU prefix-cache evictor；后续正常 lookup/reservation 会重新持有引用。
+        """
+        if not envs.VLLM_GRANULEKV_LAYER_WORKING_SET_ENABLE:
+            raise RuntimeError(
+                "trusted prepopulated prefix is only valid in working-set mode")
+        trusted_blocks = envs.VLLM_GRANULEKV_TRUSTED_PREFIX_BLOCKS
+        max_full_blocks = len(seq.get_token_ids()) // self.block_size
+        if trusted_blocks <= 0 or trusted_blocks > max_full_blocks:
+            raise ValueError(
+                "VLLM_GRANULEKV_TRUSTED_PREFIX_BLOCKS must describe a positive "
+                "complete prefix of the current request")
+        token_ids = seq.get_token_ids()[:trusted_blocks * self.block_size]
+        hashes = compute_full_prefix_block_hashes(token_ids, self.block_size,
+                                                  seq.extra_hash())
+        if len(self.block_allocator.find_cached_blocks_prefix(
+                hashes, device=Device.CPU)) == trusted_blocks:
+            return
+
+        token_blocks = [
+            token_ids[index:index + self.block_size]
+            for index in range(0, len(token_ids), self.block_size)
+        ]
+        seeded = self.block_allocator.allocate_immutable_blocks(
+            prev_block=None,
+            block_token_ids=token_blocks,
+            device=Device.CPU,
+            extra_hash=seq.extra_hash(),
+        )
+        block_ids = [block.block_id for block in seeded
+                     if block.block_id is not None]
+        if len(block_ids) != trusted_blocks:
+            raise RuntimeError("failed to seed complete trusted SSD prefix")
+        self.block_allocator.mark_blocks_as_computed_on_device(
+            block_ids, Device.CPU)
+        for block in seeded:
+            self.block_allocator.free(block)
+        logger.warning(
+            "[GRANULEKV_WORKING_SET] trusted prepopulated SSD prefix seeded "
+            "seq_id=%s blocks=%d; payload integrity is an experiment premise",
+            seq.seq_id, trusted_blocks)
+
+    def can_reserve_granulekv_prefix_restore(
         self,
         num_prefix_blocks: int,
         num_gpu_cached_blocks: int,
@@ -541,7 +590,7 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             return AllocStatus.OK
         return AllocStatus.LATER
 
-    def reserve_mds_prefix_restore(
+    def reserve_granulekv_prefix_restore(
         self,
         seq_group: SequenceGroup,
         num_prefix_blocks: int,
@@ -554,10 +603,10 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         分配，READY 后由原生 running prefill 的 append_slots 补齐。
         """
         if not self.enable_caching:
-            raise RuntimeError("BaM MDS prefix restore requires prefix caching")
+            raise RuntimeError("GranuleKV prefix restore requires prefix caching")
         waiting_seqs = seq_group.get_seqs(status=SequenceStatus.WAITING)
         if len(waiting_seqs) != 1:
-            raise ValueError("BaM MDS prefix v0 requires one waiting sequence")
+            raise ValueError("GranuleKV prefix v0 requires one waiting sequence")
         seq = waiting_seqs[0]
         if seq.seq_id in self.block_tables:
             raise RuntimeError("prefix restore target is already allocated")
@@ -611,13 +660,13 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             # 尚未进入过原生 admission，ComputedBlocksTracker 还没有对应的
             # cached-token frontier。这里以 allocator 查询得到的连续 HBM hit
             # 为准初始化 tracker；SSD 扩展部分仍保持 IO_PENDING，只有 READY
-            # 后才会在 commit_mds_prefix_restore 中提升到完整 prefix 长度。
+            # 后才会在 commit_granulekv_prefix_restore 中提升到完整 prefix 长度。
             observed_gpu_tokens = self._computed_blocks_tracker.get_num_cached_tokens(
                 seq)
             expected_gpu_tokens = num_gpu_cached_blocks * self.block_size
             if observed_gpu_tokens < expected_gpu_tokens:
                 logger.info(
-                    "[BAM_MDS_PREFIX] phase=tracker_frontier_adjust "
+                    "[GRANULEKV_PREFIX] phase=tracker_frontier_adjust "
                     "seq_group_id=%s observed_gpu_tokens=%d "
                     "expected_gpu_tokens=%d",
                     seq_group.request_id,
@@ -677,7 +726,7 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             ))
         return public
 
-    def commit_mds_prefix_restore(self, reservation_id: str) -> int:
+    def commit_granulekv_prefix_restore(self, reservation_id: str) -> int:
         """发布 restored prefix，并返回可推进的连续 prefix token 数。"""
         record = self._prefix_restore_reservations.pop(reservation_id)
         self.block_allocator.publish_pending_restore_blocks(
@@ -700,7 +749,7 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             self._storage_replicas[key] = source_block
         return record.public.num_prefix_blocks * self.block_size
 
-    def finalize_mds_prefix_working_set(self, reservation_id: str) -> int:
+    def finalize_granulekv_prefix_working_set(self, reservation_id: str) -> int:
         """结束一次 one-shot working-set restore，但不发布全局 prefix hash。
 
         各模型层共用少量环形 HBM regions，forward 结束时早期层已经被覆盖，
@@ -721,7 +770,7 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
                 record.seq.seq_id, logical_index)] = source_block
         return record.public.num_prefix_blocks * self.block_size
 
-    def admit_mds_prefix_restore_for_layer_barrier(
+    def admit_granulekv_prefix_restore_for_layer_barrier(
             self, reservation_id: str) -> int:
         """允许层屏障请求跳过 prefix 重新计算，但暂不发布 hash。
 
@@ -741,7 +790,7 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             record.seq, restored_tokens)
         return restored_tokens
 
-    def abort_mds_prefix_restore(self, reservation_id: str) -> None:
+    def abort_granulekv_prefix_restore(self, reservation_id: str) -> None:
         """取消 prefix read，并释放临时持有的 SSD source 引用。"""
         record = self._prefix_restore_reservations.pop(reservation_id)
         for source in record.source_blocks:
@@ -815,13 +864,13 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         return self._reserve_swap(seq_group, SequenceStatus.RUNNING,
                                   Device.GPU, Device.CPU)
 
-    def reserve_mds_prefix_store(
+    def reserve_granulekv_prefix_store(
             self, seq_group: SequenceGroup) -> BlockSwapReservation:
         """为正常完成请求建立 GPU -> SSD prefix populate 事务。
 
         finished sequence 已经不再是 RUNNING，不能复用 ``reserve_swap_out``
         的状态过滤；除此之外，物理 copy、clean replica 复用和 commit 顺序
-        与普通 MDS write 完全相同。
+        与普通 GranuleKV write 完全相同。
         """
         finished = tuple(seq for seq in seq_group.get_seqs()
                          if seq.status in (SequenceStatus.FINISHED_STOPPED,
@@ -830,7 +879,7 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             raise ValueError("prefix store requires a normally finished sequence")
         return self._reserve_swap(seq_group, None, Device.GPU, Device.CPU)
 
-    def can_reserve_mds_prefix_store(self,
+    def can_reserve_granulekv_prefix_store(self,
                                      seq_group: SequenceGroup) -> bool:
         """检查 finished table 是否有足够的 storage 目标 block。"""
         required = 0
@@ -912,7 +961,7 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
                     block.block_id for block in table_record.target_blocks
                     if block.block_id is not None
                 ]
-                # MDS DONE 才意味着 SSD 内容真实可读。只提交本事务的 id，
+                # GranuleKV DONE 才意味着 SSD 内容真实可读。只提交本事务的 id，
                 # 不能顺带把另一笔仍在飞行的 prefix write 标成 computed。
                 self.block_allocator.mark_blocks_as_computed_on_device(
                     storage_block_ids, Device.CPU)

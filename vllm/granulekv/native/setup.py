@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""独立构建 vLLM MDS pointer-to-Tensor bridge。"""
+"""Build the independent GranuleKV pointer-to-Tensor bridge."""
 
 from pathlib import Path
 
@@ -10,10 +10,10 @@ from torch.utils.cpp_extension import BuildExtension, CppExtension
 ROOT = Path(__file__).resolve().parent
 
 setup(
-    name="mds_torch_bridge",
+    name="granulekv_torch_bridge",
     ext_modules=[
         CppExtension(
-            name="mds_torch_bridge",
+            name="granulekv_torch_bridge",
             sources=[str(ROOT / "torch_ipc_tensor_bridge.cpp")],
             extra_compile_args=["-O2"],
         )

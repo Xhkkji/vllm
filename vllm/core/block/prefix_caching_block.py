@@ -95,7 +95,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
         # are scheduled.
         self._touched_blocks: Set[BlockId] = set()
 
-        # BaM MDS restore target 已经占用真实 GPU block id，但 SSD DMA 尚未
+        # GranuleKV restore target 已经占用真实 GPU block id，但 SSD DMA 尚未
         # 完成。它们在 READY 前不能进入 ``_cached_blocks``，否则另一个相同
         # prefix 的请求会复用仍在写入的物理地址；也不能被原生批量 computed
         # 提交发布。pending block 只由下面三个专用接口创建、发布和回收。
@@ -254,7 +254,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
 
     def publish_pending_restore_blocks(self,
                                        blocks: List[Block]) -> List[int]:
-        """在 MDS READY 后原子地把 pending block 发布到 prefix cache。
+        """在 GranuleKV READY 后原子地把 pending block 发布到 prefix cache。
 
         promotion 期间若已有普通 forward 生成相同 hash，原生 allocator 会
         回收当前临时 target，并让 Block 对象切换到已完成的 canonical id；
@@ -264,7 +264,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
         for block in blocks:
             block_id = block.block_id
             if block_id is None or block_id not in self._pending_restore_block_ids:
-                raise RuntimeError("block is not pending MDS restore")
+                raise RuntimeError("block is not pending GranuleKV restore")
             self._pending_restore_block_ids.remove(block_id)
             block.block_id = self.promote_to_immutable_block(block)
             assert block.block_id is not None
@@ -646,8 +646,8 @@ class PrefixCachingBlockAllocator(BlockAllocator):
                     "Mark block as accessed which is not belonged to GPU")
 
     def mark_blocks_as_computed(self, block_ids: List[int]) -> None:
-        # 原生调用传空列表，语义仍是提交本轮全部 touched block。BaM prefix
-        # restore 传入明确 id，只提交 MDS 已经写完的目标，避免把同一时刻
+        # 原生调用传空列表，语义仍是提交本轮全部 touched block。GranuleKV prefix
+        # restore 传入明确 id，只提交 GranuleKV 已经写完的目标，避免把同一时刻
         # 尚未计算的 prompt suffix 误标成可命中。
         blocks_to_mark = (self._touched_blocks if not block_ids else
                           self._touched_blocks.intersection(block_ids))
@@ -1156,7 +1156,7 @@ class ComputedBlocksTracker:
                               num_cached_tokens: int) -> None:
         """记录外部后端已恢复、且可以跳过计算的连续 prefix 长度。
 
-        BaM MDS 在 admission 前把 SSD KV 直接放入 GPU block。这个状态不由
+        GranuleKV 在 admission 前把 SSD KV 直接放入 GPU block。这个状态不由
         原生 GPU cache lookup 产生，但后续 chunked prefill 仍应复用 vLLM 的
         cached-token 预算和 metadata 语义，所以只在 I/O READY 后通过这个
         小接口更新 tracker，不直接改 ``SequenceData``。

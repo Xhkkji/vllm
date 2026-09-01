@@ -65,7 +65,7 @@ logger = init_logger(__name__)
 
 
 def _qwen2_layer_nvtx_trace_enabled() -> bool:
-    value = os.environ.get("VLLM_BAM_LAYER_NVTX_TRACE")
+    value = os.environ.get("VLLM_GRANULEKV_LAYER_NVTX_TRACE")
     return value is not None and value.lower() not in ("", "0", "false",
                                                        "off", "no")
 
@@ -360,13 +360,13 @@ class Qwen2Model(nn.Module):
         layers = self.layers[self.start_layer:self.end_layer]
         for layer_idx, layer in enumerate(layers, start=self.start_layer):
             # Step 4：仅在显式开启时，在 attention 消费当前层 KV 前确认其
-            # MDS restore window 已 ready。关闭时不访问 barrier ContextVar，
+            # GranuleKV restore window 已 ready。关闭时不访问 barrier ContextVar，
             # 保持原生 Qwen2 forward 热路径不变。
             sparse_kv_blocks = None
-            if envs.VLLM_BAM_MDS_HIERARCHICAL_LAYER_BARRIER:
+            if envs.VLLM_GRANULEKV_HIERARCHICAL_LAYER_BARRIER:
                 sparse_kv_blocks = wait_for_local_layer(layer_idx)
             token_count = hidden_states.shape[0]
-            # 仅在显式打开 VLLM_BAM_LAYER_NVTX_TRACE 时标记每层边界，
+            # 仅在显式打开 VLLM_GRANULEKV_LAYER_NVTX_TRACE 时标记每层边界，
             # 用于 Nsight 中判断当前整段 KV 恢复是否具备拆成 layer 级
             # prefetch 并与后续层计算重叠的空间；默认关闭，不改变数据路径。
             nvtx_pushed = _qwen2_layer_nvtx_push(
@@ -385,8 +385,8 @@ class Qwen2Model(nn.Module):
                 if nvtx_pushed:
                     torch.cuda.nvtx.range_pop()
             # 只有 layer 正常执行完成才发布消费信号。window 内非末层回调是
-            # no-op；末层会允许后续 MDS unit 覆盖已经不再访问的 HBM region。
-            if envs.VLLM_BAM_MDS_HIERARCHICAL_LAYER_BARRIER:
+            # no-op；末层会允许后续 GranuleKV unit 覆盖已经不再访问的 HBM region。
+            if envs.VLLM_GRANULEKV_HIERARCHICAL_LAYER_BARRIER:
                 release_local_layer(layer_idx)
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({

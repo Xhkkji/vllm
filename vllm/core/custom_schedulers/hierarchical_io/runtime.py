@@ -3,7 +3,7 @@
 """Worker-local prefetch plan runtime。
 
 Scheduler 预留 block 并一次下发完整 plan；本模块只决定已经预授权的 unit
-何时占用 MDS slot。它不能分配/释放 block，也不能发布 prefix hash。这样即使
+何时占用 GranuleKV slot。它不能分配/释放 block，也不能发布 prefix hash。这样即使
 激活发生在 model forward 内，事务所有权仍然完整留在 Scheduler。
 """
 
@@ -146,7 +146,7 @@ class RollingPrefetchRuntime:
         """滚动激活未来 unit，并等待当前 consumer 对应 unit READY。
 
         ``consumer_index`` 当前是 layer index。激活只查看 Scheduler 已经 stage
-        的模板；若 MDS slot 暂满，则先 poll 已激活 unit，槽位释放后再继续。
+    的模板；若 GranuleKV slot 暂满，则先 poll 已激活 unit，槽位释放后再继续。
         """
         request_id_set = frozenset(request_ids)
         matching = tuple(

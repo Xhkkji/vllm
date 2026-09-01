@@ -1,4 +1,5 @@
-"""将 vLLM V0 KV cache metadata 固化为 MDS allocation layout。"""
+# SPDX-License-Identifier: Apache-2.0
+"""vLLM KV allocation metadata used by the GranuleKV transport."""
 
 from __future__ import annotations
 
@@ -18,15 +19,15 @@ DTYPE_NAMES = {
 
 def contiguous_strides(shape: Sequence[int]) -> tuple[int, ...]:
     stride = 1
-    reversed_strides: list[int] = []
+    result: list[int] = []
     for size in reversed(shape):
-        reversed_strides.append(stride)
+        result.append(stride)
         stride *= int(size)
-    return tuple(reversed(reversed_strides))
+    return tuple(reversed(result))
 
 
 @dataclass(frozen=True)
-class VLLMKVLayout:
+class GranuleKVLayout:
     tensor_shape: tuple[int, ...]
     tensor_strides: tuple[int, ...]
     dtype_name: str
@@ -51,28 +52,26 @@ class VLLMKVLayout:
         num_gpu_blocks: int,
         num_storage_blocks: int,
         device_index: int,
-    ) -> "VLLMKVLayout":
+    ) -> "GranuleKVLayout":
         shape = tuple(int(value) for value in allocation_shape)
         order = tuple(int(value) for value in stride_order)
         if sorted(order) != list(range(len(shape))):
             raise ValueError("invalid KV cache stride order")
         if dtype not in DTYPE_NAMES:
-            raise ValueError(f"unsupported MDS KV dtype: {dtype}")
+            raise ValueError(f"unsupported GranuleKV dtype: {dtype}")
         if num_storage_blocks <= 0:
-            raise ValueError("MDS KVStore requires positive storage blocks")
+            raise ValueError("GranuleKV requires positive storage blocks")
         if not 0 < num_gpu_regions <= num_layers:
-            raise ValueError("invalid MDS GPU layer-region count")
+            raise ValueError("invalid GranuleKV GPU layer-region count")
 
-        # 精确复现原生 ``zeros(allocation_shape).permute(stride_order)``，但不在
-        # vLLM 进程额外分配一份同尺寸 CUDA tensor。
         allocation_strides = contiguous_strides(shape)
         tensor_shape = tuple(shape[index] for index in order)
         tensor_strides = tuple(allocation_strides[index] for index in order)
         if len(tensor_shape) != 3 or tensor_shape[0] != 2:
             raise ValueError(
-                f"MDS requires V0 [2,N,E] KV layout, got {tensor_shape}")
+                f"GranuleKV requires V0 [2,N,E] KV layout, got {tensor_shape}")
         if tensor_strides[2] != 1:
-            raise ValueError("MDS KV fragment must be contiguous")
+            raise ValueError("GranuleKV fragment must be contiguous")
 
         element_size = int(torch.empty((), dtype=dtype).element_size())
         storage_elements = 1 + sum(
@@ -81,18 +80,20 @@ class VLLMKVLayout:
         region_bytes = storage_elements * element_size
         fragment_bytes = tensor_strides[1] * element_size
         if fragment_bytes % 4096 != 0:
-            raise ValueError("MDS KV fragment must be 4KB aligned")
-        return cls(tensor_shape=tensor_shape,
-                   tensor_strides=tensor_strides,
-                   dtype_name=DTYPE_NAMES[dtype],
-                   element_size=element_size,
-                   region_bytes=region_bytes,
-                   fragment_bytes=fragment_bytes,
-                   num_layers=int(num_layers),
-                   num_gpu_regions=int(num_gpu_regions),
-                   num_gpu_blocks=int(num_gpu_blocks),
-                   num_storage_blocks=int(num_storage_blocks),
-                   device_index=int(device_index))
+            raise ValueError("GranuleKV fragment must be 4KB aligned")
+        return cls(
+            tensor_shape=tensor_shape,
+            tensor_strides=tensor_strides,
+            dtype_name=DTYPE_NAMES[dtype],
+            element_size=element_size,
+            region_bytes=region_bytes,
+            fragment_bytes=fragment_bytes,
+            num_layers=int(num_layers),
+            num_gpu_regions=int(num_gpu_regions),
+            num_gpu_blocks=int(num_gpu_blocks),
+            num_storage_blocks=int(num_storage_blocks),
+            device_index=int(device_index),
+        )
 
     def allocation_payload(self, *, client_pid: int) -> dict[str, Any]:
         return {
@@ -117,6 +118,6 @@ class VLLMKVLayout:
         if (tuple(manifest["tensor_shape"]) != self.tensor_shape
                 or tuple(manifest["tensor_strides"]) != self.tensor_strides
                 or manifest["dtype"] != self.dtype_name):
-            raise RuntimeError("MDS allocation manifest layout mismatch")
+            raise RuntimeError("GranuleKV allocation manifest layout mismatch")
         if len(manifest["regions"]) != self.num_gpu_regions:
-            raise RuntimeError("MDS allocation manifest region count mismatch")
+            raise RuntimeError("GranuleKV allocation region count mismatch")

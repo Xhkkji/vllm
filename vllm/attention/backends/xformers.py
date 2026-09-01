@@ -518,9 +518,9 @@ def _copy_runtime_dense_prefix_attachment(
     不去泛化成“复制所有私有属性”，避免再次把历史实验缓存也一起耦回来。
     """
     for attr_name in (
-            "_bam_dense_prefix_chunk_tensors",
-            "_bam_dense_prefix_context_tokens",
-            "_bam_dense_prefix_source",
+            "_granulekv_dense_prefix_chunk_tensors",
+            "_granulekv_dense_prefix_context_tokens",
+            "_granulekv_dense_prefix_source",
     ):
         if hasattr(src_metadata, attr_name):
             setattr(dst_metadata, attr_name, getattr(src_metadata, attr_name))
@@ -1103,7 +1103,7 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
                 #
                 # 这样既保留联调时需要的输入形状信息，又避免稳定跑分时每层都刷
                 # 一条大日志。
-                if envs.VLLM_BAM_XFORMERS_PREFIX_FALLBACK_PROFILE:
+                if envs.VLLM_GRANULEKV_XFORMERS_PREFIX_FALLBACK_PROFILE:
                     # 这里是 prefix fallback 的观测日志，不应该再去读取 CUDA tensor
                     # 的具体值。
                     #
@@ -1240,7 +1240,7 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
         )
         full_key = workspace.full_key
         full_value = workspace.full_value
-        profile_enabled = envs.VLLM_BAM_XFORMERS_PREFIX_FALLBACK_PROFILE
+        profile_enabled = envs.VLLM_GRANULEKV_XFORMERS_PREFIX_FALLBACK_PROFILE
         backend_choice = self._select_prefix_workspace_backends(
             layer=layer,
             prefill_meta=prefill_meta,
@@ -1294,7 +1294,7 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
 
         # xFormers fallback 每层都会执行一次；默认性能口径不逐层打印，
         # 避免 Python logging 干扰端到端延迟。需要 profile 时由
-        # VLLM_BAM_XFORMERS_PREFIX_FALLBACK_PROFILE=1 恢复细粒度日志。
+        # VLLM_GRANULEKV_XFORMERS_PREFIX_FALLBACK_PROFILE=1 恢复细粒度日志。
         if profile_enabled:
             logger.info(
                 "[XFORMERS_PREFIX_FALLBACK] query_lens=%s context_lens=%s "
@@ -1401,7 +1401,7 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
         #
         # 为了把主线重新收束到你要求的语义：
         #
-        # - BaM 负责存
+        # - GranuleKV 负责存
         # - GPU service 负责取 + 放到 paged cache + 发布可消费状态
         # - attention 只消费 paged cache
         #
@@ -1409,7 +1409,7 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
         # 逻辑。这样可以避免 attention 再额外依赖一套旁路 dense attachment
         # 解释，从而把“GPU 写什么 / attention 读什么”的数据面重新收成同一份
         # paged KV cache。
-        forced_prefix_backend = envs.VLLM_BAM_XFORMERS_PREFIX_BACKEND
+        forced_prefix_backend = envs.VLLM_GRANULEKV_XFORMERS_PREFIX_BACKEND
         if forced_prefix_backend not in (
                 "auto",
                 "packed_direct_to_workspace",
@@ -1431,7 +1431,7 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
         #     workspace。它更慢，但 ABI 更保守，适合判断 packed gather 是否读错。
         #
         # 注意：这个开关只影响 attention 侧如何“消费”已经写好的 paged KV cache，
-        # 不改变 BaM submit、GPU persistent poll、direct placement 写入语义。
+        # 不改变 GranuleKV submit、GPU persistent poll、direct placement 写入语义。
         if forced_prefix_backend == "gather_then_copy":
             prefix_backend = "gather_then_copy"
         elif forced_prefix_backend == "packed_direct_to_workspace":
@@ -1444,7 +1444,7 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
                 "packed_direct_to_workspace"
                 if self._can_use_packed_prefix_gather(key_cache, value_cache)
                 else "gather_then_copy")
-        forced_query_backend = envs.VLLM_BAM_XFORMERS_QUERY_BACKEND
+        forced_query_backend = envs.VLLM_GRANULEKV_XFORMERS_QUERY_BACKEND
         if forced_query_backend not in (
                 "auto",
                 "direct_scatter",
@@ -1472,7 +1472,7 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
                 "direct_scatter" if self._can_use_direct_query_scatter(
                     query_key, query_value, full_key, full_value) else
                 "segment_copy")
-        if envs.VLLM_BAM_XFORMERS_PREFIX_FALLBACK_PROFILE:
+        if envs.VLLM_GRANULEKV_XFORMERS_PREFIX_FALLBACK_PROFILE:
             logger.info(
                 "[XFORMERS_PREFIX_BACKEND] forced=%s selected_prefix=%s "
                 "forced_query=%s selected_query=%s",
@@ -1661,20 +1661,20 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
         materialize 结果，语义上等价于此前已经验证过的“两次搬运”旧路径：
 
         ```text
-        BaM pages
+        GranuleKV pages
           -> chunk tensor [2, num_layers, tokens, hidden]
           -> xformers dense prefix workspace
         ```
 
         这里故意只做非常薄的只读解析：
 
-        - 不做新的 BaM 读取
+        - 不做新的 GranuleKV 读取
         - 不做新的 paged-KV 解释
         - 只检查 attachment 是否存在、形状是否像期望的 chunk tensor
         """
         dense_prefix_chunk_tensors = getattr(
             prefill_meta,
-            "_bam_dense_prefix_chunk_tensors",
+            "_granulekv_dense_prefix_chunk_tensors",
             None,
         )
         if dense_prefix_chunk_tensors is None:
@@ -1793,7 +1793,7 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
         expected_context_tokens = int(
             getattr(
                 prefill_meta,
-                "_bam_dense_prefix_context_tokens",
+                "_granulekv_dense_prefix_context_tokens",
                 plan.total_context_tokens,
             ))
         if expected_context_tokens != int(plan.total_context_tokens):
@@ -1852,7 +1852,7 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
         当前端到端错误已经被收敛到最后消费段：
 
         ```text
-        BaM live pages 解码出的 dense chunk 是对的
+        GranuleKV live pages 解码出的 dense chunk 是对的
           -> official write repair / runtime direct placement 写入 paged KV
           -> xFormers fallback 从 paged KV gather prefix
           -> full workspace + attention
@@ -1860,10 +1860,10 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
 
         因此这里把 `prefix_key/prefix_value` 与 dense chunk reference 做少量
         token/head/dim 抽样比较。这个函数只在
-        `VLLM_BAM_XFORMERS_VERIFY_PREFIX_GATHER=1` 时运行，并且只读现有
-        attachment，不会发起新的 BaM I/O，也不会改变正式数据通路。
+        `VLLM_GRANULEKV_XFORMERS_VERIFY_PREFIX_GATHER=1` 时运行，并且只读现有
+        attachment，不会发起新的 GranuleKV I/O，也不会改变正式数据通路。
         """
-        if not envs.VLLM_BAM_XFORMERS_VERIFY_PREFIX_GATHER:
+        if not envs.VLLM_GRANULEKV_XFORMERS_VERIFY_PREFIX_GATHER:
             return
 
         dense_prefix_chunk_tensors = self._get_runtime_dense_prefix_chunk_tensors(
@@ -2095,9 +2095,9 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
         - 和 xFormers 输出逐 head 向量比较。
 
         这条逻辑只在
-        `VLLM_BAM_XFORMERS_VERIFY_ATTENTION_OUTPUT=1` 时运行，不改变正式路径。
+        `VLLM_GRANULEKV_XFORMERS_VERIFY_ATTENTION_OUTPUT=1` 时运行，不改变正式路径。
         """
-        if not envs.VLLM_BAM_XFORMERS_VERIFY_ATTENTION_OUTPUT:
+        if not envs.VLLM_GRANULEKV_XFORMERS_VERIFY_ATTENTION_OUTPUT:
             return
 
         layer_index = self._try_parse_layer_index_for_logging(layer)
@@ -2266,23 +2266,23 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
         与手写 bottom-right causal reference 一致
         ```
 
-        现在 BaM 读回、paged KV 写入、prefix gather 都已经通过全量/强抽样
+        现在 GranuleKV 读回、paged KV 写入、prefix gather 都已经通过全量/强抽样
         校验，若模型输出仍然乱码，就需要确认“整层 attention 输出”是否真的
         完整一致。
 
         这条诊断支线只在显式打开时运行：
 
-        - `VLLM_BAM_XFORMERS_VERIFY_ATTENTION_OUTPUT_FULL=1`
-        - `VLLM_BAM_XFORMERS_VERIFY_ATTENTION_OUTPUT_FULL_LAYER=N`
+        - `VLLM_GRANULEKV_XFORMERS_VERIFY_ATTENTION_OUTPUT_FULL=1`
+        - `VLLM_GRANULEKV_XFORMERS_VERIFY_ATTENTION_OUTPUT_FULL_LAYER=N`
 
         默认只查第 0 层。实现上按 segment 构造 fp32 reference，避免继续把
         所有层都拉进昂贵的 debug 路径；它不会改变正式 forward 输出。
         """
-        if not envs.VLLM_BAM_XFORMERS_VERIFY_ATTENTION_OUTPUT_FULL:
+        if not envs.VLLM_GRANULEKV_XFORMERS_VERIFY_ATTENTION_OUTPUT_FULL:
             return
 
         target_layer = int(
-            envs.VLLM_BAM_XFORMERS_VERIFY_ATTENTION_OUTPUT_FULL_LAYER)
+            envs.VLLM_GRANULEKV_XFORMERS_VERIFY_ATTENTION_OUTPUT_FULL_LAYER)
         if target_layer >= 0:
             try:
                 current_layer = int(layer_index)
@@ -2624,7 +2624,7 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
         # 注意：`cu_context_lens` 必须和上面已经确定的 `context_lens`
         # 使用同一套语义。
         #
-        # 这点对当前 BaM + LMCache rebuild 路径尤其重要：为了避免 CUDA 同步，
+        # 这点对当前 GranuleKV + LMCache rebuild 路径尤其重要：为了避免 CUDA 同步，
         # 单请求热路径会优先从 Python 侧 `seq_lens / num_prefill_tokens`
         # 推出 `context_lens`。如果这里又回头对
         # `prefill_meta.context_lens_tensor` 做 cumsum，就可能出现：
@@ -2825,7 +2825,7 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
         prefill_meta._cached_prefix_fallback_plan_key = plan_key
         # plan build 通常每个 prefill 只打印一次，但仍属于 xFormers fallback
         # 诊断信息；默认关闭，避免 performance run 的日志口径混入 profile。
-        if envs.VLLM_BAM_XFORMERS_PREFIX_FALLBACK_PROFILE:
+        if envs.VLLM_GRANULEKV_XFORMERS_PREFIX_FALLBACK_PROFILE:
             logger.info(
                 "[XFORMERS_PREFIX_FALLBACK_PLAN_BUILD] num_prefills=%d "
                 "query_lens=%s context_lens=%s total_context_tokens=%d",
@@ -2845,14 +2845,14 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
         allow_packed_fast_path: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, _XFormersPrefixGatherProfile]:
         """把 prefix 命中的 paged KV 真正 gather 回连续张量。"""
-        profile_enabled = envs.VLLM_BAM_XFORMERS_PREFIX_FALLBACK_PROFILE
+        profile_enabled = envs.VLLM_GRANULEKV_XFORMERS_PREFIX_FALLBACK_PROFILE
         block_size = int(value_cache.shape[-1])
 
         # 这里的 `allow_packed_fast_path` 很重要：
         #
         # - auto / 性能主线允许它为 True，优先用我们自己的 packed direct gather；
         # - 但当外部显式设置
-        #     VLLM_BAM_XFORMERS_PREFIX_BACKEND=gather_then_copy
+        #     VLLM_GRANULEKV_XFORMERS_PREFIX_BACKEND=gather_then_copy
         #   时，调用方要传 False，强制走 vLLM 既有 `gather_cache` 语义。
         #
         # 否则会出现日志里 selected_prefix=gather_then_copy，但 helper 内部又
@@ -3302,7 +3302,7 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
         但在当前 V100 + xFormers prefix fallback 主线里，这条 compose 快路径
         已经表现出更高的不稳定性：
 
-        - BaM runtime direct retrieve 已经完成
+        - GranuleKV runtime direct retrieve 已经完成
         - runtime metadata rebuild 也已经完成
         - 但在真正进入 xFormers fallback 消费前，就可能触发非法访存
 
@@ -3327,7 +3327,7 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
         """
         # 当前 prefix fallback 真正会走到这里的主要环境就是 V100 / sm<80。
         # 这条 compose 快路径在该环境下已经多次触发非法访存，因此先显式关闭，
-        # 避免它继续把 BaM 主线与 xFormers 消费侧问题耦在一起。
+        # 避免它继续把 GranuleKV 主线与 xFormers 消费侧问题耦在一起。
         return False
 
     @staticmethod

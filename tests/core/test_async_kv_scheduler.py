@@ -36,10 +36,10 @@ def _create_scheduler(enable_prefix_caching: bool = False) -> AsyncKVScheduler:
     return AsyncKVScheduler(scheduler_config, cache_config, None)
 
 
-def test_bam_mds_prefix_store_restore_uses_native_computed_semantics(
+def test_granulekv_prefix_store_restore_uses_native_computed_semantics(
         monkeypatch):
-    """BaM MDS prefix 应完成 populate -> SSD read -> 跳过 prefill 闭环。"""
-    monkeypatch.setenv("VLLM_BAM_MDS_PREFIX_ENABLE", "1")
+    """GranuleKV prefix 应完成 populate -> SSD read -> 跳过 prefill 闭环。"""
+    monkeypatch.setenv("VLLM_GRANULEKV_PREFIX_ENABLE", "1")
     scheduler = _create_scheduler(enable_prefix_caching=True)
 
     # populate 请求先按普通 prefill 计算。这里显式推进 computed token，模拟
@@ -79,7 +79,7 @@ def test_bam_mds_prefix_store_restore_uses_native_computed_semantics(
     )
     scheduler.add_seq_group(reuse_group)
 
-    assert scheduler._maybe_start_bam_mds_prefix_restore()
+    assert scheduler._maybe_start_granulekv_prefix_restore()
     restore = scheduler.drain_async_kv_transfers_to_submit()
     assert len(restore) == 1
     assert restore[0].operation == AsyncKVTransferOperation.READ
@@ -116,9 +116,9 @@ def test_bam_mds_prefix_store_restore_uses_native_computed_semantics(
     assert [key.logical_index for key in next_store[0].logical_blocks] == [2]
 
 
-def test_bam_mds_prefix_restore_overlaps_running_compute(monkeypatch):
+def test_granulekv_prefix_restore_overlaps_running_compute(monkeypatch):
     """pending prefix 不应阻止已有 running 请求，也不能提前成为 hit。"""
-    monkeypatch.setenv("VLLM_BAM_MDS_PREFIX_ENABLE", "1")
+    monkeypatch.setenv("VLLM_GRANULEKV_PREFIX_ENABLE", "1")
     scheduler = _create_scheduler(enable_prefix_caching=True)
 
     # 构造一个已写入 CPU/storage prefix cache 的历史请求。
@@ -153,7 +153,7 @@ def test_bam_mds_prefix_restore_overlaps_running_compute(monkeypatch):
         scheduler.add_seq_group(group)
         reuse_groups.append(group)
 
-    assert scheduler._maybe_start_bam_mds_prefix_restore() == 2
+    assert scheduler._maybe_start_granulekv_prefix_restore() == 2
     restores = scheduler.drain_async_kv_transfers_to_submit()
     assert len(restores) == 2
     assert all(request.operation == AsyncKVTransferOperation.READ
@@ -163,11 +163,11 @@ def test_bam_mds_prefix_restore_overlaps_running_compute(monkeypatch):
     for group in reuse_groups:
         seq = group.first_seq
         assert len(scheduler.block_manager.get_block_table(seq)) == 2
-        assert scheduler.block_manager.get_mds_cached_prefix_blocks(
+        assert scheduler.block_manager.get_granulekv_cached_prefix_blocks(
             seq, Device.GPU) == 0
     scheduler.block_manager.block_allocator.mark_blocks_as_computed([])
     for group in reuse_groups:
-        assert scheduler.block_manager.get_mds_cached_prefix_blocks(
+        assert scheduler.block_manager.get_granulekv_cached_prefix_blocks(
             group.first_seq, Device.GPU) == 0
 
     # 即便 prefix read pending，A 仍能计算，且剩余 sequence slot 可以继续
@@ -193,12 +193,12 @@ def test_bam_mds_prefix_restore_overlaps_running_compute(monkeypatch):
             group.first_seq)) == 2
 
 
-def test_bam_mds_hierarchical_prefix_first_window_admission(monkeypatch):
+def test_granulekv_hierarchical_prefix_first_window_admission(monkeypatch):
     """首窗 READY 只准入控制面；全窗 READY 后才能发布并执行。"""
-    monkeypatch.setenv("VLLM_BAM_MDS_PREFIX_ENABLE", "1")
-    monkeypatch.setenv("VLLM_BAM_MDS_HIERARCHICAL_IO_ENABLE", "1")
-    monkeypatch.setenv("VLLM_BAM_MDS_HIERARCHICAL_NUM_LAYERS", "4")
-    monkeypatch.setenv("VLLM_BAM_MDS_HIERARCHICAL_WINDOW_LAYERS", "2")
+    monkeypatch.setenv("VLLM_GRANULEKV_PREFIX_ENABLE", "1")
+    monkeypatch.setenv("VLLM_GRANULEKV_HIERARCHICAL_IO_ENABLE", "1")
+    monkeypatch.setenv("VLLM_GRANULEKV_HIERARCHICAL_NUM_LAYERS", "4")
+    monkeypatch.setenv("VLLM_GRANULEKV_HIERARCHICAL_WINDOW_LAYERS", "2")
     scheduler = _create_scheduler(enable_prefix_caching=True)
 
     prefix_tokens = list(range(8))
@@ -223,7 +223,7 @@ def test_bam_mds_hierarchical_prefix_first_window_admission(monkeypatch):
         block_size=4,
     )
     scheduler.add_seq_group(reuse_group)
-    assert scheduler._maybe_start_bam_mds_prefix_restore() == 1
+    assert scheduler._maybe_start_granulekv_prefix_restore() == 1
     windows = scheduler.drain_async_kv_transfers_to_submit()
     assert [request.layer_range for request in windows] == [(0, 2), (2, 4)]
     assert len({request.reservation_id for request in windows}) == 1
@@ -242,7 +242,7 @@ def test_bam_mds_hierarchical_prefix_first_window_admission(monkeypatch):
         reuse_group.request_id, )
     assert reuse_seq.status == SequenceStatus.WAITING
     assert reuse_group not in scheduler.running
-    assert scheduler.block_manager.get_mds_cached_prefix_blocks(
+    assert scheduler.block_manager.get_granulekv_cached_prefix_blocks(
         reuse_seq, Device.GPU) == 0
 
     scheduler.apply_async_kv_event(
@@ -252,18 +252,18 @@ def test_bam_mds_hierarchical_prefix_first_window_admission(monkeypatch):
     assert not scheduler.get_hierarchical_admitted_seq_group_ids()
     assert reuse_seq.status == SequenceStatus.RUNNING
     assert reuse_group in scheduler.running
-    assert scheduler.block_manager.get_mds_cached_prefix_blocks(
+    assert scheduler.block_manager.get_granulekv_cached_prefix_blocks(
         reuse_seq, Device.GPU) == 2
 
 
-def test_bam_mds_sparse_prefetch_selector_is_profiling_only(monkeypatch):
+def test_granulekv_sparse_prefetch_selector_is_profiling_only(monkeypatch):
     """部分 block restore 目前只做 I/O profiling，不能发布完整 prefix。"""
-    monkeypatch.setenv("VLLM_BAM_MDS_PREFIX_ENABLE", "1")
-    monkeypatch.setenv("VLLM_BAM_MDS_HIERARCHICAL_IO_ENABLE", "1")
-    monkeypatch.setenv("VLLM_BAM_MDS_HIERARCHICAL_NUM_LAYERS", "4")
-    monkeypatch.setenv("VLLM_BAM_MDS_HIERARCHICAL_WINDOW_LAYERS", "2")
-    monkeypatch.setenv("VLLM_BAM_MDS_PREFETCH_BLOCK_SELECTOR", "tail_n")
-    monkeypatch.setenv("VLLM_BAM_MDS_PREFETCH_BLOCK_COUNT", "1")
+    monkeypatch.setenv("VLLM_GRANULEKV_PREFIX_ENABLE", "1")
+    monkeypatch.setenv("VLLM_GRANULEKV_HIERARCHICAL_IO_ENABLE", "1")
+    monkeypatch.setenv("VLLM_GRANULEKV_HIERARCHICAL_NUM_LAYERS", "4")
+    monkeypatch.setenv("VLLM_GRANULEKV_HIERARCHICAL_WINDOW_LAYERS", "2")
+    monkeypatch.setenv("VLLM_GRANULEKV_PREFETCH_BLOCK_SELECTOR", "tail_n")
+    monkeypatch.setenv("VLLM_GRANULEKV_PREFETCH_BLOCK_COUNT", "1")
     scheduler = _create_scheduler(enable_prefix_caching=True)
 
     prefix_tokens = list(range(8))
@@ -287,7 +287,7 @@ def test_bam_mds_sparse_prefetch_selector_is_profiling_only(monkeypatch):
         block_size=4,
     )
     scheduler.add_seq_group(reuse_group)
-    assert scheduler._maybe_start_bam_mds_prefix_restore() == 1
+    assert scheduler._maybe_start_granulekv_prefix_restore() == 1
     windows = scheduler.drain_async_kv_transfers_to_submit()
 
     # tail_n=1 只恢复父 reservation 的最后一个 block。这个请求能验证 MDS
@@ -306,17 +306,17 @@ def test_bam_mds_sparse_prefetch_selector_is_profiling_only(monkeypatch):
 
     assert reuse_seq.status == SequenceStatus.FINISHED_IGNORED
     assert reuse_group not in scheduler.running
-    assert scheduler.block_manager.get_mds_cached_prefix_blocks(
+    assert scheduler.block_manager.get_granulekv_cached_prefix_blocks(
         reuse_seq, Device.GPU) == 0
 
 
-def test_bam_mds_layer_barrier_dispatches_after_first_unit(monkeypatch):
+def test_granulekv_layer_barrier_dispatches_after_first_unit(monkeypatch):
     """Step 4 只提前 dispatch，后续 window 完成前仍不可发布 prefix hash。"""
-    monkeypatch.setenv("VLLM_BAM_MDS_PREFIX_ENABLE", "1")
-    monkeypatch.setenv("VLLM_BAM_MDS_HIERARCHICAL_IO_ENABLE", "1")
-    monkeypatch.setenv("VLLM_BAM_MDS_HIERARCHICAL_NUM_LAYERS", "4")
-    monkeypatch.setenv("VLLM_BAM_MDS_HIERARCHICAL_WINDOW_LAYERS", "2")
-    monkeypatch.setenv("VLLM_BAM_MDS_HIERARCHICAL_LAYER_BARRIER", "1")
+    monkeypatch.setenv("VLLM_GRANULEKV_PREFIX_ENABLE", "1")
+    monkeypatch.setenv("VLLM_GRANULEKV_HIERARCHICAL_IO_ENABLE", "1")
+    monkeypatch.setenv("VLLM_GRANULEKV_HIERARCHICAL_NUM_LAYERS", "4")
+    monkeypatch.setenv("VLLM_GRANULEKV_HIERARCHICAL_WINDOW_LAYERS", "2")
+    monkeypatch.setenv("VLLM_GRANULEKV_HIERARCHICAL_LAYER_BARRIER", "1")
     scheduler = _create_scheduler(enable_prefix_caching=True)
 
     prefix_tokens = list(range(8))
@@ -339,7 +339,7 @@ def test_bam_mds_layer_barrier_dispatches_after_first_unit(monkeypatch):
         block_size=4,
     )
     scheduler.add_seq_group(reuse_group)
-    assert scheduler._maybe_start_bam_mds_prefix_restore() == 1
+    assert scheduler._maybe_start_granulekv_prefix_restore() == 1
     windows = scheduler.drain_async_kv_transfers_to_submit()
 
     scheduler.apply_async_kv_event(
@@ -351,24 +351,24 @@ def test_bam_mds_layer_barrier_dispatches_after_first_unit(monkeypatch):
     assert reuse_seq.status == SequenceStatus.RUNNING
     assert reuse_group in scheduler.running
     assert reuse_seq.get_num_computed_tokens() == len(prefix_tokens)
-    assert scheduler.block_manager.get_mds_cached_prefix_blocks(
+    assert scheduler.block_manager.get_granulekv_cached_prefix_blocks(
         reuse_seq, Device.GPU) == 0
 
     scheduler.apply_async_kv_event(
         AsyncKVTransferEvent(windows[1].request_id,
                              AsyncKVTransferState.READY))
     scheduler.complete_ready_async_kv_transfers()
-    assert scheduler.block_manager.get_mds_cached_prefix_blocks(
+    assert scheduler.block_manager.get_granulekv_cached_prefix_blocks(
         reuse_seq, Device.GPU) == 2
     assert scheduler.running.count(reuse_group) == 1
 
 
-def test_bam_mds_hierarchical_full_hit_recomputes_only_last_token(monkeypatch):
+def test_granulekv_hierarchical_full_hit_recomputes_only_last_token(monkeypatch):
     """完整 block hit 仍须保留最后一个 prompt token 给模型执行。"""
-    monkeypatch.setenv("VLLM_BAM_MDS_PREFIX_ENABLE", "1")
-    monkeypatch.setenv("VLLM_BAM_MDS_HIERARCHICAL_IO_ENABLE", "1")
-    monkeypatch.setenv("VLLM_BAM_MDS_HIERARCHICAL_NUM_LAYERS", "4")
-    monkeypatch.setenv("VLLM_BAM_MDS_HIERARCHICAL_WINDOW_LAYERS", "2")
+    monkeypatch.setenv("VLLM_GRANULEKV_PREFIX_ENABLE", "1")
+    monkeypatch.setenv("VLLM_GRANULEKV_HIERARCHICAL_IO_ENABLE", "1")
+    monkeypatch.setenv("VLLM_GRANULEKV_HIERARCHICAL_NUM_LAYERS", "4")
+    monkeypatch.setenv("VLLM_GRANULEKV_HIERARCHICAL_WINDOW_LAYERS", "2")
     scheduler = _create_scheduler(enable_prefix_caching=True)
 
     prompt_tokens = list(range(8))
@@ -389,7 +389,7 @@ def test_bam_mds_hierarchical_full_hit_recomputes_only_last_token(monkeypatch):
     reuse_seq, reuse_group = create_dummy_prompt(
         "95", prompt_tokens=prompt_tokens, block_size=4)
     scheduler.add_seq_group(reuse_group)
-    assert scheduler._maybe_start_bam_mds_prefix_restore() == 1
+    assert scheduler._maybe_start_granulekv_prefix_restore() == 1
     windows = scheduler.drain_async_kv_transfers_to_submit()
     for request in windows:
         scheduler.apply_async_kv_event(
@@ -403,12 +403,12 @@ def test_bam_mds_hierarchical_full_hit_recomputes_only_last_token(monkeypatch):
     assert scheduled.scheduled_seq_groups[0].token_chunk_size == 1
 
 
-def test_bam_mds_hierarchical_abort_waits_for_all_windows(monkeypatch):
+def test_granulekv_hierarchical_abort_waits_for_all_windows(monkeypatch):
     """首窗准入后 abort 也必须等待其余 DMA，不能提前释放 target。"""
-    monkeypatch.setenv("VLLM_BAM_MDS_PREFIX_ENABLE", "1")
-    monkeypatch.setenv("VLLM_BAM_MDS_HIERARCHICAL_IO_ENABLE", "1")
-    monkeypatch.setenv("VLLM_BAM_MDS_HIERARCHICAL_NUM_LAYERS", "4")
-    monkeypatch.setenv("VLLM_BAM_MDS_HIERARCHICAL_WINDOW_LAYERS", "2")
+    monkeypatch.setenv("VLLM_GRANULEKV_PREFIX_ENABLE", "1")
+    monkeypatch.setenv("VLLM_GRANULEKV_HIERARCHICAL_IO_ENABLE", "1")
+    monkeypatch.setenv("VLLM_GRANULEKV_HIERARCHICAL_NUM_LAYERS", "4")
+    monkeypatch.setenv("VLLM_GRANULEKV_HIERARCHICAL_WINDOW_LAYERS", "2")
     scheduler = _create_scheduler(enable_prefix_caching=True)
 
     prefix_tokens = list(range(8))
@@ -433,7 +433,7 @@ def test_bam_mds_hierarchical_abort_waits_for_all_windows(monkeypatch):
     )
     free_gpu_before_restore = scheduler.block_manager.get_num_free_gpu_blocks()
     scheduler.add_seq_group(reuse_group)
-    assert scheduler._maybe_start_bam_mds_prefix_restore() == 1
+    assert scheduler._maybe_start_granulekv_prefix_restore() == 1
     windows = scheduler.drain_async_kv_transfers_to_submit()
 
     scheduler.apply_async_kv_event(
@@ -464,10 +464,10 @@ def test_bam_mds_hierarchical_abort_waits_for_all_windows(monkeypatch):
         (True, AsyncKVTransferState.ERROR),
     ],
 )
-def test_bam_mds_prefix_restore_abort_releases_pending_transaction(
+def test_granulekv_prefix_restore_abort_releases_pending_transaction(
         monkeypatch, abort_first, terminal_state):
     """ERROR/abort 都不能发布 hash，也不能泄漏 pending target。"""
-    monkeypatch.setenv("VLLM_BAM_MDS_PREFIX_ENABLE", "1")
+    monkeypatch.setenv("VLLM_GRANULEKV_PREFIX_ENABLE", "1")
     scheduler = _create_scheduler(enable_prefix_caching=True)
 
     # 先生成只存在于 SSD 层的两个完整 prefix block。这里沿用真实生命周期：
@@ -495,7 +495,7 @@ def test_bam_mds_prefix_restore_abort_releases_pending_transaction(
     )
     free_gpu_before_restore = scheduler.block_manager.get_num_free_gpu_blocks()
     scheduler.add_seq_group(reuse_group)
-    assert scheduler._maybe_start_bam_mds_prefix_restore() == 1
+    assert scheduler._maybe_start_granulekv_prefix_restore() == 1
     restore = scheduler.drain_async_kv_transfers_to_submit()[0]
     assert len(scheduler.block_manager.get_block_table(reuse_seq)) == 2
     assert scheduler.block_manager.get_num_free_gpu_blocks() == (
@@ -518,7 +518,7 @@ def test_bam_mds_prefix_restore_abort_releases_pending_transaction(
     assert reuse_seq.seq_id not in scheduler.block_manager.block_tables
     assert scheduler.block_manager.get_num_free_gpu_blocks() == (
         free_gpu_before_restore)
-    assert scheduler.block_manager.get_mds_cached_prefix_blocks(
+    assert scheduler.block_manager.get_granulekv_cached_prefix_blocks(
         reuse_seq, Device.GPU) == 0
     assert not scheduler.block_manager._prefix_restore_reservations
     assert not scheduler.prefix_loading
@@ -526,10 +526,10 @@ def test_bam_mds_prefix_restore_abort_releases_pending_transaction(
     assert not scheduler.has_active_async_kv_transfer()
 
 
-def test_bam_mds_prefix_restore_does_not_bypass_blocked_priority_head(
+def test_granulekv_prefix_restore_does_not_bypass_blocked_priority_head(
         monkeypatch):
     """高优先级 restore 暂不可分配时，后续请求不能抢先预留 HBM。"""
-    monkeypatch.setenv("VLLM_BAM_MDS_PREFIX_ENABLE", "1")
+    monkeypatch.setenv("VLLM_GRANULEKV_PREFIX_ENABLE", "1")
     scheduler = _create_scheduler(enable_prefix_caching=True)
     scheduler.scheduler_config.policy = "priority"
 
@@ -550,13 +550,13 @@ def test_bam_mds_prefix_restore_does_not_bypass_blocked_priority_head(
         raise BlockAllocator.NoFreeBlocksError()
 
     monkeypatch.setattr(scheduler.block_manager,
-                        "get_mds_cached_prefix_block_counts",
+                        "get_granulekv_cached_prefix_block_counts",
                         lambda seq: (2, 0))
     monkeypatch.setattr(scheduler.block_manager,
-                        "reserve_mds_prefix_restore", fail_reservation)
+                        "reserve_granulekv_prefix_restore", fail_reservation)
 
     scheduler._sort_waiting_for_prefix_restore()
-    assert scheduler._maybe_start_bam_mds_prefix_restore() == 0
+    assert scheduler._maybe_start_granulekv_prefix_restore() == 0
     assert attempted_request_ids == [higher_group.request_id]
     assert list(scheduler.waiting) == [higher_group, lower_group]
     assert not scheduler.prefix_loading
@@ -782,7 +782,7 @@ def test_async_swap_out_keeps_gpu_blocks_until_write_ready():
     assert list(scheduler.swapped) == [seq_group]
 
 
-def test_async_writes_use_multiple_mds_slots():
+def test_async_writes_use_multiple_granulekv_slots():
     """多笔 write 应在同一轮按 request identity 独立激活和完成。"""
     scheduler = _create_scheduler()
     groups = []

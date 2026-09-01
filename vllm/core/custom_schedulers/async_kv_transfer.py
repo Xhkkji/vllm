@@ -2,7 +2,7 @@
 
 """异步 KV read/write 共用的后端无关 transfer 状态机。
 
-这个模块只描述 Scheduler 与 Worker/MDS 之间的 I/O 控制面协议，不包含
+这个模块只描述 Scheduler 与 Worker/GranuleKV 之间的 I/O 控制面协议，不包含
 prefill/decode admission、victim 选择或 block residency 策略。把它从
 ``vllm.core.scheduler_policy`` 拆出来，是为了让后续自定义调度器可以复用
 同一套 transfer 生命周期，而不继续把新策略堆在 vLLM 原生 scheduler 顶层。
@@ -29,7 +29,7 @@ class AsyncKVTransferPriority(Enum):
     """后端无关的最小 I/O 优先级。
 
     restore read 位于请求恢复关键路径；write 已经拥有 GPU source，可以
-    留在队列中等待。应用层以后可以改变入队顺序，但不需要修改 Worker/MDS。
+留在队列中等待。应用层以后可以改变入队顺序，但不需要修改 Worker/GranuleKV。
     """
 
     CRITICAL_READ = 0
@@ -57,7 +57,7 @@ class AsyncKVTransferRequest:
     logical_blocks: Tuple[LogicalBlockKey, ...]
     priority: AsyncKVTransferPriority
     # ``None`` 保持原有“搬完整 block 的全部层”语义。层级 restore 才携带
-    # 左闭右开的本地 layer range；Worker/MDS 不解释 scheduler plan。
+    # 左闭右开的本地 layer range；Worker/GranuleKV 不解释 scheduler plan。
     layer_range: Optional[Tuple[int, int]] = None
     # plan/unit identity 只描述预授权关系。普通 swap 为 None；layer-window
     # restore 使用它在 Worker 中一次 stage 全计划、随后按模型进度激活 unit。
@@ -71,7 +71,7 @@ class AsyncKVTransferRequest:
     # 完整 prefix 的 logical block 数，用于 residency 区分“已在 HBM”与
     # “本次从 SSD 恢复”的集合。None 表示普通 transfer 不启用 consumer。
     consumer_num_blocks: Optional[int] = None
-    # False 表示这次 RPC 只把 descriptor template 放进 Worker，不占用 MDS
+    # False 表示这次 RPC 只把 descriptor template 放进 Worker，不占用 GranuleKV
     # request slot。真正激活时 Worker 会回传 PENDING，再由 Scheduler 更新状态。
     activate_on_submit: bool = True
 
@@ -170,7 +170,7 @@ class AsyncKVTransferQueue:
             Sequence[Optional[Sequence[int]]]] = None,
         consumer_num_blocks: Optional[int] = None,
     ) -> AsyncKVTransferRequest:
-        """登记 reservation，但暂不占用 Worker/MDS request slot。"""
+        """登记 reservation，但暂不占用 Worker/GranuleKV request slot。"""
         if priority is None:
             priority = (AsyncKVTransferPriority.CRITICAL_READ
                         if operation == AsyncKVTransferOperation.READ else

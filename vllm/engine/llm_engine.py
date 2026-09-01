@@ -74,8 +74,8 @@ _O = TypeVar("_O", RequestOutput, PoolingRequestOutput)
 _R = TypeVar("_R", default=Any)
 
 
-def _bam_nvtx_trace_enabled() -> bool:
-    value = os.environ.get("VLLM_BAM_NVTX_TRACE")
+def _granulekv_nvtx_trace_enabled() -> bool:
+    value = os.environ.get("VLLM_GRANULEKV_NVTX_TRACE")
     return value is not None and value.strip().lower() in {
         "1",
         "true",
@@ -85,9 +85,9 @@ def _bam_nvtx_trace_enabled() -> bool:
 
 
 @contextmanager
-def _bam_nvtx_range(name: str):
+def _granulekv_nvtx_range(name: str):
     """按需标记 vLLM engine 侧调度区间，默认关闭。"""
-    if not _bam_nvtx_trace_enabled() or not torch.cuda.is_available():
+    if not _granulekv_nvtx_trace_enabled() or not torch.cuda.is_available():
         yield
         return
     torch.cuda.nvtx.range_push(name)
@@ -463,7 +463,7 @@ class LLMEngine:
             if self.parallel_config.pipeline_parallel_size != 1:
                 raise ValueError(
                     "layer working-set validation currently requires PP=1")
-            num_layers = envs.VLLM_BAM_MDS_HIERARCHICAL_NUM_LAYERS
+            num_layers = envs.VLLM_GRANULEKV_HIERARCHICAL_NUM_LAYERS
             # profiler 给出的 block 数对应“全部层常驻”。工作集只分配少量
             # regions，因此在相同 HBM 预算内可扩大每个 region 的 block 维度。
             physical_capacity = (profiled_num_gpu_blocks * num_layers
@@ -1330,7 +1330,7 @@ class LLMEngine:
     def _merge_async_kv_worker_events(worker_results: List[Any]) -> List[Any]:
         """合并各 Worker 返回的异步 KV 事件。
 
-        Phase 4A resident MDS 当前强制 TP=1、PP=1，正常情况下这里只会
+        Phase 4A resident GranuleKV 当前强制 TP=1、PP=1，正常情况下这里只会
         收到一份结果。保留一致性检查是为了将来扩展多个 Worker 时，避免
         同一个 request_id 被重复应用，或者不同 rank 对完成状态产生分歧。
         """
@@ -1487,7 +1487,7 @@ class LLMEngine:
         if not self._has_remaining_steps(
                 seq_group_metadata_list
         ) and not self._skip_scheduling_next_step:
-            with _bam_nvtx_range("vllm_engine_schedule"):
+            with _granulekv_nvtx_range("vllm_engine_schedule"):
                 # Schedule iteration
                 (seq_group_metadata_list, scheduler_outputs,
                  allow_async_output_proc
@@ -1582,7 +1582,7 @@ class LLMEngine:
                         )
 
             try:
-                with _bam_nvtx_range("vllm_engine_execute_model"):
+                with _granulekv_nvtx_range("vllm_engine_execute_model"):
                     outputs = self.model_executor.execute_model(
                         execute_model_req=execute_model_req)
                 self._skip_scheduling_next_step = False
@@ -1597,7 +1597,7 @@ class LLMEngine:
                     seq_group_metadata_list=seq_group_metadata_list,
                     allow_async_output_proc=allow_async_output_proc,
                 )
-                # BaM/LMCache deferred retrieve 会在 I/O 未 ready 时跨多个
+                # GranuleKV/LMCache deferred retrieve 会在 I/O 未 ready 时跨多个
                 # engine iteration 重试同一批调度结果。这里是热路径，默认不再
                 # 用 info 逐轮打印，避免日志 I/O 影响性能测试；需要排查调度
                 # 行为时可打开 DEBUG 日志级别。

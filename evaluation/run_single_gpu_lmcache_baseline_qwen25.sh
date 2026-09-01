@@ -19,41 +19,6 @@ LMCACHE_USE_EXPERIMENTAL_VALUE="${LMCACHE_USE_EXPERIMENTAL:-True}"
 LMCACHE_LOCAL_CPU_VALUE="${LMCACHE_LOCAL_CPU:-False}"
 LMCACHE_LOCAL_DISK_VALUE="${LMCACHE_LOCAL_DISK:-/home/xhk/llm-inference/lmcache_local_disk/}"
 LMCACHE_MAX_LOCAL_DISK_SIZE_VALUE="${LMCACHE_MAX_LOCAL_DISK_SIZE:-20}"
-VLLM_BAM_LMCACHE_SHADOW_ENABLE_VALUE="${VLLM_BAM_LMCACHE_SHADOW_ENABLE:-0}"
-VLLM_BAM_LMCACHE_SHADOW_CHUNKS_VALUE="${VLLM_BAM_LMCACHE_SHADOW_CHUNKS:-1024}"
-VLLM_BAM_IMPORT_PATH_VALUE="${VLLM_BAM_IMPORT_PATH:-/home/xhk/llm-inference/BaM_IOStack/gids_module}"
-BAM_LIB_DIR_VALUE="${BAM_LIB_DIR:-/home/xhk/llm-inference/BaM_IOStack/bam/build/lib}"
-
-# 只有在显式打开 BaM shadow 时才自动提权，避免影响普通 baseline。
-if [[ "${VLLM_BAM_LMCACHE_SHADOW_ENABLE_VALUE}" == "1" && "${EUID}" -ne 0 ]]; then
-  exec sudo env \
-    "MODEL_PATH=${MODEL_PATH}" \
-    "CUDA_DEVICE=${CUDA_DEVICE}" \
-    "MAX_MODEL_LEN=${MAX_MODEL_LEN}" \
-    "GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION}" \
-    "LMCACHE_CHUNK_SIZE_VALUE=${LMCACHE_CHUNK_SIZE_VALUE}" \
-    "LMCACHE_MAX_LOCAL_CPU_SIZE_VALUE=${LMCACHE_MAX_LOCAL_CPU_SIZE_VALUE}" \
-    "PROMPT_REPEAT=${PROMPT_REPEAT}" \
-    "MAX_TOKENS=${MAX_TOKENS}" \
-    "LOG_FILE=${LOG_FILE}" \
-    "LMCACHE_REPO_PATH=${LMCACHE_REPO_PATH}" \
-    "PYTHON_BIN=${PYTHON_BIN}" \
-    "DTYPE=${DTYPE}" \
-    "ENFORCE_EAGER=${ENFORCE_EAGER}" \
-    "ENABLE_CHUNKED_PREFILL=${ENABLE_CHUNKED_PREFILL}" \
-    "LMCACHE_USE_EXPERIMENTAL=${LMCACHE_USE_EXPERIMENTAL_VALUE}" \
-    "LMCACHE_LOCAL_CPU=${LMCACHE_LOCAL_CPU_VALUE}" \
-    "LMCACHE_LOCAL_DISK=${LMCACHE_LOCAL_DISK_VALUE}" \
-    "LMCACHE_MAX_LOCAL_DISK_SIZE=${LMCACHE_MAX_LOCAL_DISK_SIZE_VALUE}" \
-    "VLLM_BAM_LMCACHE_SHADOW_ENABLE=${VLLM_BAM_LMCACHE_SHADOW_ENABLE_VALUE}" \
-    "VLLM_BAM_LMCACHE_SHADOW_CHUNKS=${VLLM_BAM_LMCACHE_SHADOW_CHUNKS_VALUE}" \
-    "VLLM_BAM_IMPORT_PATH=${VLLM_BAM_IMPORT_PATH_VALUE}" \
-    "BAM_LIB_DIR=${BAM_LIB_DIR_VALUE}" \
-    "LD_LIBRARY_PATH=${BAM_LIB_DIR_VALUE}:${LD_LIBRARY_PATH:-}" \
-    "PYTHONPATH=${PYTHONPATH:-}" \
-    bash "$0" "$@"
-fi
-
 if [[ "${LMCACHE_LOCAL_DISK_VALUE}" == file://* ]]; then
   LMCACHE_LOCAL_DISK_VALUE="${LMCACHE_LOCAL_DISK_VALUE#file://}"
 fi
@@ -67,11 +32,6 @@ export LMCACHE_CHUNK_SIZE="${LMCACHE_CHUNK_SIZE_VALUE}"
 export LMCACHE_LOCAL_CPU="${LMCACHE_LOCAL_CPU_VALUE}"
 export LMCACHE_MAX_LOCAL_CPU_SIZE="${LMCACHE_MAX_LOCAL_CPU_SIZE_VALUE}"
 export LMCACHE_MAX_LOCAL_DISK_SIZE="${LMCACHE_MAX_LOCAL_DISK_SIZE_VALUE}"
-export VLLM_BAM_LMCACHE_SHADOW_ENABLE="${VLLM_BAM_LMCACHE_SHADOW_ENABLE_VALUE}"
-export VLLM_BAM_LMCACHE_SHADOW_CHUNKS="${VLLM_BAM_LMCACHE_SHADOW_CHUNKS_VALUE}"
-export VLLM_BAM_IMPORT_PATH="${VLLM_BAM_IMPORT_PATH_VALUE}"
-export LD_LIBRARY_PATH="${BAM_LIB_DIR_VALUE}:${LD_LIBRARY_PATH:-}"
-
 if [[ -n "${LMCACHE_LOCAL_DISK_VALUE}" ]]; then
   export LMCACHE_LOCAL_DISK="${LMCACHE_LOCAL_DISK_VALUE}"
 else
@@ -93,10 +53,6 @@ echo "[single-gpu-lmcache-baseline] lmcache_use_experimental=${LMCACHE_USE_EXPER
 echo "[single-gpu-lmcache-baseline] lmcache_local_cpu=${LMCACHE_LOCAL_CPU_VALUE}"
 echo "[single-gpu-lmcache-baseline] lmcache_local_disk=${LMCACHE_LOCAL_DISK_VALUE}"
 echo "[single-gpu-lmcache-baseline] lmcache_max_local_disk_size=${LMCACHE_MAX_LOCAL_DISK_SIZE_VALUE}"
-echo "[single-gpu-lmcache-baseline] vllm_bam_lmcache_shadow_enable=${VLLM_BAM_LMCACHE_SHADOW_ENABLE_VALUE}"
-echo "[single-gpu-lmcache-baseline] vllm_bam_lmcache_shadow_chunks=${VLLM_BAM_LMCACHE_SHADOW_CHUNKS_VALUE}"
-echo "[single-gpu-lmcache-baseline] vllm_bam_import_path=${VLLM_BAM_IMPORT_PATH_VALUE}"
-echo "[single-gpu-lmcache-baseline] bam_lib_dir=${BAM_LIB_DIR_VALUE}"
 echo "[single-gpu-lmcache-baseline] prompt_repeat=${PROMPT_REPEAT}"
 echo "[single-gpu-lmcache-baseline] max_tokens=${MAX_TOKENS}"
 echo "[single-gpu-lmcache-baseline] log_file=${LOG_FILE}"
@@ -164,7 +120,7 @@ def build_llm():
 
 shared_prompt = "请介绍一下 LMCache、KV cache 和单卡 baseline 的作用。" * prompt_repeat
 first_prompt = [shared_prompt + "然后请用三句话介绍 Qwen2.5-7B-Instruct。"]
-second_prompt = [shared_prompt + "然后请说明为什么后续可以在这个 LMCache baseline 上接入 BaM。"]
+second_prompt = [shared_prompt + "然后请说明原生 LMCache SSD baseline 的读回作用。"]
 
 sampling_params = SamplingParams(
     temperature=0.0,

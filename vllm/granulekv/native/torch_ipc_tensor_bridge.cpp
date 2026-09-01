@@ -35,15 +35,9 @@ torch::Tensor tensor_from_cuda_ptr(std::uint64_t device_ptr,
   const auto options = torch::TensorOptions()
                            .dtype(parse_dtype(dtype))
                            .device(torch::Device(torch::kCUDA, device_index));
-
-  // Tensor 只是 daemon-owned allocation 的 client view。no-op deleter 保证
-  // Tensor 析构不会越权 cudaFree；owner 最终由 BaM MDS service 释放。
   auto no_op_deleter = [](void *) {};
-  return torch::from_blob(reinterpret_cast<void *>(device_ptr),
-                          sizes,
-                          strides,
-                          no_op_deleter,
-                          options);
+  return torch::from_blob(reinterpret_cast<void *>(device_ptr), sizes,
+                          strides, no_op_deleter, options);
 }
 
 }  // namespace
@@ -52,11 +46,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module)
 {
   module.doc() =
       "Wrap a daemon-owned CUDA IPC pointer as a non-owning PyTorch Tensor";
-  module.def("tensor_from_cuda_ptr",
-             &tensor_from_cuda_ptr,
-             pybind11::arg("device_ptr"),
-             pybind11::arg("sizes"),
-             pybind11::arg("strides"),
-             pybind11::arg("dtype"),
+  module.def("tensor_from_cuda_ptr", &tensor_from_cuda_ptr,
+             pybind11::arg("device_ptr"), pybind11::arg("sizes"),
+             pybind11::arg("strides"), pybind11::arg("dtype"),
              pybind11::arg("device_index") = 0);
 }

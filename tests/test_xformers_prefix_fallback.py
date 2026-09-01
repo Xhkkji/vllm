@@ -187,7 +187,7 @@ def test_dense_prefix_attachment_no_longer_overrides_paged_cache_mainline():
         total_context_tokens=4,
     )
     prefill_meta = SimpleNamespace(
-        _bam_dense_prefix_chunk_tensors=(
+        _granulekv_dense_prefix_chunk_tensors=(
             torch.zeros(2, 1, 4, 8, dtype=torch.float16),
         ),
     )
@@ -236,8 +236,8 @@ def test_dense_prefix_workspace_materialize_writes_current_layer_prefix():
         dtype=torch.float32,
     )
     prefill_meta = SimpleNamespace(
-        _bam_dense_prefix_chunk_tensors=(chunk0, chunk1),
-        _bam_dense_prefix_context_tokens=3,
+        _granulekv_dense_prefix_chunk_tensors=(chunk0, chunk1),
+        _granulekv_dense_prefix_context_tokens=3,
     )
     plan = SimpleNamespace(
         query_lens=(2, ),

@@ -43,7 +43,7 @@ class _RestoreState:
 class HierarchicalRestoreController:
     """聚合多个 unit completion，但不管理 block/sequence 所有权。
 
-    一个父 reservation 会产生多个 MDS 子请求。只有全部子请求成功后，
+    一个父 reservation 会产生多个 GranuleKV 子请求。只有全部子请求成功后，
     scheduler 才能发布 block hash；任一子请求失败或用户取消时，也必须等
     所有 active DMA 到达终态后才能 abort target。这个类集中维护该屏障，
     避免错误处理逻辑散落在 scheduler 的 ready/error 两条分支中。

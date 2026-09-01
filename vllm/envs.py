@@ -43,71 +43,38 @@ if TYPE_CHECKING:
     VLLM_CPU_KVCACHE_SPACE: int = 0
     VLLM_V0_SWAP_TRACE: bool = False
     VLLM_LMCACHE_SEND_DECODE_KV: bool = False
-    VLLM_BAM_SHADOW_ENABLE: bool = False
-    VLLM_BAM_SWAPIN_ENABLE: bool = False
-    VLLM_BAM_SWAPIN_VERIFY: bool = False
-    VLLM_BAM_SWAPIN_VERIFY_BLOCKS: int = 0
-    VLLM_BAM_LMCACHE_SHADOW_ENABLE: bool = False
-    VLLM_BAM_LMCACHE_PREFER_LOAD_ENABLE: bool = False
-    VLLM_BAM_LMCACHE_SHADOW_CHUNKS: int = 1024
-    VLLM_BAM_LMCACHE_READ_MODE: str = "sync"
-    VLLM_BAM_LMCACHE_BASE_ROW_OFFSET: int = 0
-    VLLM_BAM_KV_FAST_PATH: bool = False
-    VLLM_BAM_GPU_INITIATED_PREFETCH: bool = False
-    VLLM_BAM_DIRECT_KVSTORE_ENABLE: bool = False
-    VLLM_BAM_DIRECT_READ_MODE: str = "direct"
-    VLLM_BAM_SYNC_CACHE_SIZE_MB: int = 64
-    VLLM_BAM_MDS_ENABLE: bool = False
-    VLLM_BAM_MDS_IOSTACK_ROOT: Optional[str] = None
-    VLLM_BAM_MDS_CONTROL_DIR: Optional[str] = None
-    VLLM_BAM_MDS_CUDA_IPC_LIBRARY: Optional[str] = None
-    VLLM_BAM_MDS_TORCH_BRIDGE_DIR: Optional[str] = None
-    VLLM_BAM_MDS_TIMEOUT_SECONDS: float = 120.0
-    VLLM_BAM_MDS_MAX_IN_FLIGHT: int = 4
-    VLLM_BAM_MDS_SERVICE_LIFETIME: str = "resident"
-    VLLM_BAM_MDS_IDLE_STOP_DELAY_MS: int = 0
-    VLLM_BAM_MDS_PREFIX_ENABLE: bool = False
-    VLLM_BAM_MDS_HIERARCHICAL_IO_ENABLE: bool = False
-    VLLM_BAM_MDS_HIERARCHICAL_NUM_LAYERS: int = 0
-    VLLM_BAM_MDS_HIERARCHICAL_WINDOW_LAYERS: int = 0
-    VLLM_BAM_MDS_HIERARCHICAL_LAYER_BARRIER: bool = False
-    VLLM_BAM_MDS_HIERARCHICAL_ROLLING_ENABLE: bool = False
-    VLLM_BAM_MDS_HIERARCHICAL_LEAD_WINDOWS: int = 1
-    VLLM_BAM_MDS_HIERARCHICAL_MAX_LEAD_WINDOWS: int = 1
-    VLLM_BAM_MDS_HIERARCHICAL_TARGET_SLACK_MS: float = 0.0
-    VLLM_BAM_MDS_LAYER_WORKING_SET_ENABLE: bool = False
-    VLLM_BAM_MDS_PREFETCH_BLOCK_SELECTOR: str = "dense"
-    VLLM_BAM_MDS_PREFETCH_BLOCK_COUNT: int = 0
-    VLLM_BAM_MDS_PREFETCH_BLOCK_STRIDE: int = 1
-    VLLM_BAM_DIRECT_PLACEMENT: bool = False
-    VLLM_BAM_DIRECT_PLACEMENT_IMPL: str = "lmcache"
-    VLLM_BAM_DIRECT_PLACEMENT_RUNTIME_ONE_COPY: bool = False
-    VLLM_BAM_DIRECT_PLACEMENT_REQUIRE_RUNTIME_ONE_COPY: bool = False
-    VLLM_BAM_DIRECT_PLACEMENT_DEFER_RUNTIME: bool = False
-    VLLM_BAM_DIRECT_PLACEMENT_DEFER_MIN_POLLS: int = 0
-    VLLM_BAM_RUNTIME_IDLE_STOP_SECONDS: float = 0.0
-    VLLM_BAM_XFORMERS_PREFIX_FALLBACK_PROFILE: bool = False
-    VLLM_BAM_XFORMERS_PREFIX_BACKEND: str = "auto"
-    VLLM_BAM_XFORMERS_QUERY_BACKEND: str = "auto"
-    VLLM_BAM_XFORMERS_VERIFY_PREFIX_GATHER: bool = False
-    VLLM_BAM_XFORMERS_VERIFY_ATTENTION_OUTPUT: bool = False
-    VLLM_BAM_XFORMERS_VERIFY_ATTENTION_OUTPUT_FULL: bool = False
-    VLLM_BAM_XFORMERS_VERIFY_ATTENTION_OUTPUT_FULL_LAYER: int = 0
-    VLLM_BAM_LOGITS_SEMANTIC_DEBUG: bool = False
-    VLLM_BAM_IMPORT_PATH: Optional[str] = None
-    VLLM_BAM_CACHE_SIZE_MB: int = 512
-    VLLM_BAM_NUM_SSD: int = 1
-    VLLM_BAM_SSD_LIST: Optional[str] = None
-    VLLM_BAM_CTRL_IDX: int = 0
-    VLLM_GDS_LMCACHE_SHADOW_ENABLE: bool = False
-    VLLM_GDS_LMCACHE_PREFER_LOAD_ENABLE: bool = False
-    VLLM_GDS_LMCACHE_PATH: str = "/tmp/vllm-bam-lmcache-gds"
-    VLLM_GDS_LMCACHE_USE_GDS: bool = True
-    VLLM_GDS_LMCACHE_USE_DIRECT_IO: bool = True
-    VLLM_GDS_LMCACHE_DEVICE: Optional[str] = None
-    VLLM_GDS_LMCACHE_FMT: str = "KV_2LTD"
-    VLLM_GDS_LMCACHE_USE_REGISTERED_BUFFER: bool = False
-    VLLM_GDS_LMCACHE_REGISTERED_BUFFER_MB: int = 0
+    VLLM_GRANULEKV_ENABLE: bool = False
+    VLLM_GRANULEKV_IOSTACK_ROOT: Optional[str] = None
+    VLLM_GRANULEKV_CONTROL_DIR: Optional[str] = None
+    VLLM_GRANULEKV_CUDA_IPC_LIBRARY: Optional[str] = None
+    VLLM_GRANULEKV_TORCH_BRIDGE_DIR: Optional[str] = None
+    VLLM_GRANULEKV_TIMEOUT_SECONDS: float = 120.0
+    VLLM_GRANULEKV_MAX_IN_FLIGHT: int = 4
+    VLLM_GRANULEKV_SERVICE_LIFETIME: str = "resident"
+    VLLM_GRANULEKV_SERVICE_LOW_PRIORITY: bool = False
+    VLLM_GRANULEKV_IDLE_STOP_DELAY_MS: int = 0
+    VLLM_GRANULEKV_PREFIX_ENABLE: bool = False
+    VLLM_GRANULEKV_HIERARCHICAL_IO_ENABLE: bool = False
+    VLLM_GRANULEKV_HIERARCHICAL_NUM_LAYERS: int = 0
+    VLLM_GRANULEKV_HIERARCHICAL_WINDOW_LAYERS: int = 0
+    VLLM_GRANULEKV_HIERARCHICAL_LAYER_BARRIER: bool = False
+    VLLM_GRANULEKV_HIERARCHICAL_ROLLING_ENABLE: bool = False
+    VLLM_GRANULEKV_HIERARCHICAL_LEAD_WINDOWS: int = 1
+    VLLM_GRANULEKV_HIERARCHICAL_MAX_LEAD_WINDOWS: int = 1
+    VLLM_GRANULEKV_HIERARCHICAL_TARGET_SLACK_MS: float = 0.0
+    VLLM_GRANULEKV_LAYER_WORKING_SET_ENABLE: bool = False
+    VLLM_GRANULEKV_TRUST_PREPOPULATED_PREFIX: bool = False
+    VLLM_GRANULEKV_TRUSTED_PREFIX_BLOCKS: int = 0
+    VLLM_GRANULEKV_PREFETCH_BLOCK_SELECTOR: str = "dense"
+    VLLM_GRANULEKV_PREFETCH_BLOCK_COUNT: int = 0
+    VLLM_GRANULEKV_PREFETCH_BLOCK_STRIDE: int = 1
+    VLLM_GRANULEKV_XFORMERS_PREFIX_FALLBACK_PROFILE: bool = False
+    VLLM_GRANULEKV_XFORMERS_PREFIX_BACKEND: str = "auto"
+    VLLM_GRANULEKV_XFORMERS_QUERY_BACKEND: str = "auto"
+    VLLM_GRANULEKV_XFORMERS_VERIFY_PREFIX_GATHER: bool = False
+    VLLM_GRANULEKV_XFORMERS_VERIFY_ATTENTION_OUTPUT: bool = False
+    VLLM_GRANULEKV_XFORMERS_VERIFY_ATTENTION_OUTPUT_FULL: bool = False
+    VLLM_GRANULEKV_XFORMERS_VERIFY_ATTENTION_OUTPUT_FULL_LAYER: int = 0
     VLLM_CPU_OMP_THREADS_BIND: str = ""
     VLLM_CPU_MOE_PREPACK: bool = True
     VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
@@ -440,231 +407,62 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_LMCACHE_SEND_DECODE_KV":
     lambda: bool(int(os.getenv("VLLM_LMCACHE_SEND_DECODE_KV", "0"))),
 
-    # 是否在 V0 swap_out 后额外执行一次 GPU -> SSD(BaM) 影子写出。
-    "VLLM_BAM_SHADOW_ENABLE":
-    lambda: bool(int(os.getenv("VLLM_BAM_SHADOW_ENABLE", "0"))),
-
-    # 是否在 V0 swap_in 时优先从 BaM 读回 KV block。
-    "VLLM_BAM_SWAPIN_ENABLE":
-    lambda: bool(int(os.getenv("VLLM_BAM_SWAPIN_ENABLE", "0"))),
-
-    # 是否在 BaM swap_in 后校验恢复出的 block 与 cpu_cache 参考值一致。
-    "VLLM_BAM_SWAPIN_VERIFY":
-    lambda: bool(int(os.getenv("VLLM_BAM_SWAPIN_VERIFY", "0"))),
-
-    # 校验 block 数。<=0 表示全量校验，>0 表示仅校验当前 batch 前 N 个映射。
-    "VLLM_BAM_SWAPIN_VERIFY_BLOCKS":
-    lambda: int(os.getenv("VLLM_BAM_SWAPIN_VERIFY_BLOCKS", "0")),
-
-    # 是否在 LMCache V0 的 put 路径上额外做一份 BaM shadow store。
-    "VLLM_BAM_LMCACHE_SHADOW_ENABLE":
-    lambda: bool(int(os.getenv("VLLM_BAM_LMCACHE_SHADOW_ENABLE", "0"))),
-
-    # 是否在 LMCache V0 的 get 路径上优先从 BaM 读取，失败再回退原始 LMCache。
-    "VLLM_BAM_LMCACHE_PREFER_LOAD_ENABLE":
-    lambda: bool(int(os.getenv("VLLM_BAM_LMCACHE_PREFER_LOAD_ENABLE", "0"))),
-
-    # LMCache shadow store 在 BaM 里最多预留多少个 chunk 槽位。
-    "VLLM_BAM_LMCACHE_SHADOW_CHUNKS":
-    lambda: int(os.getenv("VLLM_BAM_LMCACHE_SHADOW_CHUNKS", "1024")),
-
-    # LMCache BaM 读路径：
-    # - sync: 稳定同步 baseline
-    # - prefetch: page-level submit/poll/complete/refill 中间层，用于 GPU-initiated 路线
-    "VLLM_BAM_LMCACHE_READ_MODE":
-    lambda: os.getenv("VLLM_BAM_LMCACHE_READ_MODE", "sync"),
-
-    # LMCache chunk 在 BaM 逻辑 row 空间里的起始 row。默认 0 保持原热路径行为；
-    # cold-read replay 可设为 128，避开设备最前面的保留区域。
-    "VLLM_BAM_LMCACHE_BASE_ROW_OFFSET":
-    lambda: int(os.getenv("VLLM_BAM_LMCACHE_BASE_ROW_OFFSET", "0")),
-
-    # 是否启用 KVCache 专用 BaM fast path。
-    # 第一阶段内部仍复用 BaM rowctx，但接口已经从通用 feature path 中拆出。
-    "VLLM_BAM_KV_FAST_PATH":
-    lambda: bool(int(os.getenv("VLLM_BAM_KV_FAST_PATH", "0"))),
-
-    # 是否启用 GPU-initiated demand/frontier 实验分支。
-    #
-    # 默认关闭，避免改变已经验证稳定的 one-copy 主线。
-    # 打开后，不再在 LMCache connector 层提前 stage descriptor，也不提前
-    # CPU submit。connector 只推进 retrieve/deferred 生命周期；真正的 request
-    # 计划在 direct-placement start 边界由 storage 根据真实 prefix hit 现场生成：
-    #
-    #   LMCache retrieve 到达 demand start
-    #     -> storage 收集连续 prefix hit chunks
-    #     -> 生成 context-chunk frontier/metadata
-    #     -> 进入统一 submit/poll/finalize request 生命周期
-    #
-    # 当前 frontier 只描述“哪些连续 context chunk 已 ready / consumable”，不改
-    # dense attention 语义，也不改 flash-attn kernel。后续真正把 submit 下沉到
-    # GPU 时，应在这个 demand-start/request frontier 边界后面接 GPU-side
-    # descriptor ring，而不是恢复 connector-stage 预提交支线。
-    "VLLM_BAM_GPU_INITIATED_PREFETCH":
-    lambda: bool(int(os.getenv("VLLM_BAM_GPU_INITIATED_PREFETCH", "0"))),
-
-    # 是否启用独立的 BaM KVStore vLLM-block 直通路径：
-    #
-    #   vLLM scheduler block mapping
-    #     -> GPU submit
-    #     -> SSD DMA 直接读写 vLLM paged KV cache
-    #     -> GPU persistent CQ poll
-    #     -> CPU 只检查 request ready 后继续 attention
-    #
-    # 该开关与旧 BaM page cache / LMCache direct-placement 完全隔离。默认关闭，
-    # 因此不会改变 LMCache SSD、传统 GDS、普通 V0 swap 等 baseline 的行为。
-    "VLLM_BAM_DIRECT_KVSTORE_ENABLE":
-    lambda: bool(int(os.getenv("VLLM_BAM_DIRECT_KVSTORE_ENABLE", "0"))),
-    # 仅改变 direct KVStore 的 swap-in 实现。默认 direct 完整保留当前路径；
-    # bam_sync 使用原生 BaM page cache，并在单次 kernel 内同步轮询 CQ。
-    "VLLM_BAM_DIRECT_READ_MODE":
-    lambda: os.getenv("VLLM_BAM_DIRECT_READ_MODE", "direct"),
-    "VLLM_BAM_SYNC_CACHE_SIZE_MB":
-    lambda: int(os.getenv("VLLM_BAM_SYNC_CACHE_SIZE_MB", "64")),
-
-    # MDS 把 BaM controller、DMA mapping 和 persistent CQ service 放到独立
-    # process；vLLM 仅导入 daemon-owned KV allocations 并同步提交 block mapping。
-    # 默认关闭，并且与本进程 direct/legacy BaM swap 路径互斥。
-    "VLLM_BAM_MDS_ENABLE":
-    lambda: bool(int(os.getenv("VLLM_BAM_MDS_ENABLE", "0"))),
-    "VLLM_BAM_MDS_IOSTACK_ROOT":
-    lambda: os.getenv("VLLM_BAM_MDS_IOSTACK_ROOT"),
-    "VLLM_BAM_MDS_CONTROL_DIR":
-    lambda: os.getenv("VLLM_BAM_MDS_CONTROL_DIR"),
-    "VLLM_BAM_MDS_CUDA_IPC_LIBRARY":
-    lambda: os.getenv("VLLM_BAM_MDS_CUDA_IPC_LIBRARY"),
-    "VLLM_BAM_MDS_TORCH_BRIDGE_DIR":
-    lambda: os.getenv("VLLM_BAM_MDS_TORCH_BRIDGE_DIR"),
-    "VLLM_BAM_MDS_TIMEOUT_SECONDS":
-    lambda: float(os.getenv("VLLM_BAM_MDS_TIMEOUT_SECONDS", "120")),
-    "VLLM_BAM_MDS_MAX_IN_FLIGHT":
-    lambda: int(os.getenv("VLLM_BAM_MDS_MAX_IN_FLIGHT", "4")),
-    "VLLM_BAM_MDS_SERVICE_LIFETIME":
-    lambda: os.getenv("VLLM_BAM_MDS_SERVICE_LIFETIME", "resident"),
-    "VLLM_BAM_MDS_IDLE_STOP_DELAY_MS":
-    lambda: int(os.getenv("VLLM_BAM_MDS_IDLE_STOP_DELAY_MS", "0")),
-    # 只启用 BaM MDS 自己的 SSD prefix populate/restore 控制面。关闭时
-    # AsyncKVScheduler 的原有 swap-only 行为完全不变。
-    "VLLM_BAM_MDS_PREFIX_ENABLE":
-    lambda: bool(int(os.getenv("VLLM_BAM_MDS_PREFIX_ENABLE", "0"))),
-    # Step 1/2 的层级 I/O 实验开关。NUM_LAYERS 是当前 PP rank 的本地层数；
-    # 关闭时不会拆分请求，也不会增加原有 prefix baseline 的 transfer 数量。
-    "VLLM_BAM_MDS_HIERARCHICAL_IO_ENABLE":
-    lambda: bool(
-        int(os.getenv("VLLM_BAM_MDS_HIERARCHICAL_IO_ENABLE", "0"))),
-    "VLLM_BAM_MDS_HIERARCHICAL_NUM_LAYERS":
-    lambda: int(os.getenv("VLLM_BAM_MDS_HIERARCHICAL_NUM_LAYERS", "0")),
-    "VLLM_BAM_MDS_HIERARCHICAL_WINDOW_LAYERS":
-    lambda: int(os.getenv("VLLM_BAM_MDS_HIERARCHICAL_WINDOW_LAYERS", "0")),
-    # Step 4：首窗 ready 后进入 forward，并在每个 layer window 前由 worker
-    # 直接确认 DMA 完成。关闭时保留 Step 1/2 的 full-restore dispatch gate。
-    "VLLM_BAM_MDS_HIERARCHICAL_LAYER_BARRIER":
-    lambda: bool(
-        int(os.getenv("VLLM_BAM_MDS_HIERARCHICAL_LAYER_BARRIER", "0"))),
-    "VLLM_BAM_MDS_HIERARCHICAL_ROLLING_ENABLE":
-    lambda: bool(
-        int(os.getenv("VLLM_BAM_MDS_HIERARCHICAL_ROLLING_ENABLE", "0"))),
-    "VLLM_BAM_MDS_HIERARCHICAL_LEAD_WINDOWS":
-    lambda: int(
-        os.getenv("VLLM_BAM_MDS_HIERARCHICAL_LEAD_WINDOWS", "1")),
-    "VLLM_BAM_MDS_HIERARCHICAL_MAX_LEAD_WINDOWS":
-    lambda: int(
-        os.getenv("VLLM_BAM_MDS_HIERARCHICAL_MAX_LEAD_WINDOWS", "1")),
-    "VLLM_BAM_MDS_HIERARCHICAL_TARGET_SLACK_MS":
-    lambda: float(
-        os.getenv("VLLM_BAM_MDS_HIERARCHICAL_TARGET_SLACK_MS", "0")),
-    # 一次性超长 prefix 可行性验证：只保留 current + lead layer windows。
-    # 消费后的 region 会被后续层覆盖，目前仅用于首轮 forward/max_tokens=1。
-    "VLLM_BAM_MDS_LAYER_WORKING_SET_ENABLE":
-    lambda: bool(int(os.getenv("VLLM_BAM_MDS_LAYER_WORKING_SET_ENABLE", "0"))),
-
-    "VLLM_BAM_MDS_PREFETCH_BLOCK_SELECTOR":
-    lambda: os.getenv("VLLM_BAM_MDS_PREFETCH_BLOCK_SELECTOR", "dense"),
-    "VLLM_BAM_MDS_PREFETCH_BLOCK_COUNT":
-    lambda: int(os.getenv("VLLM_BAM_MDS_PREFETCH_BLOCK_COUNT", "0")),
-    "VLLM_BAM_MDS_PREFETCH_BLOCK_STRIDE":
-    lambda: int(os.getenv("VLLM_BAM_MDS_PREFETCH_BLOCK_STRIDE", "1")),
-
-    # 是否启用 Direct Placement v0。
-    # 开启后 LMCache retrieve 会优先尝试：
-    #   BaM pages -> vLLM paged KV cache
-    # 失败则回退原 LMCache retrieve。
-    "VLLM_BAM_DIRECT_PLACEMENT":
-    lambda: bool(int(os.getenv("VLLM_BAM_DIRECT_PLACEMENT", "0"))),
-
-    # Direct Placement 的具体实现：
-    # - lmcache: 保正确版本，BaM pages -> LMCache tensor -> LMCache transfer
-    # - fused: 实验版本，BaM pages -> vLLM flat paged KV cache
-    "VLLM_BAM_DIRECT_PLACEMENT_IMPL":
-    lambda: os.getenv("VLLM_BAM_DIRECT_PLACEMENT_IMPL", "lmcache"),
-
-    # 是否启用 runtime one-copy 实验主线：
-    #
-    #   BaM cache -> 最终 vLLM paged KV cache
-    #
-    # 这条链路当前仍在低层排查中。为了保证正式主线先稳定跑通，默认先关闭；
-    # 关闭后仍然保留：
-    #
-    # - GPU worker / persistent service 负责后台 poll/read
-    # - 前台只在 pages ready 后发一跳已验证正确的 finalize kernel
-    #
-    # 继续调试一次搬运时，再显式打开：
-    #   VLLM_BAM_DIRECT_PLACEMENT_RUNTIME_ONE_COPY=1
-    "VLLM_BAM_DIRECT_PLACEMENT_RUNTIME_ONE_COPY":
-    lambda: bool(
-        int(os.getenv("VLLM_BAM_DIRECT_PLACEMENT_RUNTIME_ONE_COPY", "0"))),
-
-    # 是否要求当前请求必须严格走 runtime one-copy 主线。
-    #
-    # 打开后，storage 不再允许悄悄回退到：
-    #   results_materialized + host finalize
-    #
-    # 如果 runtime attach 失败，或者 one-copy 总开关没有打开，就应立即报错。
-    # 这个开关主要服务 GPU worker + persistent service 专用启动脚本。
-    "VLLM_BAM_DIRECT_PLACEMENT_REQUIRE_RUNTIME_ONE_COPY":
-    lambda: bool(
-        int(
-            os.getenv(
-                "VLLM_BAM_DIRECT_PLACEMENT_REQUIRE_RUNTIME_ONE_COPY",
-                "0",
-            ))),
-
-    # 是否把 direct placement request handle 上提到 runtime，允许当前
-    # batch 在 retrieve 未 ready 时显式返回 DEFERRED，并在下一轮继续 poll。
-    #
-    # 默认关闭，保持当前稳定的 blocking recv 主线不变。
-    "VLLM_BAM_DIRECT_PLACEMENT_DEFER_RUNTIME":
-    lambda: bool(
-        int(os.getenv("VLLM_BAM_DIRECT_PLACEMENT_DEFER_RUNTIME", "0"))),
-
-    # 运行时验证开关：direct placement request handle 至少要经历多少次
-    # `recv -> poll -> DEFERRED` 轮次之后，才允许 finalize。
-    #
-    # 语义：
-    # - 0: 不强制额外 defer；如果本轮已经 ready，就允许同轮 finalize
-    # - N>0: 至少 defer N 轮后，下一轮才允许 finalize
-    #
-    # 这个开关主要用于验证“跨 engine iteration 的 live handle”主线是否真的
-    # 跑通，默认关闭，不影响当前正式性能口径。
-    "VLLM_BAM_DIRECT_PLACEMENT_DEFER_MIN_POLLS":
-    lambda: int(
-        os.getenv("VLLM_BAM_DIRECT_PLACEMENT_DEFER_MIN_POLLS", "0")),
-
-    # 测试/benchmark 用的临时 idle-stop 开关。
-    #
-    # 默认 0 表示保持 persistent service 常驻，不改变正常服务模式。
-    # 设置为 N>0 时，KV direct placement 每完成一次 IO 后会启动一个轻量
-    # watchdog；如果接下来 N 秒没有新的 KV IO request，就在 runtime idle
-    # 时尝试停止后台 persistent service。这样一次性跑分脚本可以在所有 iter
-    # 完成后释放 resident kernel，避免进程退出时被后台 service 拖住。
-    "VLLM_BAM_RUNTIME_IDLE_STOP_SECONDS":
-    lambda: float(os.getenv("VLLM_BAM_RUNTIME_IDLE_STOP_SECONDS", "0")),
+    "VLLM_GRANULEKV_ENABLE":
+    lambda: bool(int(os.getenv("VLLM_GRANULEKV_ENABLE", "0"))),
+    "VLLM_GRANULEKV_IOSTACK_ROOT":
+    lambda: os.getenv("VLLM_GRANULEKV_IOSTACK_ROOT"),
+    "VLLM_GRANULEKV_CONTROL_DIR":
+    lambda: os.getenv("VLLM_GRANULEKV_CONTROL_DIR"),
+    "VLLM_GRANULEKV_CUDA_IPC_LIBRARY":
+    lambda: os.getenv("VLLM_GRANULEKV_CUDA_IPC_LIBRARY"),
+    "VLLM_GRANULEKV_TORCH_BRIDGE_DIR":
+    lambda: os.getenv("VLLM_GRANULEKV_TORCH_BRIDGE_DIR"),
+    "VLLM_GRANULEKV_TIMEOUT_SECONDS":
+    lambda: float(os.getenv("VLLM_GRANULEKV_TIMEOUT_SECONDS", "120")),
+    "VLLM_GRANULEKV_MAX_IN_FLIGHT":
+    lambda: int(os.getenv("VLLM_GRANULEKV_MAX_IN_FLIGHT", "4")),
+    "VLLM_GRANULEKV_SERVICE_LIFETIME":
+    lambda: os.getenv("VLLM_GRANULEKV_SERVICE_LIFETIME", "resident"),
+    "VLLM_GRANULEKV_SERVICE_LOW_PRIORITY":
+    lambda: bool(int(os.getenv("VLLM_GRANULEKV_SERVICE_LOW_PRIORITY", "0"))),
+    "VLLM_GRANULEKV_IDLE_STOP_DELAY_MS":
+    lambda: int(os.getenv("VLLM_GRANULEKV_IDLE_STOP_DELAY_MS", "0")),
+    "VLLM_GRANULEKV_PREFIX_ENABLE":
+    lambda: bool(int(os.getenv("VLLM_GRANULEKV_PREFIX_ENABLE", "0"))),
+    "VLLM_GRANULEKV_HIERARCHICAL_IO_ENABLE":
+    lambda: bool(int(os.getenv("VLLM_GRANULEKV_HIERARCHICAL_IO_ENABLE", "0"))),
+    "VLLM_GRANULEKV_HIERARCHICAL_NUM_LAYERS":
+    lambda: int(os.getenv("VLLM_GRANULEKV_HIERARCHICAL_NUM_LAYERS", "0")),
+    "VLLM_GRANULEKV_HIERARCHICAL_WINDOW_LAYERS":
+    lambda: int(os.getenv("VLLM_GRANULEKV_HIERARCHICAL_WINDOW_LAYERS", "0")),
+    "VLLM_GRANULEKV_HIERARCHICAL_LAYER_BARRIER":
+    lambda: bool(int(os.getenv("VLLM_GRANULEKV_HIERARCHICAL_LAYER_BARRIER", "0"))),
+    "VLLM_GRANULEKV_HIERARCHICAL_ROLLING_ENABLE":
+    lambda: bool(int(os.getenv("VLLM_GRANULEKV_HIERARCHICAL_ROLLING_ENABLE", "0"))),
+    "VLLM_GRANULEKV_HIERARCHICAL_LEAD_WINDOWS":
+    lambda: int(os.getenv("VLLM_GRANULEKV_HIERARCHICAL_LEAD_WINDOWS", "1")),
+    "VLLM_GRANULEKV_HIERARCHICAL_MAX_LEAD_WINDOWS":
+    lambda: int(os.getenv("VLLM_GRANULEKV_HIERARCHICAL_MAX_LEAD_WINDOWS", "1")),
+    "VLLM_GRANULEKV_HIERARCHICAL_TARGET_SLACK_MS":
+    lambda: float(os.getenv("VLLM_GRANULEKV_HIERARCHICAL_TARGET_SLACK_MS", "0")),
+    "VLLM_GRANULEKV_LAYER_WORKING_SET_ENABLE":
+    lambda: bool(int(os.getenv("VLLM_GRANULEKV_LAYER_WORKING_SET_ENABLE", "0"))),
+    "VLLM_GRANULEKV_TRUST_PREPOPULATED_PREFIX":
+    lambda: bool(int(os.getenv("VLLM_GRANULEKV_TRUST_PREPOPULATED_PREFIX", "0"))),
+    "VLLM_GRANULEKV_TRUSTED_PREFIX_BLOCKS":
+    lambda: int(os.getenv("VLLM_GRANULEKV_TRUSTED_PREFIX_BLOCKS", "0")),
+    "VLLM_GRANULEKV_PREFETCH_BLOCK_SELECTOR":
+    lambda: os.getenv("VLLM_GRANULEKV_PREFETCH_BLOCK_SELECTOR", "dense"),
+    "VLLM_GRANULEKV_PREFETCH_BLOCK_COUNT":
+    lambda: int(os.getenv("VLLM_GRANULEKV_PREFETCH_BLOCK_COUNT", "0")),
+    "VLLM_GRANULEKV_PREFETCH_BLOCK_STRIDE":
+    lambda: int(os.getenv("VLLM_GRANULEKV_PREFETCH_BLOCK_STRIDE", "1")),
 
     # 是否为 xformers prefix fallback 打开细粒度阶段计时。
     # 默认关闭，避免在正常跑分时引入额外 synchronize 干扰口径。
-    "VLLM_BAM_XFORMERS_PREFIX_FALLBACK_PROFILE":
+    "VLLM_GRANULEKV_XFORMERS_PREFIX_FALLBACK_PROFILE":
     lambda: bool(
-        int(os.getenv("VLLM_BAM_XFORMERS_PREFIX_FALLBACK_PROFILE", "0"))),
+        int(os.getenv("VLLM_GRANULEKV_XFORMERS_PREFIX_FALLBACK_PROFILE", "0"))),
 
     # xFormers prefix fallback 的 prefix KV 读取 backend。
     #
@@ -674,9 +472,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # - gather_then_copy：强制走保守的 vLLM gather_cache + copy 路径
     #
     # 这个开关只用于定位“paged KV cache 写对了但 xformers 读错了”的问题，
-    # 不改变 BaM/GPU worker 的 submit、poll、direct placement 主线。
-    "VLLM_BAM_XFORMERS_PREFIX_BACKEND":
-    lambda: os.getenv("VLLM_BAM_XFORMERS_PREFIX_BACKEND", "auto").strip().lower(),
+    # 不改变 GranuleKV/GPU worker 的 submit、poll、direct placement 主线。
+    "VLLM_GRANULEKV_XFORMERS_PREFIX_BACKEND":
+    lambda: os.getenv("VLLM_GRANULEKV_XFORMERS_PREFIX_BACKEND", "auto").strip().lower(),
 
     # xFormers prefix fallback 的 query KV 写入 backend。
     #
@@ -686,21 +484,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # - segment_copy：强制走保守的逐 segment copy_ 路径
     #
     # 这个开关只影响 xFormers fallback 内部如何把“本轮新算出来的 query K/V”
-    # 放入连续 full-KV workspace，不改变 BaM 读、GPU persistent service、
+    # 放入连续 full-KV workspace，不改变 GranuleKV 读、GPU persistent service、
     # direct placement 或 paged-KV 写入语义。
-    "VLLM_BAM_XFORMERS_QUERY_BACKEND":
-    lambda: os.getenv("VLLM_BAM_XFORMERS_QUERY_BACKEND", "auto").strip().lower(),
+    "VLLM_GRANULEKV_XFORMERS_QUERY_BACKEND":
+    lambda: os.getenv("VLLM_GRANULEKV_XFORMERS_QUERY_BACKEND", "auto").strip().lower(),
 
     # xFormers prefix fallback 的读端正确性抽样校验。
     #
     # 打开后会把 fallback 从 paged KV cache gather 出来的 prefix K/V，
-    # 和 BaM live pages 解码得到的 dense chunk reference 做少量点对点比较。
+    # 和 GranuleKV live pages 解码得到的 dense chunk reference 做少量点对点比较。
     # 它只用于定位“最终输出乱”到底发生在 paged-cache/gather 读端，还是更后面
     # 的 full workspace / attention bias / xFormers 消费语义；默认关闭，避免
     # 正式性能实验里引入额外同步。
-    "VLLM_BAM_XFORMERS_VERIFY_PREFIX_GATHER":
+    "VLLM_GRANULEKV_XFORMERS_VERIFY_PREFIX_GATHER":
     lambda: bool(
-        int(os.getenv("VLLM_BAM_XFORMERS_VERIFY_PREFIX_GATHER", "0"))),
+        int(os.getenv("VLLM_GRANULEKV_XFORMERS_VERIFY_PREFIX_GATHER", "0"))),
 
     # xFormers prefix fallback 的最终 attention 输出抽样校验。
     #
@@ -711,13 +509,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 这能继续把问题切成两段：
     # - reference 与 xFormers 不一致：查 attention bias / full workspace 语义；
     # - reference 与 xFormers 一致：查 rebuild 后 query/input position 语义。
-    "VLLM_BAM_XFORMERS_VERIFY_ATTENTION_OUTPUT":
+    "VLLM_GRANULEKV_XFORMERS_VERIFY_ATTENTION_OUTPUT":
     lambda: bool(
-        int(os.getenv("VLLM_BAM_XFORMERS_VERIFY_ATTENTION_OUTPUT", "0"))),
+        int(os.getenv("VLLM_GRANULEKV_XFORMERS_VERIFY_ATTENTION_OUTPUT", "0"))),
 
     # xFormers prefix fallback 的整层 attention 输出校验。
     #
-    # `VLLM_BAM_XFORMERS_VERIFY_ATTENTION_OUTPUT` 只做少量 query/head 抽样。
+    # `VLLM_GRANULEKV_XFORMERS_VERIFY_ATTENTION_OUTPUT` 只做少量 query/head 抽样。
     # 当抽样通过但模型输出仍然乱码时，需要进一步确认：
     #
     #   xFormers 对整层所有 query token / head / dim 的输出
@@ -727,82 +525,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 这个校验会构造较大的 fp32 attention scores，开销明显，因此默认关闭，
     # 并且默认只查第 0 层。若要查全部层，可把 FULL_LAYER 设为 -1，但一般
     # correctness 定位不建议这么做。
-    "VLLM_BAM_XFORMERS_VERIFY_ATTENTION_OUTPUT_FULL":
+    "VLLM_GRANULEKV_XFORMERS_VERIFY_ATTENTION_OUTPUT_FULL":
     lambda: bool(
-        int(os.getenv("VLLM_BAM_XFORMERS_VERIFY_ATTENTION_OUTPUT_FULL", "0"))),
+        int(os.getenv("VLLM_GRANULEKV_XFORMERS_VERIFY_ATTENTION_OUTPUT_FULL", "0"))),
 
-    "VLLM_BAM_XFORMERS_VERIFY_ATTENTION_OUTPUT_FULL_LAYER":
+    "VLLM_GRANULEKV_XFORMERS_VERIFY_ATTENTION_OUTPUT_FULL_LAYER":
     lambda: int(
-        os.getenv("VLLM_BAM_XFORMERS_VERIFY_ATTENTION_OUTPUT_FULL_LAYER", "0")),
-
-    # 模型输出边界诊断开关。
-    #
-    # 这条开关只做日志，不改计算。打开后会在 model_runner 里打印：
-    # - selected_token_indices / seq_lens / query_lens
-    # - hidden_states 的形状
-    # - 选中 hidden row 的范数
-    # - logits top-k token id/value
-    #
-    # 目标是和 rowctx 正常路径做一一对照，定位问题是否已经发生在
-    # xFormers attention 之后的 logits / sampling 入口。
-    "VLLM_BAM_LOGITS_SEMANTIC_DEBUG":
-    lambda: bool(int(os.getenv("VLLM_BAM_LOGITS_SEMANTIC_DEBUG", "0"))),
-
-    # 可选：显式指定 BaM Python 模块搜索路径。
-    "VLLM_BAM_IMPORT_PATH":
-    lambda: os.getenv("VLLM_BAM_IMPORT_PATH", None),
-
-    # BaM page cache 大小，单位 MB。
-    "VLLM_BAM_CACHE_SIZE_MB":
-    lambda: int(os.getenv("VLLM_BAM_CACHE_SIZE_MB", "512")),
-
-    # 使用的 SSD 控制器数量。
-    "VLLM_BAM_NUM_SSD":
-    lambda: int(os.getenv("VLLM_BAM_NUM_SSD", "1")),
-
-    # 可选：逗号分隔的 SSD 编号列表，例如 "0,1"。
-    "VLLM_BAM_SSD_LIST":
-    lambda: os.getenv("VLLM_BAM_SSD_LIST", None),
-
-    # BaM 使用的控制 GPU 编号。
-    "VLLM_BAM_CTRL_IDX":
-    lambda: int(os.getenv("VLLM_BAM_CTRL_IDX", "0")),
-
-    # 是否在 LMCache V0 的 put 路径上额外写一份 LMCache-style GDS 文件。
-    "VLLM_GDS_LMCACHE_SHADOW_ENABLE":
-    lambda: bool(int(os.getenv("VLLM_GDS_LMCACHE_SHADOW_ENABLE", "0"))),
-
-    # 是否在 LMCache V0 的 get 路径上优先从 LMCache-style GDS 读取。
-    "VLLM_GDS_LMCACHE_PREFER_LOAD_ENABLE":
-    lambda: bool(int(os.getenv("VLLM_GDS_LMCACHE_PREFER_LOAD_ENABLE", "0"))),
-
-    # LMCache-style GDS 的根目录，内部按 chunk_hash 前缀分两级目录。
-    "VLLM_GDS_LMCACHE_PATH":
-    lambda: os.getenv("VLLM_GDS_LMCACHE_PATH", "/tmp/vllm-bam-lmcache-gds"),
-
-    # 是否使用原生 cuFile/GDS。设为 0 时只作为 POSIX fallback 调试路径。
-    "VLLM_GDS_LMCACHE_USE_GDS":
-    lambda: bool(int(os.getenv("VLLM_GDS_LMCACHE_USE_GDS", "1"))),
-
-    # cuFile 路径是否使用 O_DIRECT，贴近 LMCache V1 GdsBackend 的 use_direct_io。
-    "VLLM_GDS_LMCACHE_USE_DIRECT_IO":
-    lambda: bool(int(os.getenv("VLLM_GDS_LMCACHE_USE_DIRECT_IO", "1"))),
-
-    # GDS staging tensor 使用的 CUDA device；为空时跟随 VLLM_BAM_CTRL_IDX。
-    "VLLM_GDS_LMCACHE_DEVICE":
-    lambda: os.getenv("VLLM_GDS_LMCACHE_DEVICE", None),
-
-    # LMCache V1 metadata 中的 MemoryFormat.value；默认贴近 V1 KV_2LTD。
-    "VLLM_GDS_LMCACHE_FMT":
-    lambda: os.getenv("VLLM_GDS_LMCACHE_FMT", "KV_2LTD"),
-
-    # 是否启用 V1-like 预注册 GPU staging buffer。
-    "VLLM_GDS_LMCACHE_USE_REGISTERED_BUFFER":
-    lambda: bool(int(os.getenv("VLLM_GDS_LMCACHE_USE_REGISTERED_BUFFER", "0"))),
-
-    # 预注册 staging buffer 大小。0 表示按首次 chunk 大小懒分配。
-    "VLLM_GDS_LMCACHE_REGISTERED_BUFFER_MB":
-    lambda: int(os.getenv("VLLM_GDS_LMCACHE_REGISTERED_BUFFER_MB", "0")),
+        os.getenv("VLLM_GRANULEKV_XFORMERS_VERIFY_ATTENTION_OUTPUT_FULL_LAYER", "0")),
 
     # (CPU backend only) CPU core ids bound by OpenMP threads, e.g., "0-31",
     # "0,1,2", "0-31,33". CPU cores of different ranks are separated by '|'.

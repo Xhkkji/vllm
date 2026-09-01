@@ -49,33 +49,18 @@ class CacheEngine:
         self.model_config = model_config
         self.parallel_config = parallel_config
         self.device_config = device_config
-        self.bam_direct_kvstore_enabled = envs.VLLM_BAM_DIRECT_KVSTORE_ENABLE
-        self.bam_mds_enabled = envs.VLLM_BAM_MDS_ENABLE
-        if self.bam_direct_kvstore_enabled and self.bam_mds_enabled:
-            raise ValueError(
-                "VLLM_BAM_MDS_ENABLE and VLLM_BAM_DIRECT_KVSTORE_ENABLE are "
-                "mutually exclusive")
-        if (self.bam_direct_kvstore_enabled or self.bam_mds_enabled) and (
-                envs.VLLM_BAM_SHADOW_ENABLE
-                or envs.VLLM_BAM_SWAPIN_ENABLE):
-            raise ValueError(
-                "MDS/direct KVStore cannot be combined with the legacy BaM "
-                "cache-backed V0 swap path")
-        if self.bam_mds_enabled and (
+        self.granulekv_enabled = envs.VLLM_GRANULEKV_ENABLE
+        if self.granulekv_enabled and (
                 parallel_config.tensor_parallel_size != 1
                 or parallel_config.pipeline_parallel_size != 1):
             raise ValueError(
-                "MDS connector currently requires TP=1 and PP=1")
+                "GranuleKV connector currently requires TP=1 and PP=1")
 
-        # 【BaM KVStore 直通调用链】owner / DMA region 只为真实 GPU KV cache
-        # 保活。普通 vLLM、LMCache 和 GDS 路径不会创建或读取这两张表。
-        self._bam_direct_gpu_cache_owners: List[torch.Tensor] = []
-        self._bam_direct_gpu_cache_regions: List[torch.Tensor] = []
-        self.bam_mds_connector = None
+        self.granulekv_connector = None
         # legacy deferred swap-in 仍是单个 model-execution dependency；新的
         # AsyncKVScheduler 使用下面按 request_id 索引的多槽 trace 表。
-        self._bam_mds_transfer_started_at: float | None = None
-        self._bam_mds_async_kv_traces: Dict[str, _AsyncKVTrace] = {}
+        self._granulekv_transfer_started_at: float | None = None
+        self._granulekv_async_kv_traces: Dict[str, _AsyncKVTrace] = {}
 
         self.head_size = model_config.get_head_size()
         # Models like Jamba, have mixed typed layers, E.g Mamba
@@ -107,63 +92,18 @@ class CacheEngine:
         # Initialize the cache.
         self.gpu_cache = self._allocate_kv_cache(
             self.num_gpu_blocks, self.device_config.device_type)
-        # 【BaM KVStore 直通调用链】scheduler 仍使用 CPU block id 作为稳定的
-        # storage block id，但 payload 已经落到 SSD，因此不再分配等大的 CPU
-        # KV tensor。关闭新开关时仍完整保留 vLLM 原生 CPU swap baseline。
         self.cpu_cache = (
-            [] if (self.bam_direct_kvstore_enabled or self.bam_mds_enabled) else
+            [] if self.granulekv_enabled else
             self._allocate_kv_cache(self.num_cpu_blocks, "cpu")
         )
         self.swap_trace_enabled = envs.VLLM_V0_SWAP_TRACE
-        # 【BaM KVStore 直通调用链】此处只完成真实 KV allocation，不立刻执行
-        # NVMe controller 初始化或 DMA registration。Worker 必须等模型 warmup、
-        # CUDA Graph capture 和全部 workspace allocation 完成后，再显式调用
-        # initialize_bam_direct_kv_store()。这样不会让 BaM runtime 介入后续
-        # cudaMalloc/capture 生命周期。
-        self.bam_direct_kv_store = None
-        self.bam_block_store = self._init_bam_block_store()
-        self.bam_shadow_writer = self._init_bam_shadow_writer()
-        self.bam_swap_reader = self._init_bam_swap_reader()
 
-    def initialize_bam_direct_kv_store(self) -> None:
-        """在所有 CUDA warmup 后启用当前选中的 BaM KVStore transport。"""
-        if self.bam_mds_enabled:
-            assert self.bam_mds_connector is not None
-            self.bam_mds_connector.start()
+    def initialize_granulekv(self) -> None:
+        """在所有 CUDA warmup 后启用 GranuleKV transport。"""
+        if not self.granulekv_enabled:
             return
-        if not self.bam_direct_kvstore_enabled:
-            return
-        if self.bam_direct_kv_store is not None:
-            return
-        from vllm.bam.direct_block_store import BaMVLLMDirectKVStore
-        self.bam_direct_kv_store = BaMVLLMDirectKVStore(
-            gpu_cache=self.gpu_cache,
-            dma_regions=self._bam_direct_gpu_cache_regions,
-            num_storage_blocks=self.num_cpu_blocks,
-        )
-
-    def _init_bam_block_store(self):
-        if not (envs.VLLM_BAM_SHADOW_ENABLE or envs.VLLM_BAM_SWAPIN_ENABLE):
-            return None
-
-        from vllm.worker.bam_block_store import BaMBlockStore
-        return BaMBlockStore(self.gpu_cache, self.num_cpu_blocks)
-
-    def _init_bam_shadow_writer(self):
-        if not envs.VLLM_BAM_SHADOW_ENABLE:
-            return None
-
-        from vllm.worker.bam_shadow_writer import BaMShadowWriter
-        assert self.bam_block_store is not None
-        return BaMShadowWriter(self.bam_block_store, self.dtype)
-
-    def _init_bam_swap_reader(self):
-        if not envs.VLLM_BAM_SWAPIN_ENABLE:
-            return None
-
-        from vllm.worker.bam_swap_reader import BaMSwapReader
-        assert self.bam_block_store is not None
-        return BaMSwapReader(self.bam_block_store, self.dtype)
+        assert self.granulekv_connector is not None
+        self.granulekv_connector.start()
 
     def _log_swap_event(self, op_name: str, src_to_dst: torch.Tensor,
                         elapsed_s: float) -> None:
@@ -196,7 +136,7 @@ class CacheEngine:
     ) -> List[torch.Tensor]:
         """Allocates KV cache on the specified device.
 
-        【BaM KVStore 直通调用链】新后端开启时，GPU 分配改用 64KB 对齐 owner，
+        【GranuleKV 直通调用链】新后端开启时，GPU 分配改用 64KB 对齐 owner，
         但返回给 attention 的 tensor shape/stride 与原生分配完全一致。
         """
         kv_cache_generic_shape = self.attn_backend.get_kv_cache_shape(
@@ -216,10 +156,10 @@ class CacheEngine:
         kv_cache_allocation_shape = tuple(kv_cache_generic_shape[i]
                                           for i in kv_cache_stride_order)
 
-        if self.bam_mds_enabled and device == "cuda":
-            from vllm.bam.mds.connector import BaMMDSConnector
+        if self.granulekv_enabled and device == "cuda":
+            from vllm.granulekv.connector import GranuleKVConnector
             working_set_regions = get_layer_working_set_regions()
-            self.bam_mds_connector = BaMMDSConnector(
+            self.granulekv_connector = GranuleKVConnector(
                 allocation_shape=kv_cache_allocation_shape,
                 stride_order=kv_cache_stride_order,
                 dtype=self.dtype,
@@ -230,30 +170,17 @@ class CacheEngine:
                 num_gpu_blocks=num_blocks,
                 num_storage_blocks=self.num_cpu_blocks,
             )
-            return self.bam_mds_connector.gpu_cache
+            return self.granulekv_connector.gpu_cache
 
         for _ in range(self.num_attention_layers):
             # null block in CpuGpuBlockAllocator requires at least that
             # block to be zeroed-out.
             # We zero-out everything for simplicity.
-            if self.bam_direct_kvstore_enabled and device == "cuda":
-                from vllm.bam.direct_block_store import (
-                    allocate_aligned_kv_region)
-                owner, dma_region, layer_kv_cache = (
-                    allocate_aligned_kv_region(
-                        allocation_shape=kv_cache_allocation_shape,
-                        stride_order=kv_cache_stride_order,
-                        dtype=self.dtype,
-                        device=device,
-                    ))
-                self._bam_direct_gpu_cache_owners.append(owner)
-                self._bam_direct_gpu_cache_regions.append(dma_region)
-            else:
-                layer_kv_cache = torch.zeros(
-                    kv_cache_allocation_shape,
-                    dtype=self.dtype,
-                    pin_memory=pin_memory,
-                    device=device).permute(*kv_cache_stride_order)
+            layer_kv_cache = torch.zeros(
+                kv_cache_allocation_shape,
+                dtype=self.dtype,
+                pin_memory=pin_memory,
+                device=device).permute(*kv_cache_stride_order)
 
             # view back to (TOTAL_PAGES, PAGE_SIZE, entry_shape...) for cases
             # when entry_shape is higher than 1D
@@ -263,18 +190,13 @@ class CacheEngine:
     def swap_in(self, src_to_dst: torch.Tensor) -> None:
         """把 scheduler 的 storage->GPU block mapping 恢复到 KV cache。
 
-        【BaM KVStore 直通调用链】新后端下，本函数等待的只是 GPU worker 发布
+        【GranuleKV 直通调用链】新后端下，本函数等待的只是 GPU worker 发布
         request ready；CPU 不读取 NVMe CQ，也不参与 payload 搬运。返回后 Worker
         才会继续发起当前 engine step 的 attention。
         """
         start = time.perf_counter()
-        if self.bam_mds_connector is not None:
-            self.bam_mds_connector.swap_in(src_to_dst)
-        elif self.bam_direct_kv_store is not None:
-            self.bam_direct_kv_store.swap_in(src_to_dst)
-        elif self.bam_swap_reader is not None:
-            self.bam_swap_reader.swap_in(self.gpu_cache, self.cpu_cache,
-                                         src_to_dst)
+        if self.granulekv_connector is not None:
+            self.granulekv_connector.swap_in(src_to_dst)
         else:
             for i in range(self.num_attention_layers):
                 self.attn_backend.swap_blocks(self.cpu_cache[i],
@@ -282,21 +204,21 @@ class CacheEngine:
         self._log_swap_event("swap_in", src_to_dst, time.perf_counter() - start)
 
     def swap_in_async(self, src_to_dst: torch.Tensor) -> bool:
-        """推进 resident MDS swap-in，未完成时由 engine defer 当前 batch。
+        """推进 resident GranuleKV swap-in，未完成时由 engine defer 当前 batch。
 
-        该接口只服务 MDS direct 路径。目标 GPU block 在返回 True 前不能被
+        该接口只服务 GranuleKV direct 路径。目标 GPU block 在返回 True 前不能被
         attention 消费；SSD completion 和数据可见性由 daemon 内的常驻 GPU CQ
         service 保证。
         """
-        if self.bam_mds_connector is None:
-            raise RuntimeError("async swap-in is only supported by resident MDS")
-        if self._bam_mds_transfer_started_at is None:
-            self._bam_mds_transfer_started_at = time.perf_counter()
-        ready = self.bam_mds_connector.swap_in_async(src_to_dst)
+        if self.granulekv_connector is None:
+            raise RuntimeError("async swap-in is only supported by GranuleKV")
+        if self._granulekv_transfer_started_at is None:
+            self._granulekv_transfer_started_at = time.perf_counter()
+        ready = self.granulekv_connector.swap_in_async(src_to_dst)
         if not ready:
             return False
-        elapsed_s = time.perf_counter() - self._bam_mds_transfer_started_at
-        self._bam_mds_transfer_started_at = None
+        elapsed_s = time.perf_counter() - self._granulekv_transfer_started_at
+        self._granulekv_transfer_started_at = None
         self._log_swap_event("swap_in", src_to_dst, elapsed_s)
         return True
 
@@ -308,21 +230,21 @@ class CacheEngine:
         layer_range: Optional[Tuple[int, int]] = None,
         prefetch_plan_id: Optional[str] = None,
     ) -> AsyncKVTransferEvent:
-        """把 Scheduler 的异步 read/write 提交给 resident MDS。
+        """把 Scheduler 的异步 read/write 提交给 resident GranuleKV。
 
         该方法只负责控制面提交，不等待 SSD 数据完成。目标 GPU block 已经
         由 AsyncKVScheduler 预留，因此从提交开始到 READY 之前都禁止
         attention 使用这些 block。
         """
-        if self.bam_mds_connector is None:
+        if self.granulekv_connector is None:
             raise RuntimeError(
-                "async KV scheduling requires the resident MDS connector")
-        if request_id in self._bam_mds_async_kv_traces:
+                "async KV scheduling requires the resident GranuleKV connector")
+        if request_id in self._granulekv_async_kv_traces:
             raise RuntimeError(f"duplicate async KV transfer: {request_id}")
         trace = _AsyncKVTrace(operation=operation,
                               started_at=time.perf_counter(),
                               submitted_at_ns=time.monotonic_ns())
-        self._bam_mds_async_kv_traces[request_id] = trace
+        self._granulekv_async_kv_traces[request_id] = trace
         if self.swap_trace_enabled:
             logger.info(
                 "[V0_SWAP_TRACE][AsyncKV][CacheEngine] phase=submit "
@@ -336,20 +258,20 @@ class CacheEngine:
             )
         try:
             if prefetch_plan_id is None:
-                ready = self.bam_mds_connector.submit_transfer_async(
+                ready = self.granulekv_connector.submit_transfer_async(
                     request_id,
                     src_to_dst,
                     operation=operation.value,
                     layer_range=layer_range)
             else:
-                ready = self.bam_mds_connector.activate_prefetch_transfer_async(
+                ready = self.granulekv_connector.activate_prefetch_transfer_async(
                     prefetch_plan_id,
                     request_id,
                     src_to_dst,
                     operation=operation.value,
                     layer_range=layer_range)
         except Exception as exc:
-            del self._bam_mds_async_kv_traces[request_id]
+            del self._granulekv_async_kv_traces[request_id]
             return AsyncKVTransferEvent(request_id,
                                         AsyncKVTransferState.ERROR,
                                         error=str(exc))
@@ -365,11 +287,11 @@ class CacheEngine:
         units: Sequence[tuple[str, torch.Tensor, AsyncKVTransferOperation,
                               Optional[Tuple[int, int]]]],
     ) -> None:
-        """把完整 plan 下沉为 MDS 模板；此时不创建 trace 或 MDS handle。"""
-        if self.bam_mds_connector is None:
+        """把完整 plan 下沉为 GranuleKV 模板；此时不创建 trace 或 GranuleKV handle。"""
+        if self.granulekv_connector is None:
             raise RuntimeError(
-                "prefetch plan requires the resident MDS connector")
-        self.bam_mds_connector.stage_prefetch_plan(
+                "prefetch plan requires the resident GranuleKV connector")
+        self.granulekv_connector.stage_prefetch_plan(
             plan_id,
             tuple((request_id, mapping, operation.value, layer_range)
                   for request_id, mapping, operation, layer_range in units),
@@ -377,19 +299,19 @@ class CacheEngine:
 
     def discard_staged_async_kv_prefetch_units(
             self, request_ids: Sequence[str]) -> None:
-        if self.bam_mds_connector is None:
+        if self.granulekv_connector is None:
             raise RuntimeError(
-                "prefetch plan requires the resident MDS connector")
-        self.bam_mds_connector.discard_staged_prefetch_units(request_ids)
+                "prefetch plan requires the resident GranuleKV connector")
+        self.granulekv_connector.discard_staged_prefetch_units(request_ids)
 
     def poll_async_kv_transfer(
             self, request_id: str,
             src_to_dst: torch.Tensor) -> AsyncKVTransferEvent:
-        """非阻塞查询一个已经提交的 MDS read/write。"""
-        if self.bam_mds_connector is None:
+        """非阻塞查询一个已经提交的 GranuleKV read/write。"""
+        if self.granulekv_connector is None:
             raise RuntimeError(
-                "async KV scheduling requires the resident MDS connector")
-        trace = self._bam_mds_async_kv_traces.get(request_id)
+                "async KV scheduling requires the resident GranuleKV connector")
+        trace = self._granulekv_async_kv_traces.get(request_id)
         if trace is None:
             raise RuntimeError(
                 f"CacheEngine has no async KV transfer: {request_id}")
@@ -407,9 +329,9 @@ class CacheEngine:
                 )
 
         try:
-            ready = self.bam_mds_connector.poll_transfer_async(request_id)
+            ready = self.granulekv_connector.poll_transfer_async(request_id)
         except Exception as exc:
-            del self._bam_mds_async_kv_traces[request_id]
+            del self._granulekv_async_kv_traces[request_id]
             return AsyncKVTransferEvent(request_id,
                                         AsyncKVTransferState.ERROR,
                                         error=str(exc))
@@ -422,7 +344,7 @@ class CacheEngine:
     def _finish_async_kv_transfer_trace(self, request_id: str,
                                         src_to_dst: torch.Tensor) -> None:
         """在异步 read/write 完成后记录耗时并删除对应 trace。"""
-        trace = self._bam_mds_async_kv_traces.pop(request_id, None)
+        trace = self._granulekv_async_kv_traces.pop(request_id, None)
         if trace is None:
             raise RuntimeError(f"missing async KV trace: {request_id}")
         ready_ns = time.monotonic_ns()
@@ -447,20 +369,16 @@ class CacheEngine:
     def swap_out(self, src_to_dst: torch.Tensor) -> None:
         """把 scheduler 的 GPU->storage block mapping 写出。
 
-        【BaM KVStore 直通调用链】新后端直接从 vLLM physical block 发起 SSD
-        write，不再先复制到 CPU cache，也不经过 BaM payload cache。
+        【GranuleKV 直通调用链】新后端直接从 vLLM physical block 发起 SSD
+        write，不再先复制到 CPU cache，也不经过中间 payload cache。
         """
         start = time.perf_counter()
-        if self.bam_mds_connector is not None:
-            self.bam_mds_connector.swap_out(src_to_dst)
-        elif self.bam_direct_kv_store is not None:
-            self.bam_direct_kv_store.swap_out(src_to_dst)
+        if self.granulekv_connector is not None:
+            self.granulekv_connector.swap_out(src_to_dst)
         else:
             for i in range(self.num_attention_layers):
                 self.attn_backend.swap_blocks(self.gpu_cache[i],
                                               self.cpu_cache[i], src_to_dst)
-            if self.bam_shadow_writer is not None:
-                self.bam_shadow_writer.on_swap_out(self.gpu_cache, src_to_dst)
         self._log_swap_event("swap_out", src_to_dst,
                              time.perf_counter() - start)
 

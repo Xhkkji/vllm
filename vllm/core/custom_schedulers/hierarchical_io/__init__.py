@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""BaM MDS 层级 I/O 的独立控制面组件。"""
+"""GranuleKV 层级 I/O 的独立控制面组件。"""
 
 from .barrier import (HierarchicalLayerBarrierConfig, activate_layer_barrier,
                       activate_sparse_kv_blocks,

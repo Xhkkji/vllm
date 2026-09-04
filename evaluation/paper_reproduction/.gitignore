@@ -1,0 +1,3 @@
+# Runtime artifacts belong to a run directory and are not source snapshots.
+*/results/*
+!*/results/.gitkeep

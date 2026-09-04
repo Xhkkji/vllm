@@ -1,0 +1,1 @@
+"""SolidAttention-style adapter."""

@@ -1,0 +1,10 @@
+{
+  "strategy": "dense",
+  "selector": "dense",
+  "prefetcher": "on_demand",
+  "scheduler": "fcfs",
+  "layers": 32,
+  "prefix_blocks": 128,
+  "window_layers": 1,
+  "backend_comparison": ["sync", "granulekv_async"]
+}

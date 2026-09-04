@@ -1,0 +1,9 @@
+{
+  "strategy": "hisparse",
+  "layers": 32,
+  "prefix_blocks": 128,
+  "block_budget": 32,
+  "window_layers": 4,
+  "working_set": "finite",
+  "correction_read": true
+}

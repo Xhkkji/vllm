@@ -1,0 +1,10 @@
+{
+  "strategy": "quest",
+  "model": "meta-llama/Llama-2-7b-hf",
+  "layers": 32,
+  "prefix_blocks": 128,
+  "block_budget": 32,
+  "window_layers": 4,
+  "runs": ["smoke", "formal"],
+  "backend": "granulekv"
+}

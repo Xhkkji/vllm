@@ -1,0 +1,8 @@
+{
+  "strategy": "bidaw",
+  "layers": 32,
+  "prefix_blocks": 128,
+  "window_layers": 4,
+  "scheduler": "disk_hrrn",
+  "runs": ["smoke", "formal"]
+}

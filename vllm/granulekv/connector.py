@@ -235,29 +235,36 @@ class GranuleKVConnector:
         if operation not in ("read", "write"):
             raise ValueError(f"unsupported GranuleKV operation: {operation}")
         layer_range = self._validate_layer_range(layer_range)
-        if src_to_dst.numel() == 0:
-            return GranuleKVTransferStatus(
-                request_id, GranuleKVTransferState.READY, operation,
-                prefetch_plan_id=prefetch_plan_id)
+        if prefetch_plan_id is None:
+            if src_to_dst.numel() == 0:
+                return GranuleKVTransferStatus(
+                    request_id, GranuleKVTransferState.READY, operation)
+            spec = self._request_spec(
+                src_to_dst, operation=operation, layer_range=layer_range)
+        else:
+            template = self._prefetch_templates.get(request_id)
+            if template is None or template[0] != prefetch_plan_id:
+                raise RuntimeError(
+                    f"unknown staged prefetch unit: {request_id}")
+            spec = template[1]
+            if spec.operation != operation or spec.layer_range != layer_range:
+                raise RuntimeError(
+                    f"staged prefetch unit changed after staging: {request_id}")
+            if not spec.gpu_block_ids:
+                self.client.cancel_staged_units(
+                    prefetch_plan_id, (request_id,))
+                del self._prefetch_templates[request_id]
+                self._maybe_release_prefetch_plan(prefetch_plan_id)
+                return GranuleKVTransferStatus(
+                    request_id, GranuleKVTransferState.READY, operation,
+                    prefetch_plan_id=prefetch_plan_id)
 
-        spec = self._request_spec(
-            src_to_dst, operation=operation, layer_range=layer_range)
         pending = self._pending_transfers.get(request_id)
         if pending is not None:
             if (spec != pending.spec
                     or prefetch_plan_id != pending.prefetch_plan_id):
                 raise RuntimeError("GranuleKV transfer changed while in flight")
             return self.query_request(request_id)
-
-        if prefetch_plan_id is not None:
-            template = self._prefetch_templates.get(request_id)
-            if template is None or template[0] != prefetch_plan_id:
-                raise RuntimeError(
-                    f"unknown staged prefetch unit: {request_id}")
-            if template[1] != spec:
-                raise RuntimeError(
-                    f"staged prefetch unit changed after staging: {request_id}")
-            spec = template[1]
 
         payload = spec.to_payload()
         try:

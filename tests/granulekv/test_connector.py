@@ -102,6 +102,8 @@ def test_staged_request_reuses_the_same_logical_spec():
     mapping = torch.tensor([[20, 2], [21, 3]], dtype=torch.int64)
 
     connector.stage_plan("plan-1", [("unit-1", mapping, "read", (2, 4))])
+    connector._request_spec = lambda *args, **kwargs: pytest.fail(
+        "staged submit rebuilt its request spec")
     connector.submit_request(
         "unit-1", mapping, operation="read", layer_range=(2, 4),
         prefetch_plan_id="plan-1")
